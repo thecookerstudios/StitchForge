@@ -3,18 +3,10 @@
 //! Built only from the StitchForge spec, public format documentation and
 //! general embroidery practice. No competitor code, files or UI were used.
 
-mod design;
-mod dst;
-mod geom;
-mod import;
-mod settings;
-mod sheet;
-mod stitch;
-mod thread;
 
 use clap::{Args, Parser, Subcommand};
-use serde_json::json;
-use settings::Profile;
+use stitchforge::{design, dst, export, import, settings, sheet, thread};
+use stitchforge::settings::Profile;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -206,48 +198,7 @@ fn produce(mut art: import::Artwork, name: &str, o: &OutputArgs) -> Result<(), S
             },
             notes: o.notes.clone(),
         };
-        let p = |ext: &str| o.out_dir.join(format!("{base}.{ext}"));
-        let write = |path: PathBuf, data: &[u8]| {
-            std::fs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))
-        };
-        write(p("dst"), &dst::write(&d))?;
-        write(
-            p("sheet.html"),
-            sheet::operator_sheet(&d, &job, &generated).as_bytes(),
-        )?;
-        write(p("stops.csv"), sheet::stops_csv(&d).as_bytes())?;
-        write(p("preview.png"), &sheet::preview_png(&d, 12.0)?)?;
-        write(
-            p("preview.svg"),
-            sheet::preview_svg(&d, 1.0, "#f4f1ea").as_bytes(),
-        )?;
-        let files: Vec<String> = [
-            "dst",
-            "sheet.html",
-            "stops.csv",
-            "preview.png",
-            "preview.svg",
-            "job.json",
-        ]
-        .iter()
-        .map(|e| p(e).display().to_string())
-        .collect();
-        let summary = json!({
-            "name": base,
-            "profile": d.profile,
-            "fabric": d.recipe.name,
-            "size_mm": [round1(d.stats.width_mm), round1(d.stats.height_mm)],
-            "size_in": [round2(d.stats.width_mm / 25.4), round2(d.stats.height_mm / 25.4)],
-            "stats": d.stats,
-            "stops": d.stops,
-            "objects": d.objects,
-            "warnings": d.warnings,
-            "files": files,
-        });
-        write(
-            p("job.json"),
-            serde_json::to_string_pretty(&summary).unwrap().as_bytes(),
-        )?;
+        let summary = export::write_all(&d, &job, &o.out_dir, &generated)?.summary;
         if !o.json {
             print_human(&d, &base, &o.out_dir);
         }
@@ -354,11 +305,4 @@ fn slug(t: &str) -> String {
     } else {
         s.chars().take(40).collect()
     }
-}
-
-fn round1(v: f64) -> f64 {
-    (v * 10.0).round() / 10.0
-}
-fn round2(v: f64) -> f64 {
-    (v * 100.0).round() / 100.0
 }

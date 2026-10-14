@@ -1,4 +1,4 @@
-# StitchForge v0.1 — embroidery engine (Phase 1)
+# StitchForge v0.2 — embroidery app (review build)
 
 Vector art and any-font text in; machine-ready DST, a printable operator
 spec sheet, and a stitch preview out. Written in Rust, runs on Windows,
@@ -8,17 +8,34 @@ Built clean-room from the StitchForge spec, public format documentation
 and general embroidery practice. No Wilcom or Pulse code, files, fonts or
 screens were used or examined.
 
-## Build
+## Open the app
 
-Install Rust from https://rustup.rs, then:
+**Mac:** double-click `Launch StitchForge.command`. The first time, it installs
+what it needs and builds (a few minutes), then opens the app and leaves a
+`StitchForge.app` in this folder. After that, just double-click
+`StitchForge.app` (drag it to the Dock if you like).
 
-```
-cargo build --release
-```
+If macOS says the launcher "can't be opened", right-click it → Open → Open.
 
-The program is `target/release/stitchforge` (`stitchforge.exe` on Windows).
+**Windows / Linux:** install Rust from https://rustup.rs, then in this folder
+run `cargo run --release`.
 
-## Use
+### In the app
+
+- **Open SVG…**, drag an SVG onto the window, **Text…** (any installed font),
+  or **Sample logo**.
+- Right panel: width, **Flat goods / Cap (center-out)**, fabric, production
+  numbers, color stops, warnings, job fields for the operator sheet.
+- **Pro** (top right) adds stitch settings: density, stitch length, pull
+  compensation, underlay, thread chart CSV, and jump/travel display.
+- Left panel: sewing sequence grouped by needle; click an object to highlight it.
+- Bottom: **Play sew-out** steps through the stitches in sewing order
+  (Space = play/pause, F = fit, scroll/pinch = zoom, drag = pan,
+  double-click = fit).
+- **Export DST + sheet…** writes the DST, operator sheet, stops CSV and
+  preview into a folder you choose, and opens the sheet.
+
+## Command line
 
 ```
 # Vector art to stitches, 3.5" wide, flat and cap versions

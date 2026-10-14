@@ -34,6 +34,9 @@ pub struct ObjectInfo {
     pub color_match_delta_e: f64,
     pub stitches: usize,
     pub trims: usize,
+    /// Range of `Design::cmds` this object produced.
+    #[serde(skip)]
+    pub cmd_range: (usize, usize),
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -181,6 +184,7 @@ pub fn build(
         }
         let stop = stops.last_mut().unwrap();
         stop.objects.push(o.label.clone());
+        let cmd_start = cmds.len();
         let before = count_stitches(&cmds);
         let trims_before = cmds.iter().filter(|c| matches!(c, Cmd::Trim)).count();
         let mut pending_tie_in: Option<Pt> = None;
@@ -226,6 +230,7 @@ pub fn build(
             color_match_delta_e: (o.color_error * 10.0).round() / 10.0,
             stitches: added,
             trims: cmds.iter().filter(|c| matches!(c, Cmd::Trim)).count() - trims_before,
+            cmd_range: (cmd_start, cmds.len()),
         });
         if o.kind == StitchType::Satin && o.bbox.width().min(o.bbox.height()) < 1.0 {
             warnings.push(format!(

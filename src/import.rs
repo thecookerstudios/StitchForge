@@ -30,6 +30,7 @@ impl Shape {
     }
 }
 
+#[derive(Clone)]
 pub struct Artwork {
     pub shapes: Vec<Shape>,
     pub warnings: Vec<String>,
