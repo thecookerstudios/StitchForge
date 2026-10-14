@@ -1,4 +1,4 @@
-# StitchForge v0.4 — embroidery app (review build)
+# StitchForge v0.5 — embroidery app (Milestone 1 complete)
 
 Vector art and any-font text in; machine-ready DST, a printable operator
 spec sheet, and a stitch preview out. Written in Rust, runs on Windows,
@@ -21,6 +21,27 @@ If macOS says the launcher "can't be opened", right-click it → Open → Open.
 run `cargo run --release`.
 
 ### In the app
+
+**Files.** File menu or the top bar:
+- **Open…** (Cmd/Ctrl+O) opens a StitchForge project (`.sfg`), SVG artwork,
+  or a machine file (DST, EXP, PES). Dropping a file on the window works too
+  (an SVG dropped onto an open design is added as new layers).
+- **Save** (Cmd/Ctrl+S) / **Save As** (Shift+Cmd/Ctrl+S) keep your layers,
+  edits, threads, settings and job info in a `.sfg` file. The file name and a
+  • (unsaved changes) show in the window title. New, Open and quitting ask
+  before discarding unsaved work.
+- **Export…** (Cmd/Ctrl+E): pick DST, PES and/or EXP; the operator sheet,
+  stops CSV and preview always come along.
+- **Opened stitch files** (DST/EXP/PES) are read-only stitches: pick the
+  thread for each stop, play the sew-out, print the sheet, or export to
+  another format (e.g. DST → PES).
+- **Calibration sampler** (File menu, or `stitchforge sampler`): the Gate 1
+  test sew-out. Sew it on your usual fabric with normal backing; the notes on
+  its operator sheet say what to check and measure.
+
+**Stitch settings in your art app.** Put these in an element's id/name in
+Inkscape or Illustrator and StitchForge follows them: `sf-satin`,
+`sf-fill`, `sf-run`, `sf-triple`, `sf-angle-45` (any angle).
 
 **Layers (left).** Every shape, outline and text block is a layer. Layers sew
 top to bottom.
@@ -66,6 +87,15 @@ preview into a folder you choose, and opens the sheet.
 stitchforge convert logo.svg --width-in 3.5 --profile both \
   --job 10482 --customer "Hillside Rec League" --qty 48 \
   --machine "Head 2" --placement "Left chest" --notes "Match navy"
+
+# Several machine formats at once
+stitchforge convert logo.svg --width-in 3.5 --formats dst,pes,exp
+
+# Calibration sampler for a test sew-out
+stitchforge sampler --formats dst,pes
+
+# What's in any DST/EXP/PES
+stitchforge inspect design.pes
 
 # Any installed font, no embroidery-font format
 stitchforge text "Sunny Hill" --font Poppins --height-mm 20 --color "#1b2d5c"

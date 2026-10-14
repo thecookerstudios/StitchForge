@@ -5,10 +5,13 @@
 
 pub mod design;
 pub mod dst;
+pub mod export;
+pub mod formats;
 pub mod geom;
 pub mod import;
+pub mod project;
+pub mod sampler;
 pub mod settings;
 pub mod sheet;
 pub mod stitch;
 pub mod thread;
-pub mod export;

@@ -3,11 +3,10 @@
 //! Built only from the StitchForge spec, public format documentation and
 //! general embroidery practice. No competitor code, files or UI were used.
 
-
 use clap::{Args, Parser, Subcommand};
-use stitchforge::{design, dst, export, import, settings, sheet, thread};
-use stitchforge::settings::Profile;
 use std::path::PathBuf;
+use stitchforge::settings::Profile;
+use stitchforge::{design, export, import, settings, sheet, thread};
 
 #[derive(Parser)]
 #[command(
@@ -42,6 +41,11 @@ enum Command {
         /// Thread color as hex, e.g. "#1d3a8a"
         #[arg(long, default_value = "#18243f")]
         color: String,
+        #[command(flatten)]
+        out: OutputArgs,
+    },
+    /// Write the Gate 1 calibration sampler (a test design to sew)
+    Sampler {
         #[command(flatten)]
         out: OutputArgs,
     },
@@ -80,6 +84,9 @@ struct OutputArgs {
     /// Base file name (defaults to the input name)
     #[arg(long)]
     name: Option<String>,
+    /// Machine formats to write, comma separated: dst, pes, exp
+    #[arg(long, default_value = "dst")]
+    formats: String,
     /// Print a JSON summary (for scripts and AI agents)
     #[arg(long)]
     json: bool,
@@ -129,6 +136,23 @@ fn main() {
                 ..out
             };
             rgb.and_then(|rgb| import::load_text(&text, font.as_deref(), font_file.as_deref(), rgb))
+                .and_then(|art| produce(art, &name, &out))
+        }
+        Command::Sampler { out } => {
+            let name = out
+                .name
+                .clone()
+                .unwrap_or_else(|| "calibration-sampler".into());
+            let out = OutputArgs {
+                notes: if out.notes.is_empty() {
+                    stitchforge::sampler::NOTES.into()
+                } else {
+                    out.notes.clone()
+                },
+                ..out
+            };
+            import::font_options(None)
+                .and_then(|(opt, _)| import::load_svg_str(&stitchforge::sampler::svg(), &opt))
                 .and_then(|art| produce(art, &name, &out))
         }
         Command::Fonts => {
@@ -198,7 +222,15 @@ fn produce(mut art: import::Artwork, name: &str, o: &OutputArgs) -> Result<(), S
             },
             notes: o.notes.clone(),
         };
-        let summary = export::write_all(&d, &job, &o.out_dir, &generated)?.summary;
+        let fmts: Vec<stitchforge::formats::Format> = o
+            .formats
+            .split(',')
+            .map(|f| {
+                stitchforge::formats::Format::from_ext(f.trim())
+                    .ok_or(format!("unknown format '{f}' (use dst, pes, exp)"))
+            })
+            .collect::<Result<_, _>>()?;
+        let summary = export::write_formats(&d, &job, &o.out_dir, &generated, &fmts)?.summary;
         if !o.json {
             print_human(&d, &base, &o.out_dir);
         }
@@ -244,27 +276,35 @@ fn print_human(d: &design::Design, base: &str, dir: &std::path::Path) {
 }
 
 fn inspect(file: &PathBuf) -> Result<(), String> {
-    let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
-    let d = dst::read(&bytes)?;
-    let (mut minx, mut maxx, mut miny, mut maxy) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
-    for &(x, y) in &d.stitches {
-        minx = minx.min(x);
-        maxx = maxx.max(x);
-        miny = miny.min(y);
-        maxy = maxy.max(y);
+    use stitchforge::design::Cmd;
+    let f = stitchforge::formats::read_file(file)?;
+    let (mut st, mut jumps, mut trims) = (0, 0, 0);
+    let (mut minx, mut maxx, mut miny, mut maxy) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for c in &f.cmds {
+        match c {
+            Cmd::Stitch(p) => {
+                st += 1;
+                minx = minx.min(p.x);
+                maxx = maxx.max(p.x);
+                miny = miny.min(p.y);
+                maxy = maxy.max(p.y);
+            }
+            Cmd::Jump(_) => jumps += 1,
+            Cmd::Trim => trims += 1,
+            _ => {}
+        }
     }
     println!(
-        "{}: label '{}' · {} stitches (header {}) · {} jumps · {} color changes (header {}) · size {:.1} x {:.1} mm · end marker {}",
+        "{} ({}): label '{}' · {} stitches · {} jumps · {} trims · {} color stops · size {:.1} x {:.1} mm",
         file.display(),
-        d.label,
-        d.stitches.len(),
-        d.header_stitches,
-        d.jumps,
-        d.color_changes,
-        d.header_colors,
-        (maxx - minx) as f64 / 10.0,
-        (maxy - miny) as f64 / 10.0,
-        if d.ended { "ok" } else { "MISSING" }
+        f.format,
+        f.label,
+        st,
+        jumps,
+        trims,
+        f.stop_colors.len(),
+        maxx - minx,
+        maxy - miny
     );
     Ok(())
 }

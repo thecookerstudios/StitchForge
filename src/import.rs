@@ -3,10 +3,11 @@
 //! so no special embroidery font format is ever needed.
 
 use crate::geom::{BBox, FillRule, Pt, Ring};
+use serde::{Deserialize, Serialize};
 
 use usvg::tiny_skia_path::PathSegment;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ShapeKind {
     /// Closed area to be filled (fill or satin, decided by width).
     Area { rings: Vec<Ring>, rule: FillRule },
@@ -15,7 +16,7 @@ pub enum ShapeKind {
 }
 
 /// How a layer should stitch. `Auto` lets the engine decide by shape width.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StitchChoice {
     #[default]
     Auto,
@@ -28,7 +29,13 @@ pub enum StitchChoice {
 }
 
 impl StitchChoice {
-    pub const ALL: [StitchChoice; 5] = [StitchChoice::Auto, StitchChoice::Fill, StitchChoice::Satin, StitchChoice::Run, StitchChoice::TripleRun];
+    pub const ALL: [StitchChoice; 5] = [
+        StitchChoice::Auto,
+        StitchChoice::Fill,
+        StitchChoice::Satin,
+        StitchChoice::Run,
+        StitchChoice::TripleRun,
+    ];
     pub fn label(&self) -> &'static str {
         match self {
             StitchChoice::Auto => "Auto (by width)",
@@ -42,7 +49,7 @@ impl StitchChoice {
 
 /// Per-layer choices made by the user. Anything left `None`/`Auto` is decided
 /// by the engine.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ShapeOpts {
     pub stitch: StitchChoice,
     /// Stitch direction in degrees (0 = horizontal, counter-clockwise).
@@ -56,7 +63,7 @@ pub struct ShapeOpts {
     pub layer: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Shape {
     pub kind: ShapeKind,
     pub rgb: [u8; 3],
@@ -125,6 +132,15 @@ pub fn load_svg_str(svg: &str, opt: &usvg::Options) -> Result<Artwork, String> {
     };
     let mut groups = 0usize;
     walk(tree.root(), &mut art, None, &mut groups);
+    // Each source element is its own layer unless the caller regroups them.
+    for (i, sh) in art.shapes.iter_mut().enumerate() {
+        sh.opts.layer = i;
+    }
+    // Stitch instructions in element ids/names: sf-satin, sf-fill, sf-run,
+    // sf-triple, sf-angle-45. Lets designers set stitching in their art app.
+    for sh in &mut art.shapes {
+        apply_id_tags(&mut sh.opts, &sh.label);
+    }
     if art.shapes.is_empty() {
         return Err("no stitchable shapes found in the artwork".into());
     }
@@ -162,20 +178,36 @@ pub fn load_text(
 }
 
 /// Text to artwork with an already-loaded font database (fast for the app).
-pub fn load_text_with(opt: &usvg::Options, text: &str, fam: &str, rgb: [u8; 3]) -> Result<Artwork, String> {
-    let esc = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+pub fn load_text_with(
+    opt: &usvg::Options,
+    text: &str,
+    fam: &str,
+    rgb: [u8; 3],
+) -> Result<Artwork, String> {
+    let esc = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     let fam_esc = fam.replace('"', "").replace('\'', "");
     // One <tspan> per line so multi-line text keeps its layout.
     let lines: String = esc
         .lines()
         .enumerate()
-        .map(|(i, l)| format!("<tspan x='10' y='{}'>{}</tspan>", 300 + i * 240, if l.is_empty() { " " } else { l }))
+        .map(|(i, l)| {
+            format!(
+                "<tspan x='10' y='{}'>{}</tspan>",
+                300 + i * 240,
+                if l.is_empty() { " " } else { l }
+            )
+        })
         .collect();
     let svg = format!(
         "<svg xmlns='http://www.w3.org/2000/svg' width='6000' height='{}'>\
          <text xml:space='preserve' font-family=\"'{fam_esc}'\" font-size='200' fill='#{:02x}{:02x}{:02x}'>{lines}</text></svg>",
         400 + 240 * esc.lines().count().max(1),
-        rgb[0], rgb[1], rgb[2]
+        rgb[0],
+        rgb[1],
+        rgb[2]
     );
     let mut art = load_svg_str(&svg, opt)?;
     for s in &mut art.shapes {
@@ -183,6 +215,29 @@ pub fn load_text_with(opt: &usvg::Options, text: &str, fam: &str, rgb: [u8; 3]) 
         s.group = 0;
     }
     Ok(art)
+}
+
+/// Read `sf-…` instructions from an element id (see `load_svg_str`).
+pub fn apply_id_tags(opts: &mut ShapeOpts, id: &str) {
+    let id = id.to_ascii_lowercase();
+    if id.contains("sf-satin") {
+        opts.stitch = StitchChoice::Satin;
+    } else if id.contains("sf-fill") {
+        opts.stitch = StitchChoice::Fill;
+    } else if id.contains("sf-triple") {
+        opts.stitch = StitchChoice::TripleRun;
+    } else if id.contains("sf-run") {
+        opts.stitch = StitchChoice::Run;
+    }
+    if let Some(i) = id.find("sf-angle-") {
+        let num: String = id[i + 9..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if let Ok(a) = num.parse::<f64>() {
+            opts.angle_deg = Some(a.rem_euclid(180.0));
+        }
+    }
 }
 
 /// `outer` is an extra transform applied after each path's own: text
@@ -204,10 +259,15 @@ fn walk(g: &usvg::Group, art: &mut Artwork, outer: Option<usvg::Transform>, grou
                     s.group = g;
                 }
                 *groups = g;
-                let label = if t.id().is_empty() {
-                    "Lettering".to_string()
-                } else {
+                // Name text by its words (or its id when it has one).
+                let words: String = t.chunks().iter().map(|c| c.text()).collect::<Vec<_>>().join(" ");
+                let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+                let label = if !t.id().is_empty() {
                     t.id().to_string()
+                } else if !words.is_empty() {
+                    words.chars().take(28).collect()
+                } else {
+                    "Lettering".to_string()
                 };
                 for s in &mut art.shapes[first..] {
                     if s.label.is_empty() {
@@ -353,7 +413,11 @@ fn add_path(p: &usvg::Path, art: &mut Artwork, outer: Option<usvg::Transform>, g
             art.shapes.push(Shape {
                 kind: ShapeKind::Line { paths, width },
                 rgb: paint_rgb(stroke.paint()),
-                label: if p.id().is_empty() { String::new() } else { format!("{} outline", p.id()) },
+                label: if p.id().is_empty() {
+                    String::new()
+                } else {
+                    format!("{} outline", p.id())
+                },
                 group,
                 opts: ShapeOpts::default(),
             });

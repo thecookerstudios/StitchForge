@@ -1,9 +1,9 @@
 //! Geometry primitives: points, rings, scanline slicing.
 //! All design coordinates are millimetres, x right, y down (SVG convention).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Pt {
     pub x: f64,
     pub y: f64,
@@ -49,7 +49,7 @@ impl Pt {
 /// A closed ring (last point is NOT repeated).
 pub type Ring = Vec<Pt>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FillRule {
     NonZero,
     EvenOdd,
@@ -468,6 +468,42 @@ pub fn principal_angle(rings: &[Ring]) -> f64 {
         xy += d.x * d.y;
     }
     0.5 * (2.0 * xy).atan2(xx - yy)
+}
+
+/// How elongated a shape is: ratio of its long to short spread (1.0 = no
+/// clear direction, like a circle or square).
+pub fn elongation(rings: &[Ring]) -> f64 {
+    let mut pts = Vec::new();
+    for r in rings {
+        let n = r.len();
+        for i in 0..n {
+            let (p, q) = (r[i], r[(i + 1) % n]);
+            let steps = (p.dist(q) / 0.5).ceil().max(1.0) as usize;
+            for k in 0..steps {
+                pts.push(p.lerp(q, k as f64 / steps as f64));
+            }
+        }
+    }
+    if pts.len() < 3 {
+        return 1.0;
+    }
+    let n = pts.len() as f64;
+    let c = pts
+        .iter()
+        .fold(Pt::new(0.0, 0.0), |a, p| a.add(*p))
+        .mul(1.0 / n);
+    let (mut xx, mut yy, mut xy) = (0.0, 0.0, 0.0);
+    for p in &pts {
+        let d = p.sub(c);
+        xx += d.x * d.x;
+        yy += d.y * d.y;
+        xy += d.x * d.y;
+    }
+    let tr = xx + yy;
+    let det = xx * yy - xy * xy;
+    let disc = (tr * tr / 4.0 - det).max(0.0).sqrt();
+    let (l1, l2) = (tr / 2.0 + disc, (tr / 2.0 - disc).max(1e-12));
+    (l1 / l2).sqrt()
 }
 
 pub fn rotate_rings(rings: &[Ring], a: f64) -> Vec<Ring> {

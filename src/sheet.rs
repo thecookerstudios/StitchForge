@@ -2,9 +2,9 @@
 //! sheet (HTML, prints to PDF from any browser), and the colour-stop CSV.
 
 use crate::design::{Cmd, Design};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct JobInfo {
     pub job: String,
     pub customer: String,

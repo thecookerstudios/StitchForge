@@ -62,7 +62,10 @@ pub struct BuildOptions {
 
 impl Default for BuildOptions {
     fn default() -> Self {
-        BuildOptions { keep_order: false, auto_stops: true }
+        BuildOptions {
+            keep_order: false,
+            auto_stops: true,
+        }
     }
 }
 
@@ -106,10 +109,19 @@ pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox, keep_order: b
         idx.sort_by_key(|&i| {
             let o = &objs[i];
             let b = &o.bbox;
-            let d = if b.min.x <= cx && b.max.x >= cx { 0.0 } else { (b.min.x - cx).abs().min((b.max.x - cx).abs()) };
+            let d = if b.min.x <= cx && b.max.x >= cx {
+                0.0
+            } else {
+                (b.min.x - cx).abs().min((b.max.x - cx).abs())
+            };
             match profile {
                 Profile::Flat => (o.layer, 0, 0, i),
-                Profile::Cap => (o.layer, (d / 5.0).floor() as i64, -(b.max.y * 10.0) as i64, i),
+                Profile::Cap => (
+                    o.layer,
+                    (d / 5.0).floor() as i64,
+                    -(b.max.y * 10.0) as i64,
+                    i,
+                ),
             }
         });
         return idx;
@@ -163,7 +175,13 @@ pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox, keep_order: b
     order
 }
 
-pub fn build(name: &str, art: &Artwork, chart: &[Thread], recipe: &Recipe, profile: Profile) -> Result<Design, String> {
+pub fn build(
+    name: &str,
+    art: &Artwork,
+    chart: &[Thread],
+    recipe: &Recipe,
+    profile: Profile,
+) -> Result<Design, String> {
     build_with(name, art, chart, recipe, profile, BuildOptions::default())
 }
 
@@ -238,7 +256,12 @@ pub fn build_with(
                 }
             };
             cmds.push(Cmd::Color(stops.len()));
-            stops.push(Stop { thread: chart[o.thread].clone(), needle, stitches: 0, objects: Vec::new() });
+            stops.push(Stop {
+                thread: chart[o.thread].clone(),
+                needle,
+                stitches: 0,
+                objects: Vec::new(),
+            });
             cur_thread = Some(o.thread);
             starts_stop = true;
         } else if differs && layer_start {
@@ -371,6 +394,101 @@ fn count_stitches(cmds: &[Cmd]) -> usize {
     cmds.iter().filter(|c| matches!(c, Cmd::Stitch(_))).count()
 }
 
+/// Build a viewable design from an existing stitch file (DST/EXP/PES):
+/// one "object" per colour stop, threads chosen by the user.
+pub fn from_machine(
+    name: &str,
+    cmds: Vec<Cmd>,
+    threads: &[Thread],
+    profile: Profile,
+    recipe: &Recipe,
+) -> Result<Design, String> {
+    let mut bbox = BBox::empty();
+    for c in &cmds {
+        if let Cmd::Stitch(p) = c {
+            bbox.add(*p);
+        }
+    }
+    if !bbox.is_valid() {
+        return Err("the file contains no stitches".into());
+    }
+    let mut stops: Vec<Stop> = Vec::new();
+    let mut objects = Vec::new();
+    let mut needles: Vec<Thread> = Vec::new();
+    let mut start = 0usize;
+    let mut count = 0usize;
+    let mut trims = 0usize;
+    let close = |stops: &mut Vec<Stop>,
+                 objects: &mut Vec<ObjectInfo>,
+                 end: usize,
+                 count: usize,
+                 trims: usize,
+                 start: usize| {
+        let i = stops.len().wrapping_sub(1);
+        if let Some(st) = stops.last_mut() {
+            st.stitches = count;
+            objects.push(ObjectInfo {
+                sequence: i + 1,
+                label: format!("Stop {}", i + 1),
+                stitch_type: "Stitches",
+                thread_code: st.thread.code.clone(),
+                color_match_delta_e: 0.0,
+                stitches: count,
+                trims,
+                cmd_range: (start, end),
+                layer: i,
+                stop: i,
+                starts_stop: true,
+                angle_deg: 0.0,
+                wanted_thread: i,
+            });
+        }
+    };
+    for (i, c) in cmds.iter().enumerate() {
+        match c {
+            Cmd::Color(k) => {
+                close(&mut stops, &mut objects, i, count, trims, start);
+                let t = threads
+                    .get(*k)
+                    .cloned()
+                    .unwrap_or_else(|| crate::thread::generic_chart()[k % 31].clone());
+                let needle = match needles.iter().position(|n| *n == t) {
+                    Some(n) => n + 1,
+                    None => {
+                        needles.push(t.clone());
+                        needles.len()
+                    }
+                };
+                stops.push(Stop {
+                    thread: t,
+                    needle,
+                    stitches: 0,
+                    objects: vec![format!("Stop {}", k + 1)],
+                });
+                start = i;
+                count = 0;
+                trims = 0;
+            }
+            Cmd::Stitch(_) => count += 1,
+            Cmd::Trim => trims += 1,
+            _ => {}
+        }
+    }
+    close(&mut stops, &mut objects, cmds.len(), count, trims, start);
+    let stats = compute_stats(&cmds, &bbox, profile);
+    Ok(Design {
+        name: name.into(),
+        profile,
+        recipe: recipe.clone(),
+        cmds,
+        stops,
+        objects,
+        stats,
+        bbox,
+        warnings: Vec::new(),
+    })
+}
+
 fn compute_stats(cmds: &[Cmd], bbox: &BBox, profile: Profile) -> Stats {
     let mut s = Stats {
         width_mm: bbox.width(),
@@ -420,13 +538,25 @@ mod tests {
     use crate::import::{Shape, ShapeKind, ShapeOpts};
 
     fn square(x: f64, rgb: [u8; 3], layer: usize, stop: Option<bool>) -> Shape {
-        let r = vec![Pt::new(x, 0.0), Pt::new(x + 8.0, 0.0), Pt::new(x + 8.0, 8.0), Pt::new(x, 8.0)];
+        let r = vec![
+            Pt::new(x, 0.0),
+            Pt::new(x + 8.0, 0.0),
+            Pt::new(x + 8.0, 8.0),
+            Pt::new(x, 8.0),
+        ];
         Shape {
-            kind: ShapeKind::Area { rings: vec![r], rule: FillRule::NonZero },
+            kind: ShapeKind::Area {
+                rings: vec![r],
+                rule: FillRule::NonZero,
+            },
             rgb,
             label: format!("L{layer}"),
             group: layer,
-            opts: ShapeOpts { layer, stop, ..Default::default() },
+            opts: ShapeOpts {
+                layer,
+                stop,
+                ..Default::default()
+            },
         }
     }
 
@@ -434,13 +564,30 @@ mod tests {
     fn stop_off_holds_for_every_piece_of_a_layer() {
         // Layer 0 green; layer 1 black with two separate pieces and its stop off.
         let mut s2 = square(20.0, [10, 10, 10], 1, Some(false));
-        if let (ShapeKind::Area { rings, .. }, ShapeKind::Area { rings: r2, .. }) = (&mut s2.kind, square(40.0, [10, 10, 10], 1, Some(false)).kind) {
+        if let (ShapeKind::Area { rings, .. }, ShapeKind::Area { rings: r2, .. }) = (
+            &mut s2.kind,
+            square(40.0, [10, 10, 10], 1, Some(false)).kind,
+        ) {
             rings.extend(r2);
         }
-        let art = Artwork { shapes: vec![square(0.0, [20, 140, 70], 0, None), s2], warnings: vec![] };
+        let art = Artwork {
+            shapes: vec![square(0.0, [20, 140, 70], 0, None), s2],
+            warnings: vec![],
+        };
         let chart = crate::thread::generic_chart();
         let r = crate::settings::recipe("pique").unwrap();
-        let d = build_with("t", &art, &chart, &r, Profile::Flat, BuildOptions { keep_order: true, auto_stops: true }).unwrap();
+        let d = build_with(
+            "t",
+            &art,
+            &chart,
+            &r,
+            Profile::Flat,
+            BuildOptions {
+                keep_order: true,
+                auto_stops: true,
+            },
+        )
+        .unwrap();
         assert_eq!(d.stops.len(), 1, "no stop anywhere in layer 1");
         assert!(d.objects.iter().all(|o| o.stop == 0));
     }
@@ -448,12 +595,26 @@ mod tests {
     #[test]
     fn forced_stop_with_same_thread() {
         let art = Artwork {
-            shapes: vec![square(0.0, [20, 140, 70], 0, None), square(20.0, [20, 140, 70], 1, Some(true))],
+            shapes: vec![
+                square(0.0, [20, 140, 70], 0, None),
+                square(20.0, [20, 140, 70], 1, Some(true)),
+            ],
             warnings: vec![],
         };
         let chart = crate::thread::generic_chart();
         let r = crate::settings::recipe("pique").unwrap();
-        let d = build_with("t", &art, &chart, &r, Profile::Flat, BuildOptions { keep_order: true, auto_stops: true }).unwrap();
+        let d = build_with(
+            "t",
+            &art,
+            &chart,
+            &r,
+            Profile::Flat,
+            BuildOptions {
+                keep_order: true,
+                auto_stops: true,
+            },
+        )
+        .unwrap();
         assert_eq!(d.stops.len(), 2);
     }
 }

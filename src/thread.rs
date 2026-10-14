@@ -2,9 +2,9 @@
 //! not raw RGB). The built-in chart is an original generic 40 wt palette;
 //! brand charts load from CSV: `code,name,r,g,b`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Thread {
     pub brand: String,
     pub code: String,

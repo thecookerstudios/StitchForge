@@ -2,11 +2,11 @@
 //! (how a design sews: flat goods vs caps). Both are plain data so shops can
 //! later edit and share them.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Recipe {
-    pub name: &'static str,
+    pub name: String,
     /// Spacing between fill rows (mm).
     pub fill_spacing: f64,
     /// Fill stitch length (mm).
@@ -19,58 +19,58 @@ pub struct Recipe {
     pub underlay_spacing: f64,
     /// How far underlay stays inside the edge (mm).
     pub underlay_inset: f64,
-    pub backing: &'static str,
-    pub topping: &'static str,
+    pub backing: String,
+    pub topping: String,
 }
 
 pub fn recipe(name: &str) -> Option<Recipe> {
     let base = Recipe {
-        name: "pique",
+        name: "pique".into(),
         fill_spacing: 0.40,
         fill_len: 3.5,
         satin_spacing: 0.40,
         pull_comp: 0.25,
         underlay_spacing: 2.5,
         underlay_inset: 0.6,
-        backing: "Cutaway 2.5 oz",
-        topping: "None",
+        backing: "Cutaway 2.5 oz".into(),
+        topping: "None".into(),
     };
     Some(match name {
         "pique" => base,
         "tshirt" => Recipe {
-            name: "tshirt",
+            name: "tshirt".into(),
             fill_spacing: 0.45,
             pull_comp: 0.30,
             underlay_spacing: 2.0,
-            backing: "No-show mesh cutaway",
+            backing: "No-show mesh cutaway".into(),
             ..base
         },
         "fleece" => Recipe {
-            name: "fleece",
+            name: "fleece".into(),
             fill_spacing: 0.42,
             underlay_spacing: 2.0,
-            topping: "Water-soluble film",
+            topping: "Water-soluble film".into(),
             ..base
         },
         "twill" => Recipe {
-            name: "twill",
+            name: "twill".into(),
             pull_comp: 0.20,
-            backing: "Tearaway 2.0 oz",
+            backing: "Tearaway 2.0 oz".into(),
             ..base
         },
         "cap" => Recipe {
-            name: "cap",
+            name: "cap".into(),
             pull_comp: 0.30,
             underlay_spacing: 2.0,
-            backing: "Cap tearaway 3.0 oz",
+            backing: "Cap tearaway 3.0 oz".into(),
             ..base
         },
         "towel" => Recipe {
-            name: "towel",
+            name: "towel".into(),
             fill_spacing: 0.38,
             underlay_spacing: 1.8,
-            topping: "Water-soluble film",
-            backing: "Tearaway 2.0 oz",
+            topping: "Water-soluble film".into(),
+            backing: "Tearaway 2.0 oz".into(),
             ..base
         },
         _ => return None,
@@ -79,7 +79,7 @@ pub fn recipe(name: &str) -> Option<Recipe> {
 
 pub const RECIPES: &[&str] = &["pique", "tshirt", "fleece", "twill", "cap", "towel"];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Profile {
     /// Flat goods: sew by stacking order, merging colours, shortest travel.
     Flat,
