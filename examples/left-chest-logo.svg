@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300" viewBox="0 0 400 300">
+  <!-- Original sample art for testing: badge, mountain, sun, ring, banner text -->
+  <circle id="Badge" cx="200" cy="140" r="120" fill="#1b2d5c"/>
+  <circle id="Ring" cx="200" cy="140" r="104" fill="none" stroke="#f2b51c" stroke-width="6"/>
+  <circle id="Sun" cx="245" cy="105" r="26" fill="#f2b51c"/>
+  <path id="Mountain" d="M110 200 L170 110 L200 150 L225 120 L290 200 Z" fill="#2e8b57"/>
+  <path id="Snowcap" d="M170 110 L186 134 L176 130 L166 138 L158 128 Z" fill="#ffffff"/>
+  <rect id="Banner" x="60" y="215" width="280" height="56" rx="8" fill="#c41e3a"/>
+  <text id="BannerText" x="200" y="254" font-family="Poppins" font-weight="700" font-size="34" text-anchor="middle" fill="#ffffff">SUNNY HILL</text>
+</svg>
