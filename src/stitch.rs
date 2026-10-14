@@ -2,7 +2,7 @@
 //! stitches are always regenerated from them.
 
 use crate::geom::*;
-use crate::import::{Artwork, ShapeKind};
+use crate::import::{Artwork, ShapeKind, StitchChoice};
 use crate::settings::{Limits, Profile, Recipe};
 use crate::thread::{Thread, nearest};
 use serde::Serialize;
@@ -49,6 +49,9 @@ pub struct Planned {
     pub angle: f64,
     /// Upper-layer areas this object tucks under (not stitched twice).
     pub knockouts: Vec<(Vec<Ring>, FillRule)>,
+    /// Layer this object came from, and that layer's stop setting.
+    pub layer: usize,
+    pub stop: Option<bool>,
 }
 
 /// Overlap left under an upper layer's edge so no fabric shows (mm).
@@ -135,44 +138,65 @@ pub fn plan(
 ) -> Vec<Planned> {
     let mut out = Vec::new();
     for (i, s) in art.shapes.iter().enumerate() {
-        let (thread, color_error) = nearest(chart, s.rgb);
+        let o = &s.opts;
+        let (thread, color_error) = match o.thread.filter(|t| *t < chart.len()) {
+            Some(t) => (t, 0.0),
+            None => nearest(chart, s.rgb),
+        };
         let bbox = BBox::of(s.points());
-        let name = if s.label.is_empty() {
-            format!("Object {}", i + 1)
-        } else {
-            s.label.clone()
+        let name = if s.label.is_empty() { format!("Object {}", i + 1) } else { s.label.clone() };
+        // User angle: degrees counter-clockwise on screen (y runs down here).
+        let user_angle = o.angle_deg.map(|d| -d.to_radians());
+        let mk = |label: String, kind: StitchType, shape: ShapeKind, bbox: BBox, angle: f64| Planned {
+            label,
+            kind,
+            shape,
+            thread,
+            color_error,
+            stack: i,
+            bbox,
+            angle,
+            knockouts: Vec::new(),
+            layer: o.layer,
+            stop: o.stop,
         };
         match &s.kind {
-            ShapeKind::Area {
-                rings: all_rings,
-                rule,
-            } => {
+            ShapeKind::Area { rings: all_rings, rule } => {
+                if matches!(o.stitch, StitchChoice::Run | StitchChoice::TripleRun) {
+                    // Outline only: run around every ring.
+                    let paths: Vec<Vec<Pt>> = all_rings
+                        .iter()
+                        .map(|r| {
+                            let mut p = r.clone();
+                            p.push(r[0]);
+                            p
+                        })
+                        .collect();
+                    let kind = if o.stitch == StitchChoice::Run { StitchType::Run } else { StitchType::TripleRun };
+                    out.push(mk(name, kind, ShapeKind::Line { paths, width: 0.3 }, bbox, 0.0));
+                    continue;
+                }
                 let islands = split_islands(all_rings, *rule);
                 let many = islands.len() > 1;
                 for (k, rings) in islands.iter().enumerate() {
-                    let rings = rings;
-                    let name = if many {
-                        format!("{name} {}", k + 1)
-                    } else {
-                        name.clone()
-                    };
+                    let name = if many { format!("{name} {}", k + 1) } else { name.clone() };
                     let bbox = BBox::of(rings.iter().flatten());
-                    let shape = ShapeKind::Area {
-                        rings: rings.clone(),
-                        rule: *rule,
-                    };
+                    let shape = ShapeKind::Area { rings: rings.clone(), rule: *rule };
                     let area = rings_area(rings, *rule);
                     if area < Limits::MIN_AREA {
-                        warnings.push(format!(
-                            "{name}: area {area:.2} mm² too small to stitch, skipped"
-                        ));
+                        warnings.push(format!("{name}: area {area:.2} mm² too small to stitch, skipped"));
                         continue;
                     }
                     let thickness = 2.0 * area / rings_perimeter(rings).max(1e-9);
                     let pa = principal_angle(rings);
                     let mut satin_angle = pa + FRAC_PI_2;
                     let mut kind = StitchType::Fill;
-                    if thickness <= Limits::SATIN_THICKNESS {
+                    let consider_satin = match o.stitch {
+                        StitchChoice::Fill => false,
+                        StitchChoice::Satin => true,
+                        _ => thickness <= Limits::SATIN_THICKNESS,
+                    };
+                    if consider_satin {
                         // Satin runs across the strokes: try angles every 15° and
                         // keep the one with the shortest average stitch.
                         let mut best = (f64::MAX, satin_angle, f64::MAX);
@@ -191,52 +215,32 @@ pub fn plan(
                             }
                         }
                         satin_angle = best.1;
-                        if best.2 <= Limits::SATIN_MAX * 1.25 {
+                        if o.stitch == StitchChoice::Satin || best.2 <= Limits::SATIN_MAX * 1.25 {
                             kind = StitchType::Satin;
                         }
                     }
-                    let angle = match (kind, profile) {
-                        (StitchType::Satin, _) => satin_angle,
-                        (_, Profile::Cap) => 0.0, // horizontal rows, sewn bottom to top
+                    let angle = match (user_angle, kind, profile) {
+                        (Some(a), _, _) => a,
+                        (None, StitchType::Satin, _) => satin_angle,
+                        (None, _, Profile::Cap) => 0.0, // horizontal rows, sewn bottom to top
                         _ => pa,
                     };
-                    out.push(Planned {
-                        label: name,
-                        kind,
-                        shape,
-                        thread,
-                        color_error,
-                        stack: i,
-                        bbox,
-                        angle,
-                        knockouts: Vec::new(),
-                    });
+                    out.push(mk(name, kind, shape, bbox, angle));
                 }
             }
             ShapeKind::Line { width, .. } => {
-                let kind = if *width >= Limits::STROKE_SATIN_MIN {
-                    StitchType::SatinColumn
-                } else if *width >= 0.6 {
-                    StitchType::TripleRun
-                } else {
-                    StitchType::Run
+                let kind = match o.stitch {
+                    StitchChoice::Satin => StitchType::SatinColumn,
+                    StitchChoice::Run => StitchType::Run,
+                    StitchChoice::TripleRun => StitchType::TripleRun,
+                    _ if *width >= Limits::STROKE_SATIN_MIN => StitchType::SatinColumn,
+                    _ if *width >= 0.6 => StitchType::TripleRun,
+                    _ => StitchType::Run,
                 };
-                if *width > Limits::SATIN_MAX {
-                    warnings.push(format!(
-                        "{name}: stroke {width:.1} mm wide; satin stitches will be split"
-                    ));
+                if *width > Limits::SATIN_MAX && kind == StitchType::SatinColumn {
+                    warnings.push(format!("{name}: stroke {width:.1} mm wide; satin stitches will be split"));
                 }
-                out.push(Planned {
-                    label: name,
-                    kind,
-                    shape: s.kind.clone(),
-                    thread,
-                    color_error,
-                    stack: i,
-                    bbox,
-                    angle: 0.0,
-                    knockouts: Vec::new(),
-                });
+                out.push(mk(name, kind, s.kind.clone(), bbox, 0.0));
             }
         }
     }
@@ -372,23 +376,33 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
             for path in order_paths(&p.visible_paths(paths), cur) {
                 match kind {
                     StitchType::SatinColumn => {
+                        // Underlay runs forward along the whole path, then the
+                        // satin comes back piece by piece. Sharp corners split the
+                        // column and each piece runs past the corner by half the
+                        // width, so corners come out square instead of notched.
                         let half = width / 2.0 + pc;
-                        let samples = resample(&path, r.satin_spacing / 2.0);
-                        let mut sides = Vec::with_capacity(samples.len());
-                        for i in 0..samples.len() {
-                            let a = samples[i.saturating_sub(1)];
-                            let b = samples[(i + 1).min(samples.len() - 1)];
-                            let n = b.sub(a).norm().rot(FRAC_PI_2);
-                            let sgn = if i % 2 == 0 { 1.0 } else { -1.0 };
-                            sides.push(samples[i].add(n.mul(half * sgn)));
-                        }
-                        sides.reverse();
+                        let closed = path.len() > 2 && path[0].dist(*path.last().unwrap()) < 0.05;
+                        let pieces = split_at_corners(&path, 35f64.to_radians());
                         push_section(&mut out, &resample(&path, Limits::RUN_LEN), Limits::RUN_LEN);
-                        push_continue(
-                            &mut out,
-                            &split_long(&sides, Limits::SATIN_MAX),
-                            Limits::SATIN_MAX,
-                        );
+                        let n = pieces.len();
+                        for (k, piece) in pieces.iter().enumerate().rev() {
+                            let mut pc_ = piece.clone();
+                            let ext = width / 2.0;
+                            let extend_start = closed || k > 0;
+                            let extend_end = closed || k + 1 < n;
+                            if extend_start && pc_.len() >= 2 {
+                                let d = pc_[0].sub(pc_[1]).norm();
+                                pc_[0] = pc_[0].add(d.mul(ext));
+                            }
+                            if extend_end && pc_.len() >= 2 {
+                                let m = pc_.len();
+                                let d = pc_[m - 1].sub(pc_[m - 2]).norm();
+                                pc_[m - 1] = pc_[m - 1].add(d.mul(ext));
+                            }
+                            pc_.reverse();
+                            let sides = satin_along(&pc_, half, r.satin_spacing / 2.0);
+                            push_continue(&mut out, &split_long(&sides, Limits::SATIN_MAX), Limits::SATIN_MAX);
+                        }
                     }
                     StitchType::TripleRun => {
                         let pts = resample(&path, Limits::RUN_LEN);
@@ -510,6 +524,42 @@ fn travel_ok(rings: &[Ring], rule: FillRule, a: Pt, b: Pt, hidden: &dyn Fn(Pt) -
     } else {
         hid as f64 >= 0.85 * samples.len() as f64
     }
+}
+
+/// Split a polyline at corners sharper than `max_turn` (radians).
+fn split_at_corners(path: &[Pt], max_turn: f64) -> Vec<Vec<Pt>> {
+    let mut pts: Vec<Pt> = Vec::new();
+    for &p in path {
+        if pts.last().map(|l: &Pt| l.dist(p) > 1e-6).unwrap_or(true) {
+            pts.push(p);
+        }
+    }
+    let mut pieces = vec![vec![]];
+    for i in 0..pts.len() {
+        pieces.last_mut().unwrap().push(pts[i]);
+        if i > 0 && i + 1 < pts.len() {
+            let a = pts[i].sub(pts[i - 1]).norm();
+            let b = pts[i + 1].sub(pts[i]).norm();
+            if (a.x * b.x + a.y * b.y).clamp(-1.0, 1.0).acos() > max_turn {
+                pieces.push(vec![pts[i]]);
+            }
+        }
+    }
+    pieces.into_iter().filter(|p| p.len() >= 2).collect()
+}
+
+/// Zig-zag points along a centre line, `half` to each side.
+fn satin_along(path: &[Pt], half: f64, step: f64) -> Vec<Pt> {
+    let samples = resample(path, step);
+    let mut sides = Vec::with_capacity(samples.len());
+    for i in 0..samples.len() {
+        let a = samples[i.saturating_sub(1)];
+        let b = samples[(i + 1).min(samples.len() - 1)];
+        let n = b.sub(a).norm().rot(FRAC_PI_2);
+        let sgn = if i % 2 == 0 { 1.0 } else { -1.0 };
+        sides.push(samples[i].add(n.mul(half * sgn)));
+    }
+    sides
 }
 
 /// Start a new section: jump to the first point, then sew the rest.

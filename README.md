@@ -1,4 +1,4 @@
-# StitchForge v0.2 — embroidery app (review build)
+# StitchForge v0.3 — embroidery app (review build)
 
 Vector art and any-font text in; machine-ready DST, a printable operator
 spec sheet, and a stitch preview out. Written in Rust, runs on Windows,
@@ -22,18 +22,38 @@ run `cargo run --release`.
 
 ### In the app
 
-- **Open SVG…**, drag an SVG onto the window, **Text…** (any installed font),
-  or **Sample logo**.
-- Right panel: width, **Flat goods / Cap (center-out)**, fabric, production
-  numbers, color stops, warnings, job fields for the operator sheet.
-- **Pro** (top right) adds stitch settings: density, stitch length, pull
-  compensation, underlay, thread chart CSV, and jump/travel display.
-- Left panel: sewing sequence grouped by needle; click an object to highlight it.
-- Bottom: **Play sew-out** steps through the stitches in sewing order
-  (Space = play/pause, F = fit, scroll/pinch = zoom, drag = pan,
-  double-click = fit).
-- **Export DST + sheet…** writes the DST, operator sheet, stops CSV and
-  preview into a folder you choose, and opens the sheet.
+**Layers (left).** Every shape, outline and text block is a layer. Layers sew
+top to bottom.
+- Click a layer (or click it on the canvas) to select it.
+- ▸ expands a layer to show its pieces (letters, islands) with stitch type,
+  angle and stitch count. **Collapse all / Expand all** at the top.
+- 👁 hides a layer (hidden layers don't sew).
+- **STOP** chip: red = the machine stops / changes color before this layer.
+  Click to turn on or off; right-click to go back to automatic. A • means
+  you set it.
+
+**Canvas.** Drag a layer to move it (a fill and its outline move together).
+Arrow keys nudge 0.5 mm (Shift = 5 mm). Delete removes, Cmd/Ctrl+D
+duplicates, Cmd/Ctrl+Z undo, Shift+Cmd/Ctrl+Z redo, Esc deselects.
+Drag empty space to pan, scroll or pinch to zoom, F to fit. The white arrow
+on a selected layer shows its stitch direction.
+
+**Selected layer (right).** Name; words, font and letter height for text
+layers; width; rotation; **thread** from the chart; **stitch type** (auto,
+fill, satin, run outline, triple-run outline); **angle** (auto or set, with
+0/45/90/135 shortcuts); **stop before** (auto/on/off); visible; sew
+earlier/later; duplicate; delete; unlink from its partner layer.
+
+**Design.** Overall width, flat or cap (center-out), fabric, **Sew in my
+layer order**, **Auto-sequence layers** (reorders once: fewer color
+changes on flats, center-out on caps), **Automatic stops at color
+changes** (turn off to place every stop yourself).
+
+**Bottom bar.** Play the sew-out, **3D / Flat** thread view, show jumps,
+fit.
+
+**Export DST + sheet…** writes the DST, operator sheet, stops CSV and
+preview into a folder you choose, and opens the sheet.
 
 ## Command line
 

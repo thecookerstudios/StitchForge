@@ -37,6 +37,33 @@ pub struct ObjectInfo {
     /// Range of `Design::cmds` this object produced.
     #[serde(skip)]
     pub cmd_range: (usize, usize),
+    /// Layer the object belongs to.
+    pub layer: usize,
+    /// Colour stop it sews in, and whether a stop happens right before it.
+    pub stop: usize,
+    pub starts_stop: bool,
+    /// Stitch direction actually used, degrees counter-clockwise (0–180).
+    pub angle_deg: f64,
+    /// Thread the layer asked for (may differ from the stop's thread if the
+    /// stop before it was switched off).
+    #[serde(skip)]
+    pub wanted_thread: usize,
+}
+
+/// How the design is put together.
+#[derive(Clone, Copy, Debug)]
+pub struct BuildOptions {
+    /// Sew layers exactly in their list order (true), or let the garment
+    /// profile reorder them (false).
+    pub keep_order: bool,
+    /// Add a colour stop automatically whenever the thread changes.
+    pub auto_stops: bool,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        BuildOptions { keep_order: false, auto_stops: true }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -70,8 +97,23 @@ pub struct Design {
 /// Flat — keep the current colour as long as possible, then stack order.
 /// Cap  — closest to the vertical centre line first, bottom first, and stay
 ///        on the current colour when objects are equally central.
-pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox) -> Vec<usize> {
+pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox, keep_order: bool) -> Vec<usize> {
     let n = objs.len();
+    if keep_order {
+        // Layers in list order; inside a layer, caps still go center-out.
+        let cx = design.center().x;
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by_key(|&i| {
+            let o = &objs[i];
+            let b = &o.bbox;
+            let d = if b.min.x <= cx && b.max.x >= cx { 0.0 } else { (b.min.x - cx).abs().min((b.max.x - cx).abs()) };
+            match profile {
+                Profile::Flat => (o.layer, 0, 0, i),
+                Profile::Cap => (o.layer, (d / 5.0).floor() as i64, -(b.max.y * 10.0) as i64, i),
+            }
+        });
+        return idx;
+    }
     let mut preds = vec![0usize; n];
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for j in 0..n {
@@ -121,12 +163,17 @@ pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox) -> Vec<usize>
     order
 }
 
-pub fn build(
+pub fn build(name: &str, art: &Artwork, chart: &[Thread], recipe: &Recipe, profile: Profile) -> Result<Design, String> {
+    build_with(name, art, chart, recipe, profile, BuildOptions::default())
+}
+
+pub fn build_with(
     name: &str,
     art: &Artwork,
     chart: &[Thread],
     recipe: &Recipe,
     profile: Profile,
+    opts: BuildOptions,
 ) -> Result<Design, String> {
     let mut warnings = art.warnings.clone();
     let objs = plan(art, chart, profile, &mut warnings);
@@ -138,7 +185,7 @@ pub fn build(
         bbox.add(o.bbox.min);
         bbox.add(o.bbox.max);
     }
-    let order = sequence(&objs, profile, &bbox);
+    let order = sequence(&objs, profile, &bbox, opts.keep_order);
     let anchor = Pt::new(bbox.center().x, bbox.max.y);
 
     let mut cmds = Vec::new();
@@ -148,6 +195,7 @@ pub fn build(
     let mut cur: Option<Pt> = None;
     let mut cur_thread: Option<usize> = None;
     let mut last_dir = Pt::new(1.0, 0.0);
+    let mut last_layer: Option<usize> = None;
 
     for (seq, &oi) in order.iter().enumerate() {
         let o = &objs[oi];
@@ -161,7 +209,19 @@ pub fn build(
             warnings.push(format!("{}: produced no stitches", o.label));
             continue;
         }
-        if cur_thread != Some(o.thread) {
+        // Colour stop before this object?
+        let layer_start = last_layer != Some(o.layer);
+        last_layer = Some(o.layer);
+        let differs = cur_thread != Some(o.thread);
+        let new_stop = if cur_thread.is_none() {
+            true
+        } else if layer_start && o.stop.is_some() {
+            o.stop.unwrap()
+        } else {
+            differs && opts.auto_stops
+        };
+        let mut starts_stop = false;
+        if new_stop {
             if cur_thread.is_some() {
                 tie_off(&mut cmds, cur, last_dir);
                 cmds.push(Cmd::Trim);
@@ -174,13 +234,16 @@ pub fn build(
                 }
             };
             cmds.push(Cmd::Color(stops.len()));
-            stops.push(Stop {
-                thread: chart[o.thread].clone(),
-                needle,
-                stitches: 0,
-                objects: Vec::new(),
-            });
+            stops.push(Stop { thread: chart[o.thread].clone(), needle, stitches: 0, objects: Vec::new() });
             cur_thread = Some(o.thread);
+            starts_stop = true;
+        } else if differs && layer_start {
+            warnings.push(format!(
+                "{}: no stop before it, so it sews in {} instead of {}",
+                o.label,
+                chart[cur_thread.unwrap()].name,
+                chart[o.thread].name
+            ));
         }
         let stop = stops.last_mut().unwrap();
         stop.objects.push(o.label.clone());
@@ -231,6 +294,14 @@ pub fn build(
             stitches: added,
             trims: cmds.iter().filter(|c| matches!(c, Cmd::Trim)).count() - trims_before,
             cmd_range: (cmd_start, cmds.len()),
+            layer: o.layer,
+            stop: stops.len() - 1,
+            starts_stop,
+            angle_deg: {
+                let d = ((-o.angle).to_degrees().rem_euclid(180.0) * 10.0).round() / 10.0;
+                if d >= 180.0 { 0.0 } else { d }
+            },
+            wanted_thread: o.thread,
         });
         if o.kind == StitchType::Satin && o.bbox.width().min(o.bbox.height()) < 1.0 {
             warnings.push(format!(

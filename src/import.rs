@@ -14,11 +14,56 @@ pub enum ShapeKind {
     Line { paths: Vec<Vec<Pt>>, width: f64 },
 }
 
+/// How a layer should stitch. `Auto` lets the engine decide by shape width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StitchChoice {
+    #[default]
+    Auto,
+    Fill,
+    Satin,
+    /// Areas: run stitch along the outline. Lines: single run.
+    Run,
+    /// Areas: triple run along the outline. Lines: triple run.
+    TripleRun,
+}
+
+impl StitchChoice {
+    pub const ALL: [StitchChoice; 5] = [StitchChoice::Auto, StitchChoice::Fill, StitchChoice::Satin, StitchChoice::Run, StitchChoice::TripleRun];
+    pub fn label(&self) -> &'static str {
+        match self {
+            StitchChoice::Auto => "Auto (by width)",
+            StitchChoice::Fill => "Tatami fill",
+            StitchChoice::Satin => "Satin",
+            StitchChoice::Run => "Run (outline)",
+            StitchChoice::TripleRun => "Triple run (outline)",
+        }
+    }
+}
+
+/// Per-layer choices made by the user. Anything left `None`/`Auto` is decided
+/// by the engine.
+#[derive(Clone, Debug, Default)]
+pub struct ShapeOpts {
+    pub stitch: StitchChoice,
+    /// Stitch direction in degrees (0 = horizontal, counter-clockwise).
+    pub angle_deg: Option<f64>,
+    /// Index into the thread chart.
+    pub thread: Option<usize>,
+    /// Machine stop (colour change) before this layer: Some(true) forces one,
+    /// Some(false) suppresses one, None follows the automatic rule.
+    pub stop: Option<bool>,
+    /// Which layer this shape belongs to (its position in the layer list).
+    pub layer: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct Shape {
     pub kind: ShapeKind,
     pub rgb: [u8; 3],
     pub label: String,
+    /// Shapes from the same SVG element (e.g. one text block) share a group.
+    pub group: usize,
+    pub opts: ShapeOpts,
 }
 
 impl Shape {
@@ -78,7 +123,8 @@ pub fn load_svg_str(svg: &str, opt: &usvg::Options) -> Result<Artwork, String> {
         shapes: Vec::new(),
         warnings: Vec::new(),
     };
-    walk(tree.root(), &mut art);
+    let mut groups = 0usize;
+    walk(tree.root(), &mut art, None, &mut groups);
     if art.shapes.is_empty() {
         return Err("no stitchable shapes found in the artwork".into());
     }
@@ -112,31 +158,52 @@ pub fn load_text(
             "font \"{fam}\" is not installed; run `stitchforge fonts` to list fonts or pass --font-file"
         ));
     }
-    let esc = text
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
+    load_text_with(&opt, text, &fam, rgb)
+}
+
+/// Text to artwork with an already-loaded font database (fast for the app).
+pub fn load_text_with(opt: &usvg::Options, text: &str, fam: &str, rgb: [u8; 3]) -> Result<Artwork, String> {
+    let esc = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let fam_esc = fam.replace('"', "").replace('\'', "");
+    // One <tspan> per line so multi-line text keeps its layout.
+    let lines: String = esc
+        .lines()
+        .enumerate()
+        .map(|(i, l)| format!("<tspan x='10' y='{}'>{}</tspan>", 300 + i * 240, if l.is_empty() { " " } else { l }))
+        .collect();
     let svg = format!(
-        "<svg xmlns='http://www.w3.org/2000/svg' width='4000' height='400'>\
-         <text x='10' y='300' font-family=\"'{fam_esc}'\" font-size='200' fill='#{:02x}{:02x}{:02x}'>{esc}</text></svg>",
+        "<svg xmlns='http://www.w3.org/2000/svg' width='6000' height='{}'>\
+         <text xml:space='preserve' font-family=\"'{fam_esc}'\" font-size='200' fill='#{:02x}{:02x}{:02x}'>{lines}</text></svg>",
+        400 + 240 * esc.lines().count().max(1),
         rgb[0], rgb[1], rgb[2]
     );
-    let mut art = load_svg_str(&svg, &opt)?;
+    let mut art = load_svg_str(&svg, opt)?;
     for s in &mut art.shapes {
-        s.label = format!("Text \"{text}\" ({fam})");
+        s.label = text.lines().next().unwrap_or("Text").to_string();
+        s.group = 0;
     }
     Ok(art)
 }
 
-fn walk(g: &usvg::Group, art: &mut Artwork) {
+/// `outer` is an extra transform applied after each path's own: text
+/// outlines live in their text element's space, which usvg keeps separately.
+fn walk(g: &usvg::Group, art: &mut Artwork, outer: Option<usvg::Transform>, groups: &mut usize) {
     for node in g.children() {
         match node {
-            usvg::Node::Group(c) => walk(c, art),
-            usvg::Node::Path(p) => add_path(p, art),
+            usvg::Node::Group(c) => walk(c, art, outer, groups),
+            usvg::Node::Path(p) => {
+                *groups += 1;
+                add_path(p, art, outer, *groups)
+            }
             usvg::Node::Text(t) => {
                 let first = art.shapes.len();
-                walk(t.flattened(), art);
+                *groups += 1;
+                let g = *groups;
+                walk(t.flattened(), art, Some(t.abs_transform()), groups);
+                for s in &mut art.shapes[first..] {
+                    s.group = g;
+                }
+                *groups = g;
                 let label = if t.id().is_empty() {
                     "Lettering".to_string()
                 } else {
@@ -171,11 +238,14 @@ fn stop_rgb(stops: &[usvg::Stop]) -> [u8; 3] {
         .unwrap_or([128, 128, 128])
 }
 
-fn add_path(p: &usvg::Path, art: &mut Artwork) {
+fn add_path(p: &usvg::Path, art: &mut Artwork, outer: Option<usvg::Transform>, group: usize) {
     if !p.is_visible() {
         return;
     }
-    let t = p.abs_transform();
+    let t = match outer {
+        Some(o) => o.pre_concat(p.abs_transform()),
+        None => p.abs_transform(),
+    };
     let map = |x: f32, y: f32| -> Pt {
         let (x, y) = (x as f64, y as f64);
         Pt::new(
@@ -232,6 +302,10 @@ fn add_path(p: &usvg::Path, art: &mut Artwork) {
             }
             PathSegment::Close => {
                 if let Some(f) = cur.first().copied() {
+                    // Close the loop so outlines include the last edge.
+                    if cur.last().map(|l| l.dist(f) > 1e-6).unwrap_or(false) {
+                        cur.push(f);
+                    }
                     flush(&mut cur, true, &mut subs);
                     last = f;
                     cur.push(f);
@@ -267,6 +341,8 @@ fn add_path(p: &usvg::Path, art: &mut Artwork) {
                 kind: ShapeKind::Area { rings, rule },
                 rgb: paint_rgb(fill.paint()),
                 label: p.id().to_string(),
+                group,
+                opts: ShapeOpts::default(),
             });
         }
     }
@@ -277,7 +353,9 @@ fn add_path(p: &usvg::Path, art: &mut Artwork) {
             art.shapes.push(Shape {
                 kind: ShapeKind::Line { paths, width },
                 rgb: paint_rgb(stroke.paint()),
-                label: p.id().to_string(),
+                label: if p.id().is_empty() { String::new() } else { format!("{} outline", p.id()) },
+                group,
+                opts: ShapeOpts::default(),
             });
         }
     }
