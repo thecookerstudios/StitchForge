@@ -1,4 +1,4 @@
-# StitchForge v0.3 — embroidery app (review build)
+# StitchForge v0.4 — embroidery app (review build)
 
 Vector art and any-font text in; machine-ready DST, a printable operator
 spec sheet, and a stitch preview out. Written in Rust, runs on Windows,
@@ -39,12 +39,16 @@ Drag empty space to pan, scroll or pinch to zoom, F to fit. The white arrow
 on a selected layer shows its stitch direction.
 
 **Selected layer (right).** Name; words, font and letter height for text
-layers; width; rotation; **thread** from the chart; **stitch type** (auto,
-fill, satin, run outline, triple-run outline); **angle** (auto or set, with
-0/45/90/135 shortcuts); **stop before** (auto/on/off); visible; sew
-earlier/later; duplicate; delete; unlink from its partner layer.
+layers; **W and H** typed in inches (🔒 keeps proportions, 🔓 lets you
+stretch); rotation; **thread**: search the chart, or **Custom thread** with
+your own color (picker or hex), code and name; **stitch type** (auto, fill,
+satin, run outline, triple-run outline); **angle**: type any number (or
+0/45/90/135), Auto to let StitchForge choose; **stop before** (auto/on/off,
+applies to the whole layer); visible; sew earlier/later; duplicate; delete;
+unlink from its partner layer. Number boxes commit on Enter or when you
+click away.
 
-**Design.** Overall width, flat or cap (center-out), fabric, **Sew in my
+**Design.** Overall width or height (typed), flat or cap (center-out), fabric, **Sew in my
 layer order**, **Auto-sequence layers** (reorders once: fewer color
 changes on flats, center-out on caps), **Automatic stops at color
 changes** (turn off to place every stop yourself).

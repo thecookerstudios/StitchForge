@@ -48,7 +48,13 @@ struct Layer {
     /// Pivot for scale and rotation (centre of the original geometry).
     origin: Pt,
     offset: Pt,
-    scale: f64,
+    /// Horizontal and vertical scale in the layer's own frame.
+    sx: f64,
+    sy: f64,
+    /// Keep width and height in proportion when one is typed.
+    lock: bool,
+    /// A thread the user typed in themselves (code, name, color).
+    custom: Option<thread::Thread>,
     /// Degrees, counter-clockwise on screen.
     rotation: f64,
     opts: ShapeOpts,
@@ -70,7 +76,10 @@ impl Layer {
             origin: b.center(),
             shapes,
             offset: Pt::new(0.0, 0.0),
-            scale: 1.0,
+            sx: 1.0,
+            sy: 1.0,
+            lock: true,
+            custom: None,
             rotation: 0.0,
             opts: ShapeOpts::default(),
             visible: true,
@@ -81,11 +90,11 @@ impl Layer {
     }
 
     fn tf(&self, p: Pt) -> Pt {
-        p.sub(self.origin).mul(self.scale).rot(-self.rotation.to_radians()).add(self.origin).add(self.offset)
+        { let q = p.sub(self.origin); Pt::new(q.x * self.sx, q.y * self.sy) }.rot(-self.rotation.to_radians()).add(self.origin).add(self.offset)
     }
 
     fn inv(&self, p: Pt) -> Pt {
-        p.sub(self.offset).sub(self.origin).rot(self.rotation.to_radians()).mul(1.0 / self.scale).add(self.origin)
+        { let q = p.sub(self.offset).sub(self.origin).rot(self.rotation.to_radians()); Pt::new(q.x / self.sx, q.y / self.sy) }.add(self.origin)
     }
 
     fn transformed(&self) -> Vec<Shape> {
@@ -97,7 +106,7 @@ impl Layer {
                     ShapeKind::Area { rings, .. } => rings.iter_mut().flatten().for_each(|p| *p = self.tf(*p)),
                     ShapeKind::Line { paths, width } => {
                         paths.iter_mut().flatten().for_each(|p| *p = self.tf(*p));
-                        *width *= self.scale;
+                        *width *= (self.sx * self.sy).abs().sqrt();
                     }
                 }
                 s
@@ -115,6 +124,12 @@ impl Layer {
         b
     }
 
+    /// Size in the layer's own frame (before rotation), mm.
+    fn own_size(&self) -> (f64, f64) {
+        let b = BBox::of(self.shapes.iter().flat_map(|s| s.points()));
+        (b.width() * self.sx.abs(), b.height() * self.sy.abs())
+    }
+
     fn center(&self) -> Pt {
         self.origin.add(self.offset)
     }
@@ -122,7 +137,7 @@ impl Layer {
     /// Does the point (design mm) land on this layer?
     fn hit(&self, p: Pt, tol_mm: f64) -> bool {
         let q = self.inv(p);
-        let tol = tol_mm / self.scale;
+        let tol = tol_mm / self.sx.abs().min(self.sy.abs()).max(1e-6);
         self.shapes.iter().any(|s| match &s.kind {
             ShapeKind::Area { rings, rule } => {
                 spans_at(rings, *rule, q.y).iter().any(|&(a, b)| q.x >= a - tol && q.x <= b + tol)
@@ -201,6 +216,7 @@ struct App {
     speed: f32,
     play_acc: f32,
     pending_progress: Option<f32>,
+    pending_zoom: Option<f32>,
 
     status: String,
     last_dir: Option<PathBuf>,
@@ -255,6 +271,7 @@ impl App {
             speed: 600.0,
             play_acc: 0.0,
             pending_progress: None,
+            pending_zoom: None,
             status: "Open an SVG, drop one on the window, or add text.".into(),
             last_dir: None,
         }
@@ -298,10 +315,21 @@ impl App {
                     }
                     i += 1;
                 }
+                "--custom" => {
+                    let rgb = args.get(i + 1).and_then(|v| parse_hex(v));
+                    if let (Some(rgb), Some(l)) = (rgb, self.sel_mut()) {
+                        l.custom = Some(thread::Thread { brand: "Custom".into(), code: "1147".into(), name: "Madeira Gold".into(), rgb });
+                    }
+                    i += 1;
+                }
                 "--stop-off" => {
                     if let Some(l) = self.sel_mut() {
                         l.opts.stop = Some(false);
                     }
+                }
+                "--zoom" => {
+                    self.pending_zoom = num(i + 1).map(|v| v as f32);
+                    i += 1;
                 }
                 "--progress" => {
                     self.pending_progress = num(i + 1).map(|v| v as f32);
@@ -475,11 +503,12 @@ impl App {
 
     /// Copy position, size and rotation from layer `li` to its linked layers.
     fn sync_links(&mut self, li: usize) {
-        let (off, sc, rot) = (self.layers[li].offset, self.layers[li].scale, self.layers[li].rotation);
+        let (off, sx, sy, rot) = (self.layers[li].offset, self.layers[li].sx, self.layers[li].sy, self.layers[li].rotation);
         for j in self.linked(li) {
             let l = &mut self.layers[j];
             l.offset = off;
-            l.scale = sc;
+            l.sx = sx;
+            l.sy = sy;
             l.rotation = rot;
         }
     }
@@ -563,12 +592,19 @@ impl App {
             return;
         }
         let mut shapes = Vec::new();
+        // Custom threads join the chart for this build.
+        let mut chart = self.chart.clone();
         for (li, l) in self.layers.iter().enumerate() {
             if !l.visible {
                 continue;
             }
+            let mut opts = ShapeOpts { layer: li, ..l.opts.clone() };
+            if let Some(t) = &l.custom {
+                chart.push(t.clone());
+                opts.thread = Some(chart.len() - 1);
+            }
             for mut s in l.transformed() {
-                s.opts = ShapeOpts { layer: li, ..l.opts.clone() };
+                s.opts = opts.clone();
                 s.label = l.name.clone();
                 shapes.push(s);
             }
@@ -577,7 +613,7 @@ impl App {
         let name = format!("{}-{}", self.design_name, if self.profile == Profile::Cap { "cap" } else { "flat" });
         let t = std::time::Instant::now();
         let opts = BuildOptions { keep_order: self.keep_order, auto_stops: self.auto_stops };
-        match stitchforge::design::build_with(&name, &art, &self.chart, &self.recipe, self.profile, opts) {
+        match stitchforge::design::build_with(&name, &art, &chart, &self.recipe, self.profile, opts) {
             Ok(d) => {
                 self.progress = match self.pending_progress.take() {
                     Some(f) => (d.cmds.len() as f32 * f) as usize,
@@ -858,26 +894,52 @@ impl App {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Letter height");
-                    let mut h = spec.height_mm / 25.4;
-                    if ui.add(egui::DragValue::new(&mut h).speed(0.01).range(0.15..=8.0).suffix(" in").max_decimals(2)).changed() {
-                        spec.height_mm = h * 25.4;
-                        text_changed = true;
+                    if let Some(h) = num_field(ui, "letter-h", spec.height_mm / 25.4, 2, "in") {
+                        if h > 0.05 {
+                            spec.height_mm = h * 25.4;
+                            text_changed = true;
+                        }
                     }
                 });
             }
+            let (ow, oh) = l.own_size();
             ui.horizontal(|ui| {
-                ui.label("Width");
-                let b = l.bbox();
-                let mut w = b.width() / 25.4;
-                if ui.add(egui::DragValue::new(&mut w).speed(0.01).range(0.1..=16.0).suffix(" in").max_decimals(2)).changed() && b.width() > 0.0 {
-                    l.scale *= w * 25.4 / b.width();
-                    changed = true;
+                ui.label("W");
+                if let Some(w) = num_field(ui, "layer-w", ow / 25.4, 2, "in") {
+                    if w > 0.02 && ow > 0.0 {
+                        let k = w * 25.4 / ow;
+                        l.sx *= k;
+                        if l.lock {
+                            l.sy *= k;
+                        }
+                        changed = true;
+                    }
                 }
-                ui.label(RichText::new(format!("× {:.2} in", b.height() / 25.4)).weak());
+                let lock = if l.lock { "🔒" } else { "🔓" };
+                if ui.add(egui::Button::new(lock).frame(false)).on_hover_text("Lock proportions: typing one size changes the other to match").clicked() {
+                    l.lock = !l.lock;
+                }
+                ui.label("H");
+                if let Some(h) = num_field(ui, "layer-h", oh / 25.4, 2, "in") {
+                    if h > 0.02 && oh > 0.0 {
+                        let k = h * 25.4 / oh;
+                        l.sy *= k;
+                        if l.lock {
+                            l.sx *= k;
+                        }
+                        changed = true;
+                    }
+                }
             });
+            if l.rotation.abs() > 0.01 {
+                ui.label(RichText::new("Sizes are before rotation.").weak().small());
+            }
             ui.horizontal(|ui| {
                 ui.label("Rotate");
-                changed |= ui.add(egui::DragValue::new(&mut l.rotation).speed(0.5).range(-360.0..=360.0).suffix("°").max_decimals(1)).changed();
+                if let Some(r) = num_field(ui, "layer-rot", l.rotation, 1, "°") {
+                    l.rotation = r;
+                    changed = true;
+                }
                 for (lbl, d) in [("−15°", -15.0), ("+15°", 15.0)] {
                     if ui.small_button(lbl).clicked() {
                         l.rotation += d;
@@ -888,30 +950,72 @@ impl App {
 
             section(ui, "Thread");
             let current = l.opts.thread;
-            let shown = match current {
-                Some(t) if t < chart.len() => format!("{} {}", chart[t].code, chart[t].name),
-                _ => "Match artwork color".into(),
+            let shown = if let Some(t) = &l.custom {
+                format!("Custom: {} {}", t.code, t.name)
+            } else {
+                match current {
+                    Some(t) if t < chart.len() => format!("{} {}", chart[t].code, chart[t].name),
+                    _ => "Match artwork color".into(),
+                }
             };
             ui.horizontal(|ui| {
-                if let Some(t) = current.filter(|t| *t < chart.len()) {
+                if let Some(t) = &l.custom {
+                    swatch(ui, t.rgb);
+                } else if let Some(t) = current.filter(|t| *t < chart.len()) {
                     swatch(ui, chart[t].rgb);
                 }
-                egui::ComboBox::from_id_salt("thread").width(230.0).selected_text(shown).show_ui(ui, |ui| {
-                    if ui.selectable_label(current.is_none(), "Match artwork color").clicked() {
+                egui::ComboBox::from_id_salt("thread").width(240.0).height(380.0).selected_text(shown).show_ui(ui, |ui| {
+                    let fid = egui::Id::new("thread-filter");
+                    let mut q: String = ui.data_mut(|d| d.get_temp(fid)).unwrap_or_default();
+                    ui.add(egui::TextEdit::singleline(&mut q).hint_text("Search code or name…").desired_width(220.0));
+                    ui.data_mut(|d| d.insert_temp(fid, q.clone()));
+                    let ql = q.to_lowercase();
+                    if ui.selectable_label(current.is_none() && l.custom.is_none(), "Match artwork color").clicked() {
                         l.opts.thread = None;
+                        l.custom = None;
                         changed = true;
                     }
+                    if ui.selectable_label(l.custom.is_some(), "Custom thread (pick color, type code)…").clicked() {
+                        let rgb = current.filter(|t| *t < chart.len()).map(|t| chart[t].rgb).unwrap_or(l.shapes.first().map(|s| s.rgb).unwrap_or([128; 3]));
+                        l.custom = Some(thread::Thread { brand: "Custom".into(), code: String::new(), name: String::new(), rgb });
+                        changed = true;
+                    }
+                    ui.separator();
                     for (i, t) in chart.iter().enumerate() {
+                        if !ql.is_empty() && !t.code.to_lowercase().contains(&ql) && !t.name.to_lowercase().contains(&ql) {
+                            continue;
+                        }
                         ui.horizontal(|ui| {
                             swatch(ui, t.rgb);
-                            if ui.selectable_label(current == Some(i), format!("{} {}", t.code, t.name)).clicked() {
+                            if ui.selectable_label(current == Some(i) && l.custom.is_none(), format!("{} {}", t.code, t.name)).clicked() {
                                 l.opts.thread = Some(i);
+                                l.custom = None;
                                 changed = true;
                             }
                         });
                     }
                 });
             });
+            if let Some(t) = &mut l.custom {
+                ui.horizontal(|ui| {
+                    ui.label("Color");
+                    changed |= ui.color_edit_button_srgb(&mut t.rgb).changed();
+                    ui.label("Code");
+                    changed |= ui.add(egui::TextEdit::singleline(&mut t.code).hint_text("e.g. 1147").desired_width(70.0)).lost_focus();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    changed |= ui.add(egui::TextEdit::singleline(&mut t.name).hint_text("e.g. Madeira Gold").desired_width(170.0)).lost_focus();
+                    ui.label("Hex");
+                    let hex = format!("#{:02x}{:02x}{:02x}", t.rgb[0], t.rgb[1], t.rgb[2]);
+                    if let Some(v) = text_field(ui, "custom-hex", &hex, 70.0) {
+                        if let Some(rgb) = parse_hex(&v) {
+                            t.rgb = rgb;
+                            changed = true;
+                        }
+                    }
+                });
+            }
 
             section(ui, "Stitching");
             ui.horizontal(|ui| {
@@ -931,25 +1035,22 @@ impl App {
                     l.opts.angle_deg = if auto { None } else { Some(auto_angle.unwrap_or(45.0)) };
                     changed = true;
                 }
-                match &mut l.opts.angle_deg {
-                    Some(a) => {
-                        changed |= ui.add(egui::DragValue::new(a).speed(1.0).range(0.0..=180.0).suffix("°").max_decimals(0)).changed();
-                        for d in [0.0, 45.0, 90.0, 135.0] {
-                            if ui.small_button(format!("{d:.0}")).clicked() {
-                                *a = d;
-                                changed = true;
-                            }
-                        }
-                    }
-                    None => {
-                        if varies {
-                            ui.label(RichText::new("varies per piece").weak());
-                        } else if let Some(a) = auto_angle {
-                            ui.label(RichText::new(format!("{a:.0}°")).weak());
-                        }
+                // Type any angle; doing so switches Auto off.
+                let shown = l.opts.angle_deg.or(auto_angle).unwrap_or(45.0);
+                if let Some(v) = num_field(ui, "angle", shown, 0, "°") {
+                    l.opts.angle_deg = Some(v.rem_euclid(180.0));
+                    changed = true;
+                }
+                for d in [0.0, 45.0, 90.0, 135.0] {
+                    if ui.small_button(format!("{d:.0}")).clicked() {
+                        l.opts.angle_deg = Some(d);
+                        changed = true;
                     }
                 }
             });
+            if l.opts.angle_deg.is_none() && varies {
+                ui.label(RichText::new("Auto: angle varies per piece (each letter gets its own). Type a number to set one angle for all.").weak().small());
+            }
             ui.horizontal(|ui| {
                 ui.label("Stop before");
                 let mut v = l.opts.stop;
@@ -1053,14 +1154,20 @@ impl App {
             section(ui, "Design size");
             if let Some(d) = &self.design {
                 let b = d.bbox;
-                let mut w = b.width() / 25.4;
                 ui.horizontal(|ui| {
-                    ui.label("Width");
-                    let r = ui.add(egui::DragValue::new(&mut w).speed(0.01).range(0.3..=16.0).suffix(" in").max_decimals(2));
-                    ui.label(RichText::new(format!("× {:.2} in", b.height() / 25.4)).weak());
-                    if r.changed() && b.width() > 0.0 {
-                        self.checkpoint(now);
-                        scale_layers(&mut self.layers, b.center(), w * 25.4 / b.width());
+                    ui.label("W");
+                    let w = num_field(ui, "design-w", b.width() / 25.4, 2, "in");
+                    ui.label("H");
+                    let h = num_field(ui, "design-h", b.height() / 25.4, 2, "in");
+                    ui.label(RichText::new("🔒").weak()).on_hover_text("The whole design scales in proportion; unlock a single layer to stretch it");
+                    let k = match (w, h) {
+                        (Some(w), _) if w > 0.05 && b.width() > 0.0 => Some(w * 25.4 / b.width()),
+                        (_, Some(h)) if h > 0.05 && b.height() > 0.0 => Some(h * 25.4 / b.height()),
+                        _ => None,
+                    };
+                    if let Some(k) = k {
+                        self.hard_checkpoint();
+                        scale_layers(&mut self.layers, b.center(), k);
                         self.dirty = true;
                     }
                 });
@@ -1282,6 +1389,9 @@ impl App {
             self.zoom = ((rect.width() - 100.0) / b.width() as f32).min((rect.height() - 100.0) / b.height() as f32).max(0.5);
             self.view_center = b.center();
             self.fit = false;
+            if let Some(z) = self.pending_zoom.take() {
+                self.zoom *= z;
+            }
         }
         let zoom = self.zoom;
         let vc = self.view_center;
@@ -1393,7 +1503,7 @@ impl App {
             }
             let to = |p: Pt| to_screen(p.add(shift));
             let rgb = d.stops[o.stop].thread.rgb;
-            painter.extend(stitch_shapes(d, a, z.min(end), rgb, &to, zoom, view, show_jumps));
+            painter.extend(stitch_shapes(d, a, z.min(end), rgb, &to, zoom, view, show_jumps, rect.expand(20.0)));
         };
         for o in &d.objects {
             if moving.is_some() && moving_set.contains(&o.layer) {
@@ -1633,6 +1743,7 @@ fn stitch_shapes(
     zoom: f32,
     view: View,
     show_jumps: bool,
+    clip: Rect,
 ) -> Vec<EShape> {
     let col = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
     let w = (0.38 * zoom).max(1.0);
@@ -1684,34 +1795,61 @@ fn stitch_shapes(
             }
         }
         View::ThreeD => {
+            // Delicate thread look (after Tim's reference): the thread colour,
+            // a soft gradient across its width (lit top edge, shaded bottom
+            // edge, untouched middle) and, when zoomed in, faint diagonal
+            // twist lines like the ply of real thread.
+            let light = Vec2::new(0.0, -1.0); // light from the top of the screen
             let mut mesh = egui::Mesh::default();
-            // brightness across the thread (edge, middle, edge) and along it
-            // (needle hole, middle, needle hole): a simple overlay gradient.
-            let across = [0.62f32, 1.0, 0.5];
-            let along = [0.62f32, 1.18, 0.62];
+            let across: [(f32, f32); 5] = [(-1.0, -0.36), (-0.55, -0.16), (0.0, 0.0), (0.55, 0.12), (1.0, 0.26)];
+            let half = w * 0.6;
+            let twist = w >= 3.0; // only when a thread is wide enough to show it
+            let pitch = (w * 1.1).max(3.0); // px between twist lines
             for r in runs.iter().filter(|r| r.len() >= 2) {
                 for s in r.windows(2) {
                     let (a, b) = (s[0], s[1]);
                     let v = b - a;
                     let len = v.length();
-                    if len < 0.4 {
+                    if len < 0.3 || (!clip.contains(a) && !clip.contains(b) && !clip.intersects(Rect::from_two_pos(a, b))) {
                         continue;
                     }
                     let dir = v / len;
-                    let n = Vec2::new(-dir.y, dir.x) * (w * 0.62);
-                    let base = mesh.vertices.len() as u32;
-                    for (ti, t) in [0.0f32, 0.5, 1.0].iter().enumerate() {
-                        let c = a + v * *t;
-                        for (si, sgn) in [-1.0f32, 0.0, 1.0].iter().enumerate() {
-                            let k = across[si] * along[ti];
-                            mesh.colored_vertex(c + n * *sgn, scale_col(col, k));
+                    let mut n = Vec2::new(-dir.y, dir.x);
+                    if n.dot(light) < 0.0 {
+                        n = -n; // +n always points toward the light
+                    }
+                    // stations along the stitch; twist lines are thin darker bands
+                    let mut stations: Vec<(f32, f32)> = vec![(0.0, 0.0)];
+                    if twist && len > pitch * 1.5 {
+                        let k = (len / pitch).floor() as usize;
+                        for i in 1..k {
+                            let t = i as f32 * pitch;
+                            stations.push((t - 0.18 * pitch, 0.0));
+                            stations.push((t, -0.12));
+                            stations.push((t + 0.18 * pitch, 0.0));
                         }
                     }
-                    for ti in 0..2u32 {
-                        for si in 0..2u32 {
-                            let i0 = base + ti * 3 + si;
-                            mesh.add_triangle(i0, i0 + 1, i0 + 3);
-                            mesh.add_triangle(i0 + 1, i0 + 4, i0 + 3);
+                    stations.push((len, 0.0));
+                    // needle holes: the very ends sink slightly
+                    stations[0].1 = -0.1;
+                    let last = stations.len() - 1;
+                    stations[last].1 = -0.1;
+                    let slant = if twist { half * 0.9 } else { 0.0 };
+                    let base = mesh.vertices.len() as u32;
+                    let cols = across.len() as u32;
+                    for &(t, dk) in &stations {
+                        for &(sgn, tone) in &across {
+                            // twist lines lean across the thread
+                            let tt = (t + sgn * slant * if t > 0.0 && t < len { 1.0 } else { 0.0 }).clamp(0.0, len);
+                            let p = a + dir * tt + n * (sgn * half);
+                            mesh.colored_vertex(p, tone_col(col, tone + dk));
+                        }
+                    }
+                    for si in 0..(stations.len() as u32 - 1) {
+                        for ci in 0..cols - 1 {
+                            let i0 = base + si * cols + ci;
+                            mesh.add_triangle(i0, i0 + 1, i0 + cols);
+                            mesh.add_triangle(i0 + 1, i0 + cols + 1, i0 + cols);
                         }
                     }
                 }
@@ -1725,6 +1863,44 @@ fn stitch_shapes(
         }
     }
     shapes
+}
+
+/// A typed number box. Shows the live value; returns the new value when the
+/// user presses Enter or clicks away after typing.
+fn num_field(ui: &mut egui::Ui, salt: &str, value: f64, decimals: usize, suffix: &str) -> Option<f64> {
+    let shown = format!("{:.*}", decimals, value);
+    let out = text_field(ui, salt, &shown, 58.0).and_then(|t| {
+        let t = t.trim().trim_end_matches(suffix).trim().replace(',', ".");
+        t.parse::<f64>().ok().filter(|v| v.is_finite())
+    });
+    ui.label(suffix);
+    out
+}
+
+/// A text box that edits a copy and commits on Enter or focus loss.
+fn text_field(ui: &mut egui::Ui, salt: &str, shown: &str, width: f32) -> Option<String> {
+    let id = ui.id().with(salt);
+    let mut buf: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_else(|| shown.to_string());
+    let resp = ui.add(egui::TextEdit::singleline(&mut buf).id(id.with("edit")).desired_width(width));
+    if resp.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, buf.clone()));
+        None
+    } else if resp.lost_focus() {
+        ui.data_mut(|d| d.remove::<String>(id));
+        if buf != shown { Some(buf) } else { None }
+    } else {
+        ui.data_mut(|d| d.remove::<String>(id));
+        None
+    }
+}
+
+fn parse_hex(s: &str) -> Option<[u8; 3]> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let p = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some([p(0)?, p(2)?, p(4)?])
 }
 
 fn has_angle(stitch_type: &str) -> bool {
@@ -1745,6 +1921,16 @@ fn disclosure(ui: &mut egui::Ui, open: bool) -> egui::Response {
     resp
 }
 
+/// Shift a thread colour toward white (tone > 0) or black (tone < 0),
+/// like a soft luminosity overlay.
+fn tone_col(c: Color32, tone: f32) -> Color32 {
+    let f = |v: u8| -> u8 {
+        let v = v as f32;
+        if tone >= 0.0 { v + (255.0 - v) * tone } else { v * (1.0 + tone) }.clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+}
+
 fn scale_col(c: Color32, k: f32) -> Color32 {
     // Lighten toward white when k > 1 so dark threads still get a highlight.
     let f = |v: u8| -> u8 {
@@ -1759,7 +1945,8 @@ fn scale_layers(layers: &mut [Layer], c: Pt, k: f64) {
         let center = l.center();
         let new_center = c.add(center.sub(c).mul(k));
         l.offset = new_center.sub(l.origin);
-        l.scale *= k;
+        l.sx *= k;
+        l.sy *= k;
     }
 }
 

@@ -217,6 +217,10 @@ pub fn build_with(
             true
         } else if layer_start && o.stop.is_some() {
             o.stop.unwrap()
+        } else if o.stop == Some(false) || !layer_start {
+            // A layer's stop setting covers all of its pieces: no surprise
+            // stops partway through a layer.
+            false
         } else {
             differs && opts.auto_stops
         };
@@ -407,4 +411,49 @@ fn compute_stats(cmds: &[Cmd], bbox: &BBox, profile: Profile) -> Stats {
     s.run_minutes =
         s.stitches as f64 / profile.spm() + s.color_changes as f64 * 0.12 + s.trims as f64 * 0.05;
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::{FillRule, Pt};
+    use crate::import::{Shape, ShapeKind, ShapeOpts};
+
+    fn square(x: f64, rgb: [u8; 3], layer: usize, stop: Option<bool>) -> Shape {
+        let r = vec![Pt::new(x, 0.0), Pt::new(x + 8.0, 0.0), Pt::new(x + 8.0, 8.0), Pt::new(x, 8.0)];
+        Shape {
+            kind: ShapeKind::Area { rings: vec![r], rule: FillRule::NonZero },
+            rgb,
+            label: format!("L{layer}"),
+            group: layer,
+            opts: ShapeOpts { layer, stop, ..Default::default() },
+        }
+    }
+
+    #[test]
+    fn stop_off_holds_for_every_piece_of_a_layer() {
+        // Layer 0 green; layer 1 black with two separate pieces and its stop off.
+        let mut s2 = square(20.0, [10, 10, 10], 1, Some(false));
+        if let (ShapeKind::Area { rings, .. }, ShapeKind::Area { rings: r2, .. }) = (&mut s2.kind, square(40.0, [10, 10, 10], 1, Some(false)).kind) {
+            rings.extend(r2);
+        }
+        let art = Artwork { shapes: vec![square(0.0, [20, 140, 70], 0, None), s2], warnings: vec![] };
+        let chart = crate::thread::generic_chart();
+        let r = crate::settings::recipe("pique").unwrap();
+        let d = build_with("t", &art, &chart, &r, Profile::Flat, BuildOptions { keep_order: true, auto_stops: true }).unwrap();
+        assert_eq!(d.stops.len(), 1, "no stop anywhere in layer 1");
+        assert!(d.objects.iter().all(|o| o.stop == 0));
+    }
+
+    #[test]
+    fn forced_stop_with_same_thread() {
+        let art = Artwork {
+            shapes: vec![square(0.0, [20, 140, 70], 0, None), square(20.0, [20, 140, 70], 1, Some(true))],
+            warnings: vec![],
+        };
+        let chart = crate::thread::generic_chart();
+        let r = crate::settings::recipe("pique").unwrap();
+        let d = build_with("t", &art, &chart, &r, Profile::Flat, BuildOptions { keep_order: true, auto_stops: true }).unwrap();
+        assert_eq!(d.stops.len(), 2);
+    }
 }
