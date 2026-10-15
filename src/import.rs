@@ -47,9 +47,55 @@ impl StitchChoice {
     }
 }
 
+/// How a satin column turns a sharp corner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Corner {
+    /// Each side runs past the corner and overlaps (square, heavier corner).
+    Square,
+    /// Stitches fan to a diagonal seam through the corner.
+    #[default]
+    Miter,
+    /// The outside of the corner is rounded; stitches fan around it.
+    Round,
+}
+
+impl Corner {
+    pub const ALL: [Corner; 3] = [Corner::Miter, Corner::Round, Corner::Square];
+    pub fn label(&self) -> &'static str {
+        match self {
+            Corner::Square => "Square (overlap)",
+            Corner::Miter => "Mitered",
+            Corner::Round => "Rounded",
+        }
+    }
+}
+
+/// How an open satin column ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Cap {
+    #[default]
+    Flat,
+    Square,
+    Round,
+    Point,
+}
+
+impl Cap {
+    pub const ALL: [Cap; 4] = [Cap::Flat, Cap::Square, Cap::Round, Cap::Point];
+    pub fn label(&self) -> &'static str {
+        match self {
+            Cap::Flat => "Flat",
+            Cap::Square => "Square (extended)",
+            Cap::Round => "Round",
+            Cap::Point => "Point",
+        }
+    }
+}
+
 /// Per-layer choices made by the user. Anything left `None`/`Auto` is decided
 /// by the engine.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ShapeOpts {
     pub stitch: StitchChoice,
     /// Stitch direction in degrees (0 = horizontal, counter-clockwise).
@@ -61,6 +107,19 @@ pub struct ShapeOpts {
     pub stop: Option<bool>,
     /// Which layer this shape belongs to (its position in the layer list).
     pub layer: usize,
+    /// Skip underlay for this layer.
+    pub no_underlay: bool,
+    /// Keep sewing this layer underneath layers above it (no cut-out).
+    pub keep_under: bool,
+    /// Satin column (outline) width in mm; None = the artwork's stroke width.
+    pub column_width: Option<f64>,
+    /// Satin areas (e.g. lettering): widen (+) or narrow (−) by this many mm.
+    pub widen: f64,
+    pub corner: Corner,
+    pub cap: Cap,
+    /// Sews on top without cutting holes in the layers under it (used for
+    /// name drops, where each name runs on a different head).
+    pub overlay: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -229,6 +288,40 @@ pub fn apply_id_tags(opts: &mut ShapeOpts, id: &str) {
     } else if id.contains("sf-run") {
         opts.stitch = StitchChoice::Run;
     }
+    if id.contains("sf-miter") {
+        opts.corner = Corner::Miter;
+    } else if id.contains("sf-round-corner") {
+        opts.corner = Corner::Round;
+    } else if id.contains("sf-square-corner") {
+        opts.corner = Corner::Square;
+    }
+    for (tag, cap) in [
+        ("sf-cap-flat", Cap::Flat),
+        ("sf-cap-square", Cap::Square),
+        ("sf-cap-round", Cap::Round),
+        ("sf-cap-point", Cap::Point),
+    ] {
+        if id.contains(tag) {
+            opts.cap = cap;
+        }
+    }
+    if id.contains("sf-no-underlay") {
+        opts.no_underlay = true;
+    }
+    if id.contains("sf-keep-under") {
+        opts.keep_under = true;
+    }
+    let num_after = |key: &str| -> Option<f64> {
+        let i = id.find(key)?;
+        let num: String = id[i + key.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        num.trim_end_matches('.').parse::<f64>().ok()
+    };
+    if let Some(w) = num_after("sf-width-") {
+        opts.column_width = Some(w);
+    }
     if let Some(i) = id.find("sf-angle-") {
         let num: String = id[i + 9..]
             .chars()
@@ -260,7 +353,12 @@ fn walk(g: &usvg::Group, art: &mut Artwork, outer: Option<usvg::Transform>, grou
                 }
                 *groups = g;
                 // Name text by its words (or its id when it has one).
-                let words: String = t.chunks().iter().map(|c| c.text()).collect::<Vec<_>>().join(" ");
+                let words: String = t
+                    .chunks()
+                    .iter()
+                    .map(|c| c.text())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
                 let label = if !t.id().is_empty() {
                     t.id().to_string()

@@ -4,6 +4,7 @@
 //! and general embroidery practice.
 
 pub mod design;
+pub mod drops;
 pub mod dst;
 pub mod export;
 pub mod formats;

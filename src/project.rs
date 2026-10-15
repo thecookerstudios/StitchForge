@@ -186,6 +186,54 @@ pub fn compose(layers: &[Layer], chart: &[Thread]) -> (Artwork, Vec<Thread>) {
     )
 }
 
+const PX_TO_MM: f64 = 25.4 / 96.0;
+
+/// Outlines for a text layer, in mm, centred on the origin. `height_mm` is the
+/// capital-letter height, so every name in a run comes out the same size and
+/// sits on the same baseline whatever its letters.
+pub fn text_shapes(opt: &usvg::Options, spec: &TextSpec) -> Result<Vec<Shape>, String> {
+    let art = crate::import::load_text_with(opt, &spec.text, &spec.font, spec.rgb)?;
+    let b = BBox::of(art.shapes.iter().flat_map(|s| s.points()));
+    if !b.is_valid() || b.width() <= 0.0 {
+        return Err(format!(
+            "“{}” produced no outlines in {}",
+            spec.text.trim(),
+            spec.font
+        ));
+    }
+    let h = crate::import::load_text_with(opt, "H", &spec.font, spec.rgb)?;
+    let hb = BBox::of(h.shapes.iter().flat_map(|s| s.points()));
+    let cap = if hb.is_valid() && hb.height() > 0.0 {
+        hb.height()
+    } else {
+        b.height()
+    };
+    let lines = spec.text.lines().count().max(1) as f64;
+    let last_base = hb.max.y + (lines - 1.0) * 240.0 * PX_TO_MM;
+    let c = Pt::new(b.center().x, (hb.min.y + last_base) / 2.0);
+    let k = spec.height_mm / cap;
+    Ok(art
+        .shapes
+        .into_iter()
+        .map(|mut s| {
+            match &mut s.kind {
+                ShapeKind::Area { rings, .. } => rings
+                    .iter_mut()
+                    .flatten()
+                    .for_each(|p| *p = p.sub(c).mul(k)),
+                ShapeKind::Line { paths, width } => {
+                    paths
+                        .iter_mut()
+                        .flatten()
+                        .for_each(|p| *p = p.sub(c).mul(k));
+                    *width *= k;
+                }
+            }
+            s
+        })
+        .collect())
+}
+
 pub const FORMAT: &str = "stitchforge-project";
 pub const VERSION: u32 = 1;
 
@@ -204,6 +252,9 @@ pub struct Project {
     pub chart_name: String,
     pub chart: Vec<Thread>,
     pub job: JobInfo,
+    /// Name-drop setup (personalisation runs), if any.
+    #[serde(default)]
+    pub drops: crate::drops::DropSetup,
 }
 
 impl Project {
@@ -222,6 +273,7 @@ impl Project {
             chart_name: "Generic 40wt".into(),
             chart: thread::generic_chart(),
             job: JobInfo::default(),
+            drops: Default::default(),
         }
     }
 

@@ -1,4 +1,4 @@
-# StitchForge v0.5 — embroidery app (Milestone 1 complete)
+# StitchForge v0.6 — embroidery app (Milestone 2 started: name drops)
 
 Vector art and any-font text in; machine-ready DST, a printable operator
 spec sheet, and a stitch preview out. Written in Rust, runs on Windows,
@@ -39,9 +39,33 @@ run `cargo run --release`.
   test sew-out. Sew it on your usual fabric with normal backing; the notes on
   its operator sheet say what to check and measure.
 
+**Name drops** (tab at the top). For team and staff orders on multi-head
+machines: each drop file sews the logo on every head, then stops before each
+name so the operator runs it on one head at a time.
+1. In **Design**, add a text layer (Add text…) where the names go. Its font,
+   letter height, color and stitching are used for every name.
+2. Open **Name drops** and **Load Excel / CSV…** (try
+   `examples/team-roster.xlsx`). Tick the name column(s) (e.g. First + Last),
+   same line or separate lines, letter case, an optional quantity column.
+3. Pick the **name layer** and the **logo layers** (sewn on all heads).
+4. Set **heads** and **names per drop** (up to 2 × heads: the second half is a
+   second pass on the same heads), logo in every drop, and an optional
+   maximum name width (wider names shrink to fit).
+5. Fix any name by typing over it in the list. The left panel shows the drop
+   as layers: logo, then STOP + name + head for each name; click one to see it.
+6. **Export…** writes one machine file per drop, an operator sheet per drop,
+   and a printable **run sheet** (plus CSV) listing every stop, which head to
+   turn on, the name, and its spreadsheet row.
+
+Letter height means capital-letter height, so every name comes out the same
+size whatever its letters.
+
 **Stitch settings in your art app.** Put these in an element's id/name in
 Inkscape or Illustrator and StitchForge follows them: `sf-satin`,
-`sf-fill`, `sf-run`, `sf-triple`, `sf-angle-45` (any angle).
+`sf-fill`, `sf-run`, `sf-triple`, `sf-angle-45` (any angle), `sf-no-underlay`,
+`sf-keep-under`, `sf-width-3` (satin outline width, mm), `sf-miter`,
+`sf-round-corner`, `sf-square-corner`, `sf-cap-flat`, `sf-cap-square`,
+`sf-cap-round`, `sf-cap-point`.
 
 **Layers (left).** Every shape, outline and text block is a layer. Layers sew
 top to bottom.
@@ -65,7 +89,11 @@ stretch); rotation; **thread**: search the chart, or **Custom thread** with
 your own color (picker or hex), code and name; **stitch type** (auto, fill,
 satin, run outline, triple-run outline); **angle**: type any number (or
 0/45/90/135), Auto to let StitchForge choose; **stop before** (auto/on/off,
-applies to the whole layer); visible; sew earlier/later; duplicate; delete;
+applies to the whole layer); **underlay** on/off; **under layers above**: Cut
+out (skip what's covered) or Keep fill (sew the full shape underneath);
+outlines: **satin width** (mm), **corners** (mitered, rounded, square
+overlap) and **ends** (flat, square, round, point); filled shapes: **satin
+widen** (± mm, for thin or heavy lettering); visible; sew earlier/later; duplicate; delete;
 unlink from its partner layer. Number boxes commit on Enter or when you
 click away.
 
@@ -93,6 +121,10 @@ stitchforge convert logo.svg --width-in 3.5 --formats dst,pes,exp
 
 # Calibration sampler for a test sew-out
 stitchforge sampler --formats dst,pes
+
+# Name drops from a project with a text layer for the name
+stitchforge drops team.sfg --data roster.xlsx --columns "First Name,Last Name" \
+  --case upper --heads 6 --per-drop 12 --max-width-in 3.5 --formats dst,pes -o drops
 
 # What's in any DST/EXP/PES
 stitchforge inspect design.pes

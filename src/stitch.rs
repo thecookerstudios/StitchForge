@@ -2,7 +2,7 @@
 //! stitches are always regenerated from them.
 
 use crate::geom::*;
-use crate::import::{Artwork, ShapeKind, StitchChoice};
+use crate::import::{Artwork, Cap, Corner, ShapeKind, ShapeOpts, StitchChoice};
 use crate::settings::{Limits, Profile, Recipe};
 use crate::thread::{Thread, nearest};
 use serde::Serialize;
@@ -52,6 +52,8 @@ pub struct Planned {
     /// Layer this object came from, and that layer's stop setting.
     pub layer: usize,
     pub stop: Option<bool>,
+    /// The layer's stitch choices (underlay, cut-out, widths, corners, caps).
+    pub opts: ShapeOpts,
 }
 
 /// Overlap left under an upper layer's edge so no fabric shows (mm).
@@ -164,6 +166,7 @@ pub fn plan(
                 knockouts: Vec::new(),
                 layer: o.layer,
                 stop: o.stop,
+                opts: o.clone(),
             };
         match &s.kind {
             ShapeKind::Area {
@@ -263,6 +266,7 @@ pub fn plan(
                 }
             }
             ShapeKind::Line { width, .. } => {
+                let width = &o.column_width.unwrap_or(*width);
                 let kind = match o.stitch {
                     StitchChoice::Satin => StitchType::SatinColumn,
                     StitchChoice::Run => StitchType::Run,
@@ -282,9 +286,12 @@ pub fn plan(
     }
     // Knockout: each area skips what later (upper) areas will cover.
     for i in 0..out.len() {
+        if out[i].opts.keep_under {
+            continue; // this layer keeps sewing underneath
+        }
         let kos: Vec<(Vec<Ring>, FillRule)> = out[i + 1..]
             .iter()
-            .filter(|u| u.bbox.overlaps(&out[i].bbox, 0.0))
+            .filter(|u| !u.opts.overlay && u.bbox.overlaps(&out[i].bbox, 0.0))
             .filter_map(|u| match &u.shape {
                 ShapeKind::Area { rings, rule } => Some((rings.clone(), *rule)),
                 _ => None,
@@ -307,6 +314,9 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
             let mut layers = vec![p.angle + FRAC_PI_2];
             if profile == Profile::Cap {
                 layers.push(p.angle);
+            }
+            if p.opts.no_underlay {
+                layers.clear();
             }
             let inset = r.underlay_inset;
             for a in layers {
@@ -342,6 +352,7 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
             );
         }
         (ShapeKind::Area { rings, rule }, _) => {
+            let pc = pc + p.opts.widen / 2.0;
             // Satin from an outline. Stitches run across the stroke at the
             // object's angle; bands where that would make stitches too long
             // (crossbars, arch tops) are sewn at the perpendicular angle.
@@ -444,15 +455,50 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
             let mut cur = from;
             for path in order_paths(&p.visible_paths(paths), cur) {
                 match kind {
+                    StitchType::SatinColumn if p.opts.corner != Corner::Square => {
+                        let width = p.opts.column_width.unwrap_or(*width);
+                        let half = width / 2.0 + pc;
+                        let closed = path.len() > 2 && path[0].dist(*path.last().unwrap()) < 0.05;
+                        let ribs = column_ribs(&path, half, p.opts.corner, p.opts.cap, closed);
+                        if !p.opts.no_underlay {
+                            // centre run out, satin back over it
+                            push_section(
+                                &mut out,
+                                &resample(&path, Limits::RUN_LEN),
+                                Limits::RUN_LEN,
+                            );
+                            let back: Vec<(Pt, Pt)> = ribs.iter().rev().copied().collect();
+                            let zz = ribs_to_zigzag(&back, r.satin_spacing / 2.0);
+                            push_continue(
+                                &mut out,
+                                &split_long(&zz, Limits::SATIN_MAX),
+                                Limits::SATIN_MAX,
+                            );
+                        } else {
+                            let zz = ribs_to_zigzag(&ribs, r.satin_spacing / 2.0);
+                            push_section(
+                                &mut out,
+                                &split_long(&zz, Limits::SATIN_MAX),
+                                Limits::SATIN_MAX,
+                            );
+                        }
+                    }
                     StitchType::SatinColumn => {
-                        // Underlay runs forward along the whole path, then the
-                        // satin comes back piece by piece. Sharp corners split the
-                        // column and each piece runs past the corner by half the
-                        // width, so corners come out square instead of notched.
+                        // Square corners: underlay runs forward along the whole
+                        // path, then the satin comes back piece by piece. Sharp
+                        // corners split the column and each piece runs past the
+                        // corner by half the width, overlapping into a square.
+                        let width = p.opts.column_width.unwrap_or(*width);
                         let half = width / 2.0 + pc;
                         let closed = path.len() > 2 && path[0].dist(*path.last().unwrap()) < 0.05;
                         let pieces = split_at_corners(&path, 35f64.to_radians());
-                        push_section(&mut out, &resample(&path, Limits::RUN_LEN), Limits::RUN_LEN);
+                        if !p.opts.no_underlay {
+                            push_section(
+                                &mut out,
+                                &resample(&path, Limits::RUN_LEN),
+                                Limits::RUN_LEN,
+                            );
+                        }
                         let n = pieces.len();
                         for (k, piece) in pieces.iter().enumerate().rev() {
                             let mut pc_ = piece.clone();
@@ -470,6 +516,14 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
                             }
                             pc_.reverse();
                             let sides = satin_along(&pc_, half, r.satin_spacing / 2.0);
+                            if out.is_empty() || (p.opts.no_underlay && k + 1 == n) {
+                                push_section(
+                                    &mut out,
+                                    &split_long(&sides, Limits::SATIN_MAX),
+                                    Limits::SATIN_MAX,
+                                );
+                                continue;
+                            }
                             push_continue(
                                 &mut out,
                                 &split_long(&sides, Limits::SATIN_MAX),
@@ -531,7 +585,7 @@ fn sew_satin(
                 Pt::new(x, s.y).rot(angle)
             })
             .collect();
-        if segs.len() >= 6 {
+        if segs.len() >= 6 && !p.opts.no_underlay {
             start_in_shape(out, rings, rule, &center, Limits::RUN_LEN, &|_| true);
             push_continue(
                 out,
@@ -610,6 +664,208 @@ fn travel_ok(rings: &[Ring], rule: FillRule, a: Pt, b: Pt, hidden: &dyn Fn(Pt) -
     } else {
         hid as f64 >= 0.85 * samples.len() as f64
     }
+}
+
+/// Left-hand normal of a direction.
+fn left_of(d: Pt) -> Pt {
+    Pt::new(-d.y, d.x)
+}
+
+/// Matched (left, right) edge points across a satin column, following the
+/// centre line, with mitered or rounded corners and the chosen end caps.
+pub fn column_ribs(
+    path: &[Pt],
+    half: f64,
+    corner: Corner,
+    cap: Cap,
+    closed: bool,
+) -> Vec<(Pt, Pt)> {
+    let mut pts: Vec<Pt> = Vec::new();
+    for &q in path {
+        if pts.last().map(|l: &Pt| l.dist(q) > 1e-6).unwrap_or(true) {
+            pts.push(q);
+        }
+    }
+    if closed && pts.len() > 2 && pts[0].dist(*pts.last().unwrap()) < 0.05 {
+        pts.pop();
+    }
+    let n = pts.len();
+    if n < 2 {
+        return vec![];
+    }
+    let dir = |i: usize, j: usize| pts[j].sub(pts[i]).norm();
+    let mut ribs: Vec<(Pt, Pt)> = Vec::new();
+    let smooth = 25f64.to_radians().cos();
+    for i in 0..n {
+        let c = pts[i];
+        let din = if i > 0 {
+            Some(dir(i - 1, i))
+        } else if closed {
+            Some(dir(n - 1, 0))
+        } else {
+            None
+        };
+        let dout = if i + 1 < n {
+            Some(dir(i, i + 1))
+        } else if closed {
+            Some(dir(n - 1, 0))
+        } else {
+            None
+        };
+        match (din, dout) {
+            (None, Some(d)) => {
+                let nl = left_of(d);
+                // start cap: from the tip toward the column
+                ribs.extend(cap_ribs(c, d.mul(-1.0), nl, half, cap).into_iter().rev());
+                ribs.push((c.add(nl.mul(half)), c.sub(nl.mul(half))));
+            }
+            (Some(d), None) => {
+                let nl = left_of(d);
+                ribs.push((c.add(nl.mul(half)), c.sub(nl.mul(half))));
+                ribs.extend(cap_ribs(c, d, nl, half, cap));
+            }
+            (Some(a), Some(b)) => {
+                let (na, nb) = (left_of(a), left_of(b));
+                let cosang = a.x * b.x + a.y * b.y;
+                let bis = na.add(nb).norm();
+                let k = (bis.x * na.x + bis.y * na.y).max(1e-6); // cos(turn/2)
+                let m = half / k;
+                // Keep stitches square to the column until half a width (more on
+                // sharper turns) before the corner, then fan through it.
+                let prev = if i > 0 { pts[i - 1] } else { pts[n - 1] };
+                let next = if i + 1 < n { pts[i + 1] } else { pts[0] };
+                let half_turn = cosang.clamp(-1.0, 1.0).acos() / 2.0;
+                let e = (half * half_turn.tan())
+                    .min(0.45 * c.dist(prev))
+                    .min(0.45 * c.dist(next));
+                let sharp = cosang < smooth;
+                if sharp && e > 0.05 {
+                    let q = c.sub(a.mul(e));
+                    ribs.push((q.add(na.mul(half)), q.sub(na.mul(half))));
+                }
+                if !sharp || (corner == Corner::Miter && m <= half * 3.0) {
+                    ribs.push((c.add(bis.mul(m)), c.sub(bis.mul(m))));
+                } else {
+                    // Inner side: the miter point (clamped). Outer side: a bevel
+                    // (two points) or an arc.
+                    let left_inner = b.x * na.x + b.y * na.y > 0.0;
+                    let mi = m.min(half * 3.0);
+                    let inner = if left_inner {
+                        c.add(bis.mul(mi))
+                    } else {
+                        c.sub(bis.mul(mi))
+                    };
+                    let (oa, ob) = if left_inner {
+                        (na.mul(-1.0), nb.mul(-1.0))
+                    } else {
+                        (na, nb)
+                    };
+                    let steps = if corner == Corner::Round {
+                        let ang = cosang.clamp(-1.0, 1.0).acos();
+                        (ang / 12f64.to_radians()).ceil().max(2.0) as usize
+                    } else {
+                        1
+                    };
+                    let (a0, a1) = (oa.y.atan2(oa.x), ob.y.atan2(ob.x));
+                    let mut da = a1 - a0;
+                    while da > std::f64::consts::PI {
+                        da -= 2.0 * std::f64::consts::PI;
+                    }
+                    while da < -std::f64::consts::PI {
+                        da += 2.0 * std::f64::consts::PI;
+                    }
+                    for s in 0..=steps {
+                        let t = a0 + da * s as f64 / steps as f64;
+                        let outer = c.add(Pt::new(t.cos(), t.sin()).mul(half));
+                        ribs.push(if left_inner {
+                            (inner, outer)
+                        } else {
+                            (outer, inner)
+                        });
+                    }
+                }
+                if sharp && e > 0.05 {
+                    let q = c.add(b.mul(e));
+                    ribs.push((q.add(nb.mul(half)), q.sub(nb.mul(half))));
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    if closed && !ribs.is_empty() {
+        ribs.push(ribs[0]);
+    }
+    ribs
+}
+
+/// Ribs beyond an open end at `c` going in direction `d` (outward).
+fn cap_ribs(c: Pt, d: Pt, nl: Pt, half: f64, cap: Cap) -> Vec<(Pt, Pt)> {
+    let min_half = 0.2; // keep the last stitch at least 0.4 mm wide
+    match cap {
+        Cap::Flat => vec![],
+        Cap::Square => {
+            let e = c.add(d.mul(half));
+            vec![(e.add(nl.mul(half)), e.sub(nl.mul(half)))]
+        }
+        Cap::Round => {
+            let max_phi = (min_half / half).clamp(0.0, 1.0).acos();
+            let k = ((max_phi / 15f64.to_radians()).ceil() as usize).max(2);
+            (1..=k)
+                .map(|i| {
+                    let phi = max_phi * i as f64 / k as f64;
+                    let e = c.add(d.mul(half * phi.sin()));
+                    let w = half * phi.cos();
+                    (e.add(nl.mul(w)), e.sub(nl.mul(w)))
+                })
+                .collect()
+        }
+        Cap::Point => {
+            let k = 4;
+            (1..=k)
+                .map(|i| {
+                    let t = i as f64 / k as f64;
+                    let w = (half * (1.0 - t)).max(min_half);
+                    let e = c.add(d.mul(half * 1.2 * t));
+                    (e.add(nl.mul(w)), e.sub(nl.mul(w)))
+                })
+                .collect()
+        }
+    }
+}
+
+/// Zig-zag between the two edges, alternating sides every `step`, measured
+/// continuously along whichever edge moves more (so corners stay covered).
+fn ribs_to_zigzag(ribs: &[(Pt, Pt)], step: f64) -> Vec<Pt> {
+    if ribs.len() < 2 {
+        return ribs.iter().map(|r| r.0).collect();
+    }
+    let seg: Vec<f64> = ribs
+        .windows(2)
+        .map(|w| w[0].0.dist(w[1].0).max(w[0].1.dist(w[1].1)))
+        .collect();
+    let total: f64 = seg.iter().sum();
+    let n = (total / step).round().max(1.0) as usize;
+    let mut out = Vec::with_capacity(n + 1);
+    let (mut k, mut start) = (0usize, 0.0);
+    for j in 0..=n {
+        let target = total * j as f64 / n as f64;
+        while k + 1 < seg.len() && start + seg[k] < target {
+            start += seg[k];
+            k += 1;
+        }
+        let t = if seg[k] > 0.0 {
+            ((target - start) / seg[k]).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let (a, b) = (ribs[k], ribs[k + 1]);
+        out.push(if j % 2 == 0 {
+            a.0.lerp(b.0, t)
+        } else {
+            a.1.lerp(b.1, t)
+        });
+    }
+    out
 }
 
 /// Split a polyline at corners sharper than `max_turn` (radians).

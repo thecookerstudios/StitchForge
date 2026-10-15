@@ -49,6 +49,40 @@ enum Command {
         #[command(flatten)]
         out: OutputArgs,
     },
+    /// Name drops: logo on every head, then one name per head, from a sheet
+    Drops {
+        /// StitchForge project (.sfg) with the logo and a text layer for the name
+        project: PathBuf,
+        /// Excel (.xlsx) or CSV with the names
+        #[arg(long)]
+        data: PathBuf,
+        /// Name columns: letters (A,B) or header text (First,Last)
+        #[arg(long, default_value = "A")]
+        columns: String,
+        /// Put each column on its own line instead of joining with spaces
+        #[arg(long)]
+        lines: bool,
+        /// upper, title or as-is
+        #[arg(long, default_value = "as-is")]
+        case: String,
+        /// Number of heads on the machine
+        #[arg(long, default_value_t = 6)]
+        heads: usize,
+        /// Names per drop file (default = heads; up to 2x heads)
+        #[arg(long)]
+        per_drop: Option<usize>,
+        /// Name of the text layer to use for names (default: first text layer)
+        #[arg(long)]
+        name_layer: Option<String>,
+        /// Shrink names wider than this many inches
+        #[arg(long)]
+        max_width_in: Option<f64>,
+        /// Machine formats, comma separated
+        #[arg(long, default_value = "dst")]
+        formats: String,
+        #[arg(long, short, default_value = "out")]
+        out_dir: PathBuf,
+    },
     /// List installed font families
     Fonts,
     /// Read a DST file and report what is in it
@@ -155,6 +189,31 @@ fn main() {
                 .and_then(|(opt, _)| import::load_svg_str(&stitchforge::sampler::svg(), &opt))
                 .and_then(|art| produce(art, &name, &out))
         }
+        Command::Drops {
+            project,
+            data,
+            columns,
+            lines,
+            case,
+            heads,
+            per_drop,
+            name_layer,
+            max_width_in,
+            formats,
+            out_dir,
+        } => run_drops(
+            &project,
+            &data,
+            &columns,
+            lines,
+            &case,
+            heads,
+            per_drop,
+            name_layer,
+            max_width_in,
+            &formats,
+            &out_dir,
+        ),
         Command::Fonts => {
             for f in import::list_fonts() {
                 println!("{f}");
@@ -305,6 +364,92 @@ fn inspect(file: &PathBuf) -> Result<(), String> {
         f.stop_colors.len(),
         maxx - minx,
         maxy - miny
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_drops(
+    project: &std::path::Path,
+    data: &std::path::Path,
+    columns: &str,
+    lines: bool,
+    case: &str,
+    heads: usize,
+    per_drop: Option<usize>,
+    name_layer: Option<String>,
+    max_width_in: Option<f64>,
+    formats: &str,
+    out_dir: &std::path::Path,
+) -> Result<(), String> {
+    use stitchforge::drops::{self, Case, Join};
+    let mut p = stitchforge::project::Project::load(project)?;
+    let table = drops::read_table(data)?;
+    let headers = table.headers(true);
+    let mut cols = Vec::new();
+    for c in columns.split(',').map(|c| c.trim()) {
+        let by_letter = (0..table.width()).find(|i| drops::col_letter(*i).eq_ignore_ascii_case(c));
+        let by_name = headers.iter().position(|h| {
+            h.to_lowercase()
+                .starts_with(&format!("{} (", c.to_lowercase()))
+        });
+        cols.push(by_letter.or(by_name).ok_or(format!(
+            "no column '{c}' in {} (columns: {})",
+            table.source,
+            headers.join(", ")
+        ))?);
+    }
+    let first_row_headers = cols.iter().all(|c| {
+        table.raw[0]
+            .get(*c)
+            .map(|v| v.parse::<f64>().is_err())
+            .unwrap_or(true)
+    }) && columns.split(',').any(|c| c.trim().len() > 2);
+    let template = match &name_layer {
+        Some(n) => p
+            .layers
+            .iter()
+            .find(|l| l.name.eq_ignore_ascii_case(n) && l.text.is_some()),
+        None => p.layers.iter().find(|l| l.text.is_some()),
+    }
+    .ok_or("the project needs a text layer for the names (add one in the app with Add text)")?
+    .id;
+    let s = &mut p.drops;
+    s.table = Some(table);
+    s.first_row_headers = first_row_headers;
+    s.columns = cols;
+    s.join = if lines { Join::NewLine } else { Join::Space };
+    s.case = match case {
+        "upper" => Case::Upper,
+        "title" => Case::Title,
+        _ => Case::AsTyped,
+    };
+    s.heads = heads.max(1);
+    s.per_drop = per_drop.unwrap_or(heads).clamp(1, heads.max(1) * 2);
+    s.name_layer = Some(template);
+    s.logo_layers = p
+        .layers
+        .iter()
+        .filter(|l| l.id != template && l.visible)
+        .map(|l| l.id)
+        .collect();
+    s.max_width_mm = max_width_in.map(|w| w * 25.4);
+    let fmts: Vec<stitchforge::formats::Format> = formats
+        .split(',')
+        .map(|f| {
+            stitchforge::formats::Format::from_ext(f.trim()).ok_or(format!("unknown format '{f}'"))
+        })
+        .collect::<Result<_, _>>()?;
+    let (opt, _) = import::font_options(None)?;
+    let generated = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let ex = drops::export_drops(&p, &opt, out_dir, &fmts, &generated)?;
+    println!(
+        "{} names · {} drop file(s) · {} heads · {} per drop -> {}",
+        p.drops.names().len(),
+        p.drops.drop_count(),
+        p.drops.heads,
+        p.drops.per_drop,
+        ex.sheet.display()
     );
     Ok(())
 }

@@ -618,3 +618,106 @@ mod tests {
         assert_eq!(d.stops.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+    use crate::geom::{FillRule, Pt};
+    use crate::import::{Shape, ShapeKind, ShapeOpts};
+
+    fn sq(x: f64, y: f64, s: f64, rgb: [u8; 3], layer: usize, opts: ShapeOpts) -> Shape {
+        let r = vec![
+            Pt::new(x, y),
+            Pt::new(x + s, y),
+            Pt::new(x + s, y + s),
+            Pt::new(x, y + s),
+        ];
+        Shape {
+            kind: ShapeKind::Area {
+                rings: vec![r],
+                rule: FillRule::NonZero,
+            },
+            rgb,
+            label: format!("L{layer}"),
+            group: layer,
+            opts: ShapeOpts { layer, ..opts },
+        }
+    }
+
+    fn stitches(shapes: Vec<Shape>) -> usize {
+        let art = Artwork {
+            shapes,
+            warnings: vec![],
+        };
+        let r = crate::settings::recipe("pique").unwrap();
+        build_with(
+            "t",
+            &art,
+            &crate::thread::generic_chart(),
+            &r,
+            Profile::Flat,
+            BuildOptions {
+                keep_order: true,
+                auto_stops: true,
+            },
+        )
+        .unwrap()
+        .objects[0]
+            .stitches
+    }
+
+    #[test]
+    fn keep_under_sews_more_than_cut_out() {
+        let top = sq(10.0, 10.0, 20.0, [200, 20, 40], 1, ShapeOpts::default());
+        let cut = stitches(vec![
+            sq(0.0, 0.0, 40.0, [20, 140, 70], 0, ShapeOpts::default()),
+            top.clone(),
+        ]);
+        let keep = stitches(vec![
+            sq(
+                0.0,
+                0.0,
+                40.0,
+                [20, 140, 70],
+                0,
+                ShapeOpts {
+                    keep_under: true,
+                    ..Default::default()
+                },
+            ),
+            top,
+        ]);
+        assert!(keep > cut + 150, "keep {keep} vs cut {cut}");
+    }
+
+    #[test]
+    fn underlay_off_sews_fewer() {
+        let with = stitches(vec![sq(
+            0.0,
+            0.0,
+            30.0,
+            [20, 140, 70],
+            0,
+            ShapeOpts::default(),
+        )]);
+        let without = stitches(vec![sq(
+            0.0,
+            0.0,
+            30.0,
+            [20, 140, 70],
+            0,
+            ShapeOpts {
+                no_underlay: true,
+                ..Default::default()
+            },
+        )]);
+        assert!(without + 100 < with, "without {without} vs with {with}");
+    }
+
+    #[test]
+    fn old_projects_without_new_options_still_load() {
+        let json = r#"{"stitch":"Auto","angle_deg":null,"thread":null,"stop":null,"layer":0}"#;
+        let o: ShapeOpts = serde_json::from_str(json).unwrap();
+        assert!(!o.no_underlay && !o.keep_under && o.column_width.is_none());
+    }
+}

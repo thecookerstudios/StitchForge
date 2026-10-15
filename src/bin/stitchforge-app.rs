@@ -9,9 +9,11 @@ use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Shape as EShape, 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use stitchforge::design::{BuildOptions, Cmd, Design};
+use stitchforge::drops::{self as drops_mod, Case, DropSetup, Join, Slot};
 use stitchforge::formats::{self, Format, MachineFile};
 use stitchforge::geom::{BBox, Pt};
 use stitchforge::import::{self, Artwork, Shape, ShapeKind, ShapeOpts, StitchChoice};
+use stitchforge::import::{Cap, Corner};
 use stitchforge::project::{Layer, Project, TextSpec};
 use stitchforge::settings::{self, Profile, Recipe};
 use stitchforge::sheet::JobInfo;
@@ -53,6 +55,12 @@ enum Pending {
     OpenPath(PathBuf),
     Sampler,
     Sample,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Design,
+    Drops,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -125,6 +133,14 @@ struct App {
     machine: Option<MachineDoc>,
     show_export: bool,
     export_fmts: [bool; 3],
+
+    // name drops
+    tab: Tab,
+    drops: DropSetup,
+    drop_view: usize,
+    drop_sel: usize,
+    drop_info: Option<(usize, Vec<Slot>)>,
+    quiet_regen: bool,
 }
 
 use stitchforge::import::font_options;
@@ -188,6 +204,12 @@ impl App {
             machine: None,
             show_export: false,
             export_fmts: [true, false, false],
+            tab: Tab::Design,
+            drops: DropSetup::default(),
+            drop_view: 0,
+            drop_sel: 0,
+            drop_info: None,
+            quiet_regen: false,
         }
         .with_launch_args()
     }
@@ -242,6 +264,13 @@ impl App {
                     }
                     i += 1;
                 }
+                "--round" => {
+                    if let Some(l) = self.sel_mut() {
+                        l.opts.corner = Corner::Round;
+                        l.opts.column_width = Some(3.0);
+                        l.opts.no_underlay = true;
+                    }
+                }
                 "--stop-off" => {
                     if let Some(l) = self.sel_mut() {
                         l.opts.stop = Some(false);
@@ -255,6 +284,17 @@ impl App {
                     self.pending_progress = num(i + 1).map(|v| v as f32);
                     i += 1;
                 }
+                "--add-text" => {
+                    if let Some(t) = args.get(i + 1) {
+                        self.text = t.clone();
+                        self.font = "DejaVu Sans".into();
+                        self.text_height_in = 0.35;
+                        self.text_color = [245, 245, 245];
+                        self.regenerate();
+                        self.add_text_layer();
+                    }
+                    i += 1;
+                }
                 "--text" => {
                     if let Some(t) = args.get(i + 1) {
                         self.show_text = true;
@@ -263,6 +303,25 @@ impl App {
                     i += 1;
                 }
                 "--sampler" => self.load_sampler(),
+                "--drops-data" => {
+                    if let Some(p) = args.get(i + 1) {
+                        self.set_tab(Tab::Drops);
+                        self.load_names_path(PathBuf::from(p));
+                    }
+                    i += 1;
+                }
+                "--drop" => {
+                    if let Some(n) = num(i + 1) {
+                        self.drop_view = (n as usize).saturating_sub(1);
+                    }
+                    i += 1;
+                }
+                "--drop-sel" => {
+                    if let Some(n) = num(i + 1) {
+                        self.drop_sel = n as usize;
+                    }
+                    i += 1;
+                }
                 "--save-to" => {
                     // test hook: save without a dialog
                     if let Some(p) = args.get(i + 1) {
@@ -470,33 +529,7 @@ impl App {
 
     fn text_shapes(&mut self, spec: &TextSpec) -> Result<Vec<Shape>, String> {
         let opt = self.fonts_db();
-        let art = import::load_text_with(&opt, &spec.text, &spec.font, spec.rgb)?;
-        let b = BBox::of(art.shapes.iter().flat_map(|s| s.points()));
-        if !b.is_valid() || b.height() <= 0.0 {
-            return Err("that text produced no outlines".into());
-        }
-        let k = spec.height_mm / b.height();
-        let c = b.center();
-        Ok(art
-            .shapes
-            .into_iter()
-            .map(|mut s| {
-                match &mut s.kind {
-                    ShapeKind::Area { rings, .. } => rings
-                        .iter_mut()
-                        .flatten()
-                        .for_each(|p| *p = p.sub(c).mul(k)),
-                    ShapeKind::Line { paths, width } => {
-                        paths
-                            .iter_mut()
-                            .flatten()
-                            .for_each(|p| *p = p.sub(c).mul(k));
-                        *width *= k;
-                    }
-                }
-                s
-            })
-            .collect())
+        stitchforge::project::text_shapes(opt, spec)
     }
 
     fn add_text_layer(&mut self) {
@@ -560,6 +593,35 @@ impl App {
 
     fn regenerate(&mut self) {
         self.dirty = false;
+        if self.tab == Tab::Drops && self.machine.is_none() {
+            self.drop_info = None;
+            let n = self.drops.drop_count();
+            if n == 0 || self.drops.problem(&self.layers).is_some() {
+                self.design = None;
+                return;
+            }
+            self.drop_view = self.drop_view.min(n - 1);
+            let proj = self.to_project();
+            let view = self.drop_view;
+            let res = {
+                let opt = self.fonts_db();
+                drops_mod::build_drop(&proj, opt, view)
+            };
+            match res {
+                Ok((d, n_logo, slots)) => {
+                    self.drop_sel = self.drop_sel.min(slots.len().saturating_sub(1));
+                    self.progress = d.cmds.len();
+                    self.design = Some(d);
+                    self.drop_info = Some((n_logo, slots));
+                    self.error = None;
+                }
+                Err(e) => {
+                    self.design = None;
+                    self.error = Some(e);
+                }
+            }
+            return;
+        }
         if let Some(m) = &self.machine {
             match stitchforge::design::from_machine(
                 &self.design_name,
@@ -691,6 +753,16 @@ impl App {
             self.error = Some("Pick at least one machine format".into());
             return;
         }
+        if self.tab == Tab::Drops {
+            let mut dlg = rfd::FileDialog::new()
+                .set_title("Choose a folder for the drop files and run sheet");
+            if let Some(dir) = &self.last_dir {
+                dlg = dlg.set_directory(dir);
+            }
+            let Some(dir) = dlg.pick_folder() else { return };
+            self.export_drops_to(&dir, &fmts);
+            return;
+        }
         let mut dlg = rfd::FileDialog::new()
             .set_title("Choose a folder for the machine files and operator sheet");
         if let Some(dir) = &self.last_dir {
@@ -750,6 +822,7 @@ impl App {
         p.chart_name = self.chart_name.clone();
         p.chart = self.chart.clone();
         p.job = self.job.clone();
+        p.drops = self.drops.clone();
         p
     }
 
@@ -765,6 +838,8 @@ impl App {
         self.chart_name = p.chart_name;
         self.chart = p.chart;
         self.job = p.job;
+        self.drops = p.drops;
+        self.tab = Tab::Design;
         self.project_path = path;
         self.machine = None;
         self.selected = None;
@@ -837,6 +912,8 @@ impl App {
         self.undo.clear();
         self.redo.clear();
         self.job = JobInfo::default();
+        self.drops = DropSetup::default();
+        self.tab = Tab::Design;
         self.modified = false;
         self.status = "New design".into();
     }
@@ -949,13 +1026,25 @@ impl App {
             return;
         }
         let build = |keep: bool| {
-            stitchforge::design::build_with("tip", &art, &chart, &self.recipe, self.profile, BuildOptions { keep_order: keep, auto_stops: self.auto_stops })
-                .map(|d| d.stops.len())
-                .unwrap_or(0)
+            stitchforge::design::build_with(
+                "tip",
+                &art,
+                &chart,
+                &self.recipe,
+                self.profile,
+                BuildOptions {
+                    keep_order: keep,
+                    auto_stops: self.auto_stops,
+                },
+            )
+            .map(|d| d.stops.len())
+            .unwrap_or(0)
         };
         let (mine, auto) = (build(true), build(false));
         if auto + 1 < mine {
-            self.status = format!("Tip: Auto-sequence layers (right panel) would cut stops from {mine} to {auto}.");
+            self.status = format!(
+                "Tip: Auto-sequence layers (right panel) would cut stops from {mine} to {auto}."
+            );
         }
     }
 
@@ -1095,6 +1184,19 @@ impl App {
         let mode_art = self.machine.is_none();
         ui.horizontal(|ui| {
             ui.label(RichText::new("StitchForge").strong().size(17.0));
+            ui.separator();
+            let can_drops = mode_art && !self.layers.is_empty();
+            let mut tab = self.tab;
+            ui.selectable_value(&mut tab, Tab::Design, "Design");
+            ui.add_enabled_ui(can_drops, |ui| {
+                ui.selectable_value(&mut tab, Tab::Drops, "Name drops")
+                    .on_hover_text(
+                        "Logo on every head, then one name per head, from an Excel/CSV sheet",
+                    );
+            });
+            if tab != self.tab {
+                self.set_tab(tab);
+            }
             ui.separator();
             ui.menu_button("File", |ui| {
                 if ui.button("New").clicked() {
@@ -1684,32 +1786,38 @@ impl App {
                         }
                     });
             });
-            ui.horizontal(|ui| {
-                ui.label("Angle");
-                let mut auto = l.opts.angle_deg.is_none();
-                if ui.checkbox(&mut auto, "Auto").changed() {
-                    l.opts.angle_deg = if auto {
-                        None
-                    } else {
-                        Some(auto_angle.unwrap_or(45.0))
-                    };
-                    changed = true;
-                }
-                // Type any angle; doing so switches Auto off.
-                let shown = l.opts.angle_deg.or(auto_angle).unwrap_or(45.0);
-                if let Some(v) = num_field(ui, "angle", shown, 0, "°") {
-                    l.opts.angle_deg = Some(v.rem_euclid(180.0));
-                    changed = true;
-                }
-                for d in [0.0, 45.0, 90.0, 135.0] {
-                    if ui.small_button(format!("{d:.0}")).clicked() {
-                        l.opts.angle_deg = Some(d);
+            let is_outline_layer = l
+                .shapes
+                .iter()
+                .all(|s| matches!(s.kind, ShapeKind::Line { .. }));
+            if !is_outline_layer {
+                ui.horizontal(|ui| {
+                    ui.label("Angle");
+                    let mut auto = l.opts.angle_deg.is_none();
+                    if ui.checkbox(&mut auto, "Auto").changed() {
+                        l.opts.angle_deg = if auto {
+                            None
+                        } else {
+                            Some(auto_angle.unwrap_or(45.0))
+                        };
                         changed = true;
                     }
+                    // Type any angle; doing so switches Auto off.
+                    let shown = l.opts.angle_deg.or(auto_angle).unwrap_or(45.0);
+                    if let Some(v) = num_field(ui, "angle", shown, 0, "°") {
+                        l.opts.angle_deg = Some(v.rem_euclid(180.0));
+                        changed = true;
+                    }
+                    for d in [0.0, 45.0, 90.0, 135.0] {
+                        if ui.small_button(format!("{d:.0}")).clicked() {
+                            l.opts.angle_deg = Some(d);
+                            changed = true;
+                        }
+                    }
+                });
+                if l.opts.angle_deg.is_none() && varies {
+                    ui.label(RichText::new("Auto: angle varies per piece (each letter gets its own). Type a number to set one angle for all.").weak().small());
                 }
-            });
-            if l.opts.angle_deg.is_none() && varies {
-                ui.label(RichText::new("Auto: angle varies per piece (each letter gets its own). Type a number to set one angle for all.").weak().small());
             }
             ui.horizontal(|ui| {
                 ui.label("Stop before");
@@ -1725,6 +1833,97 @@ impl App {
                     ui.label(RichText::new(if s { "(stops)" } else { "(no stop)" }).weak());
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("Underlay");
+                let mut on = !l.opts.no_underlay;
+                let label = if on { "On" } else { "Off" };
+                if ui
+                    .checkbox(&mut on, label)
+                    .on_hover_text("Foundation stitches under the top stitching")
+                    .changed()
+                {
+                    l.opts.no_underlay = !on;
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Under layers above");
+                let mut keep = l.opts.keep_under;
+                ui.selectable_value(&mut keep, false, "Cut out")
+                    .on_hover_text("Skip the parts covered by layers above (fewer stitches)");
+                ui.selectable_value(&mut keep, true, "Keep fill")
+                    .on_hover_text("Keep sewing the full shape underneath");
+                if keep != l.opts.keep_under {
+                    l.opts.keep_under = keep;
+                    changed = true;
+                }
+            });
+            let outline = l
+                .shapes
+                .iter()
+                .any(|s| matches!(s.kind, ShapeKind::Line { .. }));
+            let art_width = l.shapes.iter().find_map(|s| {
+                if let ShapeKind::Line { width, .. } = s.kind {
+                    Some(width * (l.sx * l.sy).abs().sqrt())
+                } else {
+                    None
+                }
+            });
+            if outline {
+                ui.horizontal(|ui| {
+                    ui.label("Satin width");
+                    let mut auto = l.opts.column_width.is_none();
+                    if ui.checkbox(&mut auto, "From art").changed() {
+                        l.opts.column_width = if auto {
+                            None
+                        } else {
+                            Some(art_width.unwrap_or(3.0))
+                        };
+                        changed = true;
+                    }
+                    let shown = l.opts.column_width.or(art_width).unwrap_or(3.0);
+                    if let Some(w) = num_field(ui, "col-width", shown, 1, "mm") {
+                        if w > 0.2 {
+                            l.opts.column_width = Some(w.min(12.0));
+                            changed = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Corners");
+                    egui::ComboBox::from_id_salt("corner")
+                        .selected_text(l.opts.corner.label())
+                        .show_ui(ui, |ui| {
+                            for c in Corner::ALL {
+                                if ui
+                                    .selectable_value(&mut l.opts.corner, c, c.label())
+                                    .clicked()
+                                {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    ui.label("Ends");
+                    egui::ComboBox::from_id_salt("cap")
+                        .selected_text(l.opts.cap.label())
+                        .show_ui(ui, |ui| {
+                            for c in Cap::ALL {
+                                if ui.selectable_value(&mut l.opts.cap, c, c.label()).clicked() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Satin widen");
+                    if let Some(w) = num_field(ui, "widen", l.opts.widen, 2, "mm") {
+                        l.opts.widen = w.clamp(-2.0, 3.0);
+                        changed = true;
+                    }
+                    ui.label(RichText::new("+ thicker, − thinner").weak().small());
+                });
+            }
             ui.horizontal(|ui| {
                 changed |= ui.checkbox(&mut l.visible, "Visible").changed();
             });
@@ -1783,6 +1982,539 @@ impl App {
         }
     }
 
+    // ---------- name drops ----------
+
+    fn set_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.selected = None;
+        self.moving = None;
+        if tab == Tab::Drops {
+            let d = &mut self.drops;
+            let name_ok = d
+                .name_layer
+                .map(|id| self.layers.iter().any(|l| l.id == id && l.text.is_some()))
+                .unwrap_or(false);
+            if !name_ok {
+                d.name_layer = self
+                    .layers
+                    .iter()
+                    .rev()
+                    .find(|l| l.text.is_some())
+                    .map(|l| l.id);
+            }
+            d.logo_layers
+                .retain(|id| self.layers.iter().any(|l| l.id == *id));
+            if d.logo_layers.is_empty() {
+                d.logo_layers = self
+                    .layers
+                    .iter()
+                    .filter(|l| Some(l.id) != d.name_layer && l.visible)
+                    .map(|l| l.id)
+                    .collect();
+            }
+        }
+        self.fit = true;
+        self.dirty = true;
+        self.quiet_regen = true;
+    }
+
+    fn pick_names_file(&mut self) {
+        let mut dlg = rfd::FileDialog::new()
+            .set_title("Names: Excel or CSV")
+            .add_filter(
+                "Spreadsheet",
+                &["xlsx", "xlsm", "xls", "ods", "csv", "tsv", "txt"],
+            );
+        if let Some(dir) = &self.last_dir {
+            dlg = dlg.set_directory(dir);
+        }
+        if let Some(p) = dlg.pick_file() {
+            self.load_names_path(p);
+        }
+    }
+
+    fn load_names_path(&mut self, path: PathBuf) {
+        match drops_mod::read_table(&path) {
+            Ok(t) => {
+                // Guess the setup from the header row.
+                let first = t.raw.first().cloned().unwrap_or_default();
+                let looks_header =
+                    !first.is_empty() && first.iter().all(|c| c.trim().parse::<f64>().is_err());
+                let low: Vec<String> = first.iter().map(|c| c.to_lowercase()).collect();
+                let mut cols: Vec<usize> = (0..low.len())
+                    .filter(|i| low[*i].contains("name"))
+                    .collect();
+                if cols.is_empty() || !looks_header {
+                    cols = vec![0];
+                }
+                let qty = if looks_header {
+                    (0..low.len()).find(|i| low[*i].contains("qty") || low[*i].contains("quantity"))
+                } else {
+                    None
+                };
+                let d = &mut self.drops;
+                d.first_row_headers = looks_header;
+                d.columns = cols;
+                d.qty_column = qty;
+                d.edits.clear();
+                self.status = format!(
+                    "Loaded {} rows from {}",
+                    t.data_rows(looks_header).len(),
+                    t.source
+                );
+                d.table = Some(t);
+                self.drop_view = 0;
+                self.drop_sel = 0;
+                self.last_dir = path.parent().map(|p| p.to_path_buf());
+                self.dirty = true;
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn export_drops_to(&mut self, dir: &std::path::Path, fmts: &[Format]) {
+        let proj = self.to_project();
+        let generated = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        let res = {
+            let opt = self.fonts_db();
+            drops_mod::export_drops(&proj, opt, dir, fmts, &generated)
+        };
+        match res {
+            Ok(ex) => {
+                self.status = format!(
+                    "Wrote {} drop file(s) and the run sheet to {}",
+                    ex.files.len() / fmts.len().max(1),
+                    dir.display()
+                );
+                open_path(&ex.sheet);
+                self.last_dir = Some(dir.to_path_buf());
+                self.show_export = false;
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Left panel in the Name drops tab: the drop shown as its layers.
+    fn drops_panel(&mut self, ui: &mut egui::Ui) {
+        let n = self.drops.drop_count();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Name drops").strong());
+            if n > 0 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(self.drop_view + 1 < n, egui::Button::new("▶"))
+                        .clicked()
+                    {
+                        self.drop_view += 1;
+                        self.drop_sel = 0;
+                        self.dirty = true;
+                        self.quiet_regen = true;
+                    }
+                    ui.label(format!("Drop {} of {}", self.drop_view + 1, n));
+                    if ui
+                        .add_enabled(self.drop_view > 0, egui::Button::new("◀"))
+                        .clicked()
+                    {
+                        self.drop_view -= 1;
+                        self.drop_sel = 0;
+                        self.dirty = true;
+                        self.quiet_regen = true;
+                    }
+                });
+            }
+        });
+        ui.label(RichText::new("Each drop is one machine file: the logo on all heads, then a stop before every name. Click a name to see it.").weak().small());
+        ui.separator();
+        if let Some(p) = self.drops.problem(&self.layers) {
+            ui.label(
+                RichText::new(format!("To start: {p}")).color(Color32::from_rgb(196, 130, 20)),
+            );
+            return;
+        }
+        let (Some(d), Some((n_logo, slots))) = (&self.design, &self.drop_info) else {
+            return;
+        };
+        let plan = drops_mod::stop_plan(d, *n_logo, slots);
+        let logo_names: Vec<String> = self
+            .layers
+            .iter()
+            .filter(|l| self.drops.logo_layers.contains(&l.id))
+            .map(|l| l.name.clone())
+            .collect();
+        let mut pick: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if *n_logo > 0 {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Logo").strong());
+                        ui.label(RichText::new("· all heads").weak());
+                    });
+                    ui.indent("logo", |ui| {
+                        for nm in &logo_names {
+                            ui.label(RichText::new(nm).small());
+                        }
+                    });
+                    ui.add_space(4.0);
+                } else {
+                    ui.label(
+                        RichText::new("No logo in this drop (logo is set to drop 1 only)")
+                            .weak()
+                            .small(),
+                    );
+                }
+                for (stop, thread, what, heads) in plan.iter().filter(|r| r.2.starts_with("Name")) {
+                    let k = slots
+                        .iter()
+                        .position(|s| what.starts_with(&format!("Name {}:", s.index + 1)))
+                        .unwrap_or(0);
+                    let sel = k == self.drop_sel;
+                    ui.horizontal(|ui| {
+                        let chip = egui::Button::new(
+                            RichText::new("STOP").size(10.5).color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(200, 60, 50))
+                        .corner_radius(9.0)
+                        .min_size(Vec2::new(44.0, 18.0));
+                        ui.add(chip).on_hover_text(format!(
+                            "Stop {stop}: turn on {}",
+                            heads.to_lowercase()
+                        ));
+                        let label = format!(
+                            "{}  ·  {}",
+                            what.split_once(": ").map(|x| x.1).unwrap_or(what),
+                            heads
+                        );
+                        if ui
+                            .selectable_label(sel, label)
+                            .on_hover_text(thread.as_str())
+                            .clicked()
+                        {
+                            pick = Some(k);
+                        }
+                    });
+                }
+            });
+        if let Some(k) = pick {
+            self.drop_sel = k;
+        }
+    }
+
+    /// Right panel in the Name drops tab: data, columns, layers, machine.
+    fn drops_setup(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        section(ui, "1 · Names");
+        ui.horizontal(|ui| {
+            if ui.button("Load Excel / CSV…").clicked() {
+                self.pick_names_file();
+            }
+            if let Some(t) = &self.drops.table {
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {} rows",
+                        t.source,
+                        t.data_rows(self.drops.first_row_headers).len()
+                    ))
+                    .weak(),
+                );
+            }
+        });
+        if self.drops.table.is_some() {
+            let d = &mut self.drops;
+            changed |= ui
+                .checkbox(&mut d.first_row_headers, "First row is column titles")
+                .changed();
+            let headers = d.table.as_ref().unwrap().headers(d.first_row_headers);
+            ui.label("Name columns (combined in this order)");
+            ui.horizontal_wrapped(|ui| {
+                for (i, h) in headers.iter().enumerate() {
+                    let mut on = d.columns.contains(&i);
+                    if ui.checkbox(&mut on, h).changed() {
+                        if on {
+                            d.columns.push(i);
+                        } else {
+                            d.columns.retain(|c| *c != i);
+                        }
+                        d.edits.clear();
+                        changed = true;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Join");
+                changed |= ui
+                    .selectable_value(&mut d.join, Join::Space, "Same line")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut d.join, Join::NewLine, "Separate lines")
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Letters");
+                changed |= ui
+                    .selectable_value(&mut d.case, Case::AsTyped, "As typed")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut d.case, Case::Upper, "UPPER")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut d.case, Case::Title, "Title Case")
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Quantity column");
+                let shown = d
+                    .qty_column
+                    .and_then(|c| headers.get(c).cloned())
+                    .unwrap_or("None (1 each)".into());
+                egui::ComboBox::from_id_salt("qty")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(d.qty_column.is_none(), "None (1 each)")
+                            .clicked()
+                        {
+                            d.qty_column = None;
+                            changed = true;
+                        }
+                        for (i, h) in headers.iter().enumerate() {
+                            if ui.selectable_label(d.qty_column == Some(i), h).clicked() {
+                                d.qty_column = Some(i);
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            changed |= ui.checkbox(&mut d.skip_blank, "Skip blank rows").changed();
+        }
+
+        section(ui, "2 · Layers");
+        {
+            let d = &mut self.drops;
+            let text_layers: Vec<(u64, String)> = self
+                .layers
+                .iter()
+                .filter(|l| l.text.is_some())
+                .map(|l| (l.id, l.name.clone()))
+                .collect();
+            ui.horizontal(|ui| {
+                ui.label("Name layer");
+                let shown = d
+                    .name_layer
+                    .and_then(|id| text_layers.iter().find(|t| t.0 == id))
+                    .map(|t| t.1.clone())
+                    .unwrap_or("Pick a text layer".into());
+                egui::ComboBox::from_id_salt("name-layer")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        for (id, nm) in &text_layers {
+                            if ui.selectable_label(d.name_layer == Some(*id), nm).clicked() {
+                                d.name_layer = Some(*id);
+                                d.logo_layers.retain(|l| l != id);
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            if text_layers.is_empty() {
+                ui.label(RichText::new("Add a text layer in the Design tab (Add text…) and place it where names go. Its font, size, color and stitching are used for every name.").weak().small());
+            }
+            ui.horizontal(|ui| {
+                ui.label("Logo layers (all heads)");
+                if ui.small_button("All").clicked() {
+                    d.logo_layers = self
+                        .layers
+                        .iter()
+                        .filter(|l| Some(l.id) != d.name_layer)
+                        .map(|l| l.id)
+                        .collect();
+                    changed = true;
+                }
+                if ui.small_button("None").clicked() {
+                    d.logo_layers.clear();
+                    changed = true;
+                }
+            });
+            ui.indent("logo-layers", |ui| {
+                for l in self.layers.iter().filter(|l| Some(l.id) != d.name_layer) {
+                    let mut on = d.logo_layers.contains(&l.id);
+                    if ui.checkbox(&mut on, &l.name).changed() {
+                        if on {
+                            d.logo_layers.push(l.id);
+                        } else {
+                            d.logo_layers.retain(|x| *x != l.id);
+                        }
+                        changed = true;
+                    }
+                }
+            });
+        }
+
+        section(ui, "3 · Machine");
+        {
+            let d = &mut self.drops;
+            ui.horizontal(|ui| {
+                ui.label("Heads");
+                if let Some(h) = num_field(ui, "heads", d.heads as f64, 0, "") {
+                    d.heads = (h.round() as usize).clamp(1, 60);
+                    d.per_drop = d.per_drop.clamp(1, d.heads * 2);
+                    changed = true;
+                }
+                ui.label("Names per drop");
+                if let Some(n) = num_field(ui, "per-drop", d.per_drop as f64, 0, "") {
+                    d.per_drop = (n.round() as usize).clamp(1, d.heads * 2);
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button(format!("= heads ({})", d.heads)).clicked() {
+                    d.per_drop = d.heads;
+                    changed = true;
+                }
+                if ui
+                    .small_button(format!("= 2 × heads ({})", d.heads * 2))
+                    .clicked()
+                {
+                    d.per_drop = d.heads * 2;
+                    changed = true;
+                }
+            });
+            if d.per_drop > d.heads {
+                ui.label(
+                    RichText::new(format!(
+                        "Names {}–{} of each drop are a second pass on heads 1–{}.",
+                        d.heads + 1,
+                        d.per_drop,
+                        d.per_drop - d.heads
+                    ))
+                    .weak()
+                    .small(),
+                );
+            }
+            changed |= ui
+                .checkbox(&mut d.logo_every_drop, "Sew the logo in every drop")
+                .changed();
+            ui.horizontal(|ui| {
+                let mut on = d.max_width_mm.is_some();
+                if ui.checkbox(&mut on, "Shrink names wider than").changed() {
+                    d.max_width_mm = if on { Some(76.2) } else { None };
+                    changed = true;
+                }
+                if let Some(w) = d.max_width_mm {
+                    if let Some(v) = num_field(ui, "max-w", w / 25.4, 2, "in") {
+                        d.max_width_mm = Some(v.max(0.3) * 25.4);
+                        changed = true;
+                    }
+                }
+            });
+        }
+
+        let names = self.drops.names();
+        if !names.is_empty() {
+            section(
+                ui,
+                &format!(
+                    "4 · {} names in {} drop file(s)",
+                    names.len(),
+                    self.drops.drop_count()
+                ),
+            );
+            ui.label(
+                RichText::new("Fix a name by typing over it. Click a row to show its drop.")
+                    .weak()
+                    .small(),
+            );
+            let mut edit: Option<(usize, Option<String>)> = None;
+            let mut show: Option<(usize, usize)> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("names")
+                .max_height(260.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for n in &names {
+                        let here = n.drop == self.drop_view
+                            && Some(n.index)
+                                == self
+                                    .drop_info
+                                    .as_ref()
+                                    .and_then(|(_, sl)| sl.get(self.drop_sel))
+                                    .map(|s| s.index);
+                        ui.horizontal(|ui| {
+                            let tag = format!(
+                                "{:>2}  D{} H{}{}",
+                                n.index + 1,
+                                n.drop + 1,
+                                n.head,
+                                if n.pass > 1 { " (2nd)" } else { "" }
+                            );
+                            if ui
+                                .add_sized(
+                                    [86.0, 18.0],
+                                    egui::Button::selectable(here, RichText::new(tag).small()),
+                                )
+                                .on_hover_text(format!(
+                                    "Sheet row {} · click to show this name",
+                                    n.row
+                                ))
+                                .clicked()
+                            {
+                                show = Some((n.drop, n.index));
+                            }
+                            if let Some(v) = text_field(
+                                ui,
+                                &format!("nm-{}", n.index),
+                                &n.text.replace('\n', " / "),
+                                170.0,
+                            ) {
+                                edit = Some((n.index, Some(v.replace(" / ", "\n"))));
+                            }
+                            if n.edited
+                                && ui
+                                    .small_button("↺")
+                                    .on_hover_text("Undo your fix")
+                                    .clicked()
+                            {
+                                edit = Some((n.index, None));
+                            }
+                        });
+                    }
+                });
+            if let Some((i, v)) = edit {
+                match v {
+                    Some(t) => {
+                        self.drops.edits.insert(i, t);
+                    }
+                    None => {
+                        self.drops.edits.remove(&i);
+                    }
+                }
+                changed = true;
+            }
+            if let Some((drop, idx)) = show {
+                self.drop_view = drop;
+                self.drop_sel = idx % self.drops.per_drop.max(1);
+                self.dirty = true;
+                self.quiet_regen = true;
+            }
+            ui.add_space(6.0);
+            if ui
+                .add_enabled(
+                    self.design.is_some(),
+                    egui::Button::new(RichText::new("Export all drops…").strong()),
+                )
+                .on_hover_text("Machine files for every drop + printable run sheet")
+                .clicked()
+            {
+                self.show_export = true;
+            }
+        }
+        if changed {
+            self.dirty = true;
+            self.modified = true;
+            self.quiet_regen = true;
+        }
+    }
+
     fn layer_action(&mut self, a: &str, li: usize) {
         self.hard_checkpoint();
         match a {
@@ -1819,13 +2551,19 @@ impl App {
 
     fn right_panel(&mut self, ui: &mut egui::Ui, now: f64) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            self.layer_props(ui, now);
+            if self.tab == Tab::Drops && self.machine.is_none() {
+                self.drops_setup(ui);
+                ui.add_space(6.0);
+                ui.separator();
+            } else {
+                self.layer_props(ui, now);
+            }
             if self.selected.is_some() {
                 ui.add_space(6.0);
                 ui.separator();
             }
 
-            if self.machine.is_none() {
+            if self.machine.is_none() && self.tab == Tab::Design {
             section(ui, "Design size");
             if let Some(d) = &self.design {
                 let b = d.bbox;
@@ -1883,7 +2621,7 @@ impl App {
                 }
             });
 
-            if self.machine.is_none() {
+            if self.machine.is_none() && self.tab == Tab::Design {
             section(ui, "Sewing order and stops");
             if ui.checkbox(&mut self.keep_order, "Sew in my layer order").on_hover_text("Off = the garment profile reorders layers automatically").changed() {
                 self.dirty = true;
@@ -2149,9 +2887,12 @@ impl App {
                 .find(|l| l.visible && l.hit(p, tol))
                 .map(|l| l.id)
         };
+        let editing = self.tab == Tab::Design && self.machine.is_none();
+        let no_layers: Vec<Layer> = Vec::new();
+        let hit_src: &[Layer] = if editing { &self.layers } else { &no_layers };
         if resp.drag_started() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let hit = hit_layer(pos, &self.layers, zoom);
+                let hit = hit_layer(pos, hit_src, zoom);
                 if hit.is_some() && (hit == self.selected || ui.input(|i| !i.modifiers.shift)) {
                     self.selected = hit;
                     self.moving = Some(Pt::new(0.0, 0.0));
@@ -2184,7 +2925,7 @@ impl App {
                 }
             }
         }
-        if resp.clicked() {
+        if resp.clicked() && editing {
             if let Some(pos) = resp.interact_pointer_pos() {
                 self.selected = hit_layer(pos, &self.layers, zoom);
             }
@@ -2214,7 +2955,7 @@ impl App {
                 }
             }
             if let Some(cur) = cursor {
-                if !resp.dragged() && hit_layer(cur, &self.layers, zoom).is_some() {
+                if !resp.dragged() && editing && hit_layer(cur, &self.layers, zoom).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
             }
@@ -2254,8 +2995,16 @@ impl App {
 
         // ---- stitches
         let end = self.progress.min(d.cmds.len());
-        let sel_layer = self.sel_idx();
+        let sel_layer = if editing { self.sel_idx() } else { None };
         let moving = self.moving.filter(|m| m.len() > 0.0);
+        // Name drops: all names share one spot, so show only the chosen one.
+        let only_name: Option<(usize, usize)> = if self.tab == Tab::Drops {
+            self.drop_info
+                .as_ref()
+                .map(|(n_logo, _)| (*n_logo, *n_logo + self.drop_sel))
+        } else {
+            None
+        };
         let moving_set: Vec<usize> = sel_layer.map(|li| self.linked(li)).unwrap_or_default();
         let view = self.view;
         let show_jumps = self.show_jumps;
@@ -2281,6 +3030,11 @@ impl App {
         for o in &d.objects {
             if moving.is_some() && moving_set.contains(&o.layer) {
                 continue;
+            }
+            if let Some((n_logo, keep)) = only_name {
+                if o.layer >= n_logo && o.layer != keep {
+                    continue;
+                }
             }
             draw_obj(o, Pt::new(0.0, 0.0), &painter);
         }
@@ -2564,9 +3318,10 @@ impl eframe::App for App {
             if self.clean_after_regen {
                 self.clean_after_regen = false;
                 self.modified = false;
-            } else if self.machine.is_none() {
+            } else if self.machine.is_none() && !self.quiet_regen {
                 self.modified = true;
             }
+            self.quiet_regen = false;
             self.regenerate();
         }
         // playback
@@ -2616,6 +3371,8 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 if self.machine.is_some() {
                     self.machine_panel(ui)
+                } else if self.tab == Tab::Drops {
+                    self.drops_panel(ui)
                 } else {
                     self.layers_panel(ui)
                 }
