@@ -17,8 +17,13 @@ what it needs and builds (a few minutes), then opens the app and leaves a
 
 If macOS says the launcher "can't be opened", right-click it → Open → Open.
 
-**Windows / Linux:** install Rust from https://rustup.rs, then in this folder
-run `cargo run --release`.
+**Windows:** double-click `Launch StitchForge (Windows).bat`. The first time
+it installs Rust (no Visual Studio needed) and builds, which takes about 10–15
+minutes on a typical PC; then it opens the app and leaves `StitchForge.exe` in
+this folder for next time. If Windows SmartScreen warns about the .bat, click
+**More info → Run anyway**.
+
+**Linux:** install Rust from https://rustup.rs, then run `cargo run --release`.
 
 ### In the app
 
