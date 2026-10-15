@@ -332,6 +332,10 @@ impl Planned {
     pub fn stitch_label(&self) -> &'static str {
         match self.kind {
             StitchType::Fill => self.opts.fill.short(),
+            // auto-angle satin areas follow each stroke (turning satin)
+            StitchType::Satin if self.opts.angle_deg.is_none() && self.knockouts.is_empty() => {
+                "Turning satin"
+            }
             k => k.label(),
         }
     }
@@ -766,25 +770,112 @@ fn turning_satin(
             through.insert((n, e2), e1);
         }
     }
-    let ext = |n: usize, e: usize| -> f64 {
-        let d = field.at(g.nodes[n]).max(0.1);
+    // How each end of a stroke piece is finished.
+    #[derive(Clone, Copy, PartialEq)]
+    enum End {
+        /// A free end: run on to the tip, satin covers serifs straight on.
+        Leaf,
+        /// A sharp turn inside a stroke (the corners of an N): each side
+        /// runs past the corner and overlaps, like a hand-made square corner.
+        Corner,
+        /// Joins another stroke: tuck a little way under it.
+        Tuck,
+        /// Carries straight on into the next stroke as one column.
+        Through,
+    }
+    let end_kind = |n: usize, e: usize| -> End {
         if deg[n] == 1 {
-            d * 1.3 + 0.3 // free end: reach the rounded tip
+            End::Leaf
         } else if through.contains_key(&(n, e)) || g.edges[e].a == g.edges[e].b {
-            0.0
+            End::Through
         } else {
-            d * 0.7 // tuck under the stroke it joins
+            End::Tuck
         }
     };
-    // Ribs across a stroke path (in its direction), from edge to edge.
-    let ribs = |path: &[Pt], e0: f64, e1: f64| -> Vec<(Pt, Pt)> {
+    let end_ext = |k: End, d: f64| -> f64 {
+        match k {
+            End::Leaf => d * 1.3 + 0.3,
+            End::Corner => d + 0.1,
+            End::Tuck => d * 0.7,
+            End::Through => 0.0,
+        }
+    };
+    // How far an end's stitches may reach past the stroke's own width
+    // (serifs widen a free end; a tuck must not run along the other stroke).
+    let end_reach = |k: End| -> f64 {
+        match k {
+            End::Leaf => 2.4,
+            End::Corner => 1.5,
+            End::Tuck => 1.15,
+            End::Through => 1.6,
+        }
+    };
+    // Split a stroke path where it turns sharply.
+    let split_sharp = |path: &[Pt]| -> Vec<Vec<Pt>> {
+        let sp = resample(path, 0.1);
+        let n = sp.len();
+        if n < 12 {
+            return vec![sp];
+        }
+        let turn = |i: usize| -> f64 {
+            let k = ((field.at(sp[i]) * 1.5 / 0.1) as usize).clamp(5, 25);
+            if i < k || i + k >= n {
+                return 0.0;
+            }
+            let (a, b) = (sp[i].sub(sp[i - k]).norm(), sp[i + k].sub(sp[i]).norm());
+            (a.x * b.x + a.y * b.y).clamp(-1.0, 1.0).acos()
+        };
+        let turns: Vec<f64> = (0..n).map(turn).collect();
+        let mut cuts = Vec::new();
+        let mut i = 0;
+        while i < n {
+            if turns[i] > 55f64.to_radians() {
+                let mut j = i;
+                let mut best = i;
+                while j < n && turns[j] > 55f64.to_radians() {
+                    if turns[j] > turns[best] {
+                        best = j;
+                    }
+                    j += 1;
+                }
+                let last = cuts.last().copied().unwrap_or(0);
+                if best >= last + 6 && best + 6 < n {
+                    cuts.push(best);
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        let mut out = Vec::new();
+        let mut from = 0;
+        for c in cuts {
+            out.push(sp[from..=c].to_vec());
+            from = c;
+        }
+        out.push(sp[from..].to_vec());
+        out
+    };
+    // Ribs across a stroke piece (in its direction), from edge to edge.
+    let ribs = |path: &[Pt], k0: End, k1: End| -> Vec<(Pt, Pt)> {
         let mut pts = path.to_vec();
         if pts.len() < 2 {
             return Vec::new();
         }
-        let d0 = pts[0].sub(pts[1.min(pts.len() - 1)]).norm();
-        let n = pts.len();
-        let d1 = pts[n - 1].sub(pts[n - 2]).norm();
+        let len: f64 = pts.windows(2).map(|w| w[0].dist(w[1])).sum();
+        let (dd0, dd1) = (field.at(pts[0]).max(0.1), field.at(*pts.last().unwrap()).max(0.1));
+        let (e0, e1) = (end_ext(k0, dd0), end_ext(k1, dd1));
+        let back = |v: &[Pt], from_end: bool| -> Pt {
+            // direction over the last ~0.5 mm, for straight extensions
+            let n = v.len();
+            let k = 5.min(n - 1);
+            if from_end {
+                v[n - 1].sub(v[n - 1 - k]).norm()
+            } else {
+                v[0].sub(v[k]).norm()
+            }
+        };
+        let (d0, d1) = (back(&pts, false), back(&pts, true));
         if e0 > 0.0 {
             pts.insert(0, pts[0].add(d0.mul(e0)));
         }
@@ -793,15 +884,21 @@ fn turning_satin(
             pts.push(l.add(d1.mul(e1)));
         }
         let sp = resample(&pts, 0.1);
-        let k = 8usize; // direction from ±0.8 mm along the stroke
-        let mut out = Vec::with_capacity(sp.len());
-        for i in 0..sp.len() {
+        let n = sp.len();
+        // near the ends, hold the stitch direction steady
+        let zone = |k: End, d: f64| if k == End::Through { 0.0 } else { (d * 2.0 + 0.4).min(len * 0.45) };
+        let i0 = (((e0 + zone(k0, dd0)) / 0.1) as usize).min(n - 1);
+        let i1 = n.saturating_sub(1 + ((e1 + zone(k1, dd1)) / 0.1) as usize).max(i0);
+        let k = 8usize;
+        let mut raw: Vec<(usize, Pt, Pt, f64, f64)> = Vec::with_capacity(n);
+        for i in 0..n {
             let c = sp[i];
             let depth = field.at(c);
             if depth < 0.08 {
                 continue;
             }
-            let t = sp[(i + k).min(sp.len() - 1)].sub(sp[i.saturating_sub(k)]);
+            let j = i.clamp(i0, i1);
+            let t = sp[(j + k).min(n - 1)].sub(sp[j.saturating_sub(k)]);
             if t.len() < 1e-9 {
                 continue;
             }
@@ -829,22 +926,63 @@ fn turning_satin(
                 }
                 limit
             };
-            let (l, rr) = (march(nrm), march(nrm.mul(-1.0)));
-            out.push((c.add(nrm.mul(l + pc)), c.sub(nrm.mul(rr + pc))));
+            raw.push((i, c, nrm, march(nrm), march(nrm.mul(-1.0))));
         }
-        out
+        // the stroke's own half-widths just inside each end zone
+        let med = |lo: usize, hi: usize| -> (f64, f64) {
+            let mut l: Vec<f64> = raw.iter().filter(|r| r.0 >= lo && r.0 <= hi).map(|r| r.3).collect();
+            let mut rr: Vec<f64> = raw.iter().filter(|r| r.0 >= lo && r.0 <= hi).map(|r| r.4).collect();
+            if l.is_empty() {
+                l = raw.iter().map(|r| r.3).collect();
+                rr = raw.iter().map(|r| r.4).collect();
+            }
+            l.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            rr.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (l.get(l.len() / 2).copied().unwrap_or(1.0), rr.get(rr.len() / 2).copied().unwrap_or(1.0))
+        };
+        let (m0, m1) = (med(i0, i0 + 15), med(i1.saturating_sub(15), i1));
+        raw.into_iter()
+            .map(|(i, c, nrm, mut l, mut rr)| {
+                if i < i0 {
+                    l = l.min(m0.0 * end_reach(k0) + 0.1);
+                    rr = rr.min(m0.1 * end_reach(k0) + 0.1);
+                } else if i > i1 {
+                    l = l.min(m1.0 * end_reach(k1) + 0.1);
+                    rr = rr.min(m1.1 * end_reach(k1) + 0.1);
+                }
+                (c.add(nrm.mul(l + pc)), c.sub(nrm.mul(rr + pc)))
+            })
+            .collect()
+    };
+    // A stroke as pieces of ribs, split at sharp turns.
+    let stroke_ribs = |path: &[Pt], k0: End, k1: End| -> Vec<Vec<(Pt, Pt)>> {
+        let pieces = split_sharp(path);
+        let m = pieces.len();
+        pieces
+            .iter()
+            .enumerate()
+            .map(|(i, pc_)| {
+                let a = if i == 0 { k0 } else { End::Corner };
+                let b = if i + 1 == m { k1 } else { End::Corner };
+                ribs(pc_, a, b)
+            })
+            .filter(|v| v.len() >= 2)
+            .collect()
     };
     let underlay = !p.opts.no_underlay;
     let step = r.satin_spacing / 2.0;
-    let sew_back = |out: &mut Vec<Needle>, back: &[(Pt, Pt)]| {
-        if back.len() < 2 {
-            return;
+    let sew_back = |out: &mut Vec<Needle>, back: &[Vec<(Pt, Pt)>]| {
+        for piece in back {
+            if piece.len() < 2 {
+                continue;
+            }
+            let zz = ribs_to_zigzag(piece, step);
+            push_continue(out, &split_long(&zz, Limits::SATIN_MAX), Limits::SATIN_MAX);
         }
-        let zz = ribs_to_zigzag(back, step);
-        push_continue(out, &split_long(&zz, Limits::SATIN_MAX), Limits::SATIN_MAX);
     };
     // Out along a stroke: centre run (or a light zig-zag on wide strokes).
-    let run_out = |out: &mut Vec<Needle>, path: &[Pt], fwd: &[(Pt, Pt)]| {
+    let run_out = |out: &mut Vec<Needle>, path: &[Pt], fwd: &[Vec<(Pt, Pt)>]| {
+        let fwd: Vec<(Pt, Pt)> = fwd.iter().flatten().copied().collect();
         let wide = fwd.iter().map(|(a, b)| a.dist(*b)).sum::<f64>() / fwd.len().max(1) as f64 > 3.5;
         if underlay && wide {
             let inset = r.underlay_inset + pc;
@@ -873,10 +1011,10 @@ fn turning_satin(
     struct Frame {
         e: usize,
         y: usize,
-        fwd: Vec<(Pt, Pt)>,
+        fwd: Vec<Vec<(Pt, Pt)>>,
         pending: Vec<usize>,
         thru: Option<usize>,
-        owed: Vec<(Pt, Pt)>,
+        owed: Vec<Vec<(Pt, Pt)>>,
         stage: u8,
     }
     let start = (0..g.nodes.len())
@@ -903,7 +1041,7 @@ fn turning_satin(
         let Some(first_e) = first_e else { break };
         let start_pt = {
             let path = leaving(first_e, root);
-            let e0 = ext(root, first_e);
+            let e0 = end_ext(end_kind(root, first_e), field.at(g.nodes[root]).max(0.1));
             let d = path[0].sub(path[1.min(path.len() - 1)]).norm();
             let tip = path[0].add(d.mul((e0 - 0.4).max(0.0)));
             if field.at(tip) > 0.05 { tip } else { path[0] }
@@ -923,7 +1061,7 @@ fn turning_satin(
             edge_done[e] = true;
             let path = leaving(e, x);
             let y = if g.edges[e].a == x { g.edges[e].b } else { g.edges[e].a };
-            let fwd = ribs(&path, ext(x, e), ext(y, e));
+            let fwd = stroke_ribs(&path, end_kind(x, e), end_kind(y, e));
             run_out(out, &path, &fwd);
             Frame { e, y, fwd, pending: Vec::new(), thru: None, owed: Vec::new(), stage: 0 }
         };
@@ -970,8 +1108,16 @@ fn turning_satin(
                     }
                     2 | 3 => {
                         let mut fr = stack.pop().unwrap();
-                        let mut back: Vec<(Pt, Pt)> = std::mem::take(&mut fr.owed);
-                        back.extend(fr.fwd.iter().rev().map(|(a, b)| (*b, *a)));
+                        // owed pieces (from the far end), then this stroke's
+                        // pieces backwards; the two meet in one column
+                        let mut back: Vec<Vec<(Pt, Pt)>> = std::mem::take(&mut fr.owed);
+                        for (i, piece) in fr.fwd.iter().rev().enumerate() {
+                            let rev: Vec<(Pt, Pt)> = piece.iter().rev().map(|(a, b)| (*b, *a)).collect();
+                            match back.last_mut() {
+                                Some(last) if i == 0 => last.extend(rev),
+                                _ => back.push(rev),
+                            }
+                        }
                         // owed to the parent if this was its through-stroke
                         match stack.last_mut() {
                             Some(parent) if parent.stage == 3 && parent.thru == Some(fr.e) => {

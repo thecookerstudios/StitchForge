@@ -1,4 +1,4 @@
-# StitchForge v0.6 — embroidery app (Milestone 2 started: name drops)
+# StitchForge v0.7 — embroidery app
 
 Vector art and any-font text in; machine-ready DST, a printable operator
 spec sheet, and a stitch preview out. Written in Rust, runs on Windows,
@@ -64,6 +64,33 @@ name so the operator runs it on one head at a time.
 
 Letter height means capital-letter height, so every name comes out the same
 size whatever its letters.
+
+**Design objects (v0.7).** Every layer keeps two sides that stay in step:
+its *shape* (the vector paths, with their anchors and curve handles) and its
+*stitches* (the needle points). Both are saved in the `.sfg` file.
+- **Edit shape**: drag anchors and handles, double-click the outline to add
+  an anchor, Delete removes one. Stitches regenerate when you let go.
+- **Edit stitches**: click or box-select needle points, drag or arrow-nudge
+  them, Delete removes, double-click a stitch to add a point. Hand-edited
+  stitches are kept as they are; moving, resizing or rotating the layer
+  moves them too. If you later change the shape or its stitch settings, the
+  layer shows **⚠ check** and asks: *Regenerate stitches* or *Keep my stitches*.
+
+**Fill types and per-layer settings (v0.7).** Fills can be **Tatami** (rows),
+**Contour** (rings that follow the outline), **Spiral** (one continuous line in
+from the edge) or **Radial** (rows from the middle). Each layer can set its own
+row/satin spacing, stitch length, pull compensation, underlay spacing and
+inset, and tatami needle pattern (½ ⅓ ¼ ⅕) — blank means the fabric's
+setting. Tags: `sf-contour`, `sf-spiral`, `sf-radial`, `sf-density-0.4`,
+`sf-len-3`, `sf-pull-0.3`.
+
+**Lettering (v0.7): turning satin.** Satin lettering on Auto angle follows each
+stroke: the letter is traced to its centre line, split into strokes, and the
+satin turns with each curve. Strokes that carry straight through a junction
+are one unbroken column, sharp corners (N, M, K) are separate overlapping
+columns, serif feet are covered straight across, and the centre-run underlay
+doubles as the hidden travel, so letters sew without internal trims. Typing an
+angle switches that layer back to one fixed satin angle.
 
 **Stitch settings in your art app.** Put these in an element's id/name in
 Inkscape or Illustrator and StitchForge follows them: `sf-satin`,

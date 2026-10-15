@@ -11,7 +11,10 @@ use std::path::PathBuf;
 use stitchforge::design::{BuildOptions, Cmd, Design};
 use stitchforge::drops::{self as drops_mod, Case, DropSetup, Join, Slot};
 use stitchforge::formats::{self, Format, MachineFile};
-use stitchforge::geom::{BBox, Pt};
+use stitchforge::geom::{BBox, Node, Pt};
+use stitchforge::import::FillPattern;
+use stitchforge::project::Embroidery;
+use stitchforge::stitch::Needle;
 use stitchforge::import::{self, Artwork, Shape, ShapeKind, ShapeOpts, StitchChoice};
 use stitchforge::import::{Cap, Corner};
 use stitchforge::project::{Layer, Project, TextSpec};
@@ -62,6 +65,32 @@ enum Pending {
 enum Tab {
     Design,
     Drops,
+}
+
+/// Which side of a design object is being edited on the canvas.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Edit {
+    None,
+    /// Needle points of a layer (its embroidery representation).
+    Stitches(u64),
+    /// Anchors and handles of a layer's paths (its vector representation).
+    Shape(u64),
+}
+
+/// An anchor (part 0) or one of its handles (1 = in, 2 = out).
+#[derive(PartialEq, Clone, Copy, Debug)]
+struct NodeRef {
+    shape: usize,
+    path: usize,
+    node: usize,
+    part: u8,
+}
+
+enum EditDrag {
+    /// Moving needle points: where the drag began, and their starting spots.
+    Stitches(Pt, Vec<(usize, Pt)>),
+    Node(NodeRef, Pt, Node),
+    Box(Pos2),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -142,6 +171,12 @@ struct App {
     drop_sel: usize,
     drop_info: Option<(usize, Vec<Slot>)>,
     quiet_regen: bool,
+
+    // editing a design object's stitches or shape on the canvas
+    edit: Edit,
+    st_sel: std::collections::BTreeSet<usize>,
+    node_sel: Option<NodeRef>,
+    edit_drag: Option<EditDrag>,
 }
 
 use stitchforge::import::font_options;
@@ -211,6 +246,10 @@ impl App {
             drop_sel: 0,
             drop_info: None,
             quiet_regen: false,
+            edit: Edit::None,
+            st_sel: Default::default(),
+            node_sel: None,
+            edit_drag: None,
         }
         .with_launch_args()
     }
@@ -332,6 +371,74 @@ impl App {
                     i += 1;
                 }
                 "--export-dialog" => self.show_export = true,
+                // test hooks for editing design objects
+                "--fill" => {
+                    let f = match args.get(i + 1).map(|s| s.as_str()) {
+                        Some("contour") => FillPattern::Contour,
+                        Some("spiral") => FillPattern::Spiral,
+                        Some("radial") => FillPattern::Radial,
+                        _ => FillPattern::Tatami,
+                    };
+                    if let Some(l) = self.sel_mut() {
+                        l.opts.stitch = StitchChoice::Fill;
+                        l.opts.fill = f;
+                    }
+                    i += 1;
+                }
+                "--density" => {
+                    if let (Some(v), Some(l)) = (num(i + 1), self.sel_mut()) {
+                        l.opts.density = Some(v);
+                    }
+                    i += 1;
+                }
+                "--edit-stitches" => {
+                    if let Some(li) = self.sel_idx() {
+                        self.regenerate();
+                        self.dirty = false;
+                        self.start_stitch_edit(li);
+                    }
+                }
+                "--sel-points" => {
+                    if let (Some(a), Some(b)) = (num(i + 1), num(i + 2)) {
+                        self.st_sel = (a as usize..b as usize).collect();
+                    }
+                    i += 2;
+                }
+                "--nudge-points" => {
+                    if let (Some(dx), Some(dy), Some(li)) = (num(i + 1), num(i + 2), self.sel_idx()) {
+                        let l = &mut self.layers[li];
+                        for &k in &self.st_sel {
+                            if let Some(n) = l.embroidery.needles.get(k).copied() {
+                                l.embroidery.needles[k].p = l.inv(l.tf(n.p).add(Pt::new(dx, dy)));
+                            }
+                        }
+                        self.touch_stitches(li);
+                    }
+                    i += 2;
+                }
+                "--edit-shape" => {
+                    if let Some(li) = self.sel_idx() {
+                        self.start_shape_edit(li);
+                    }
+                }
+                "--move-node" => {
+                    // --move-node NODE dx dy (first shape, first path)
+                    if let (Some(k), Some(dx), Some(dy), Some(li)) = (num(i + 1), num(i + 2), num(i + 3), self.sel_idx()) {
+                        let l = &mut self.layers[li];
+                        if let Some(n) = l.shapes.get_mut(0).and_then(|s| s.curves.get_mut(0)).and_then(|c| c.nodes.get_mut(k as usize)) {
+                            let d = Pt::new(dx, dy);
+                            n.p = n.p.add(d);
+                            n.cin = n.cin.add(d);
+                            n.cout = n.cout.add(d);
+                        }
+                        if let Some(s) = l.shapes.get_mut(0) {
+                            s.reflatten();
+                        }
+                        self.node_sel = Some(NodeRef { shape: 0, path: 0, node: k as usize, part: 0 });
+                        self.dirty = true;
+                    }
+                    i += 3;
+                }
                 "--modified" => {
                     self.modified = true;
                     self.confirm = Some(Pending::Close);
@@ -374,6 +481,8 @@ impl App {
         self.last_checkpoint = -10.0;
     }
     fn do_undo(&mut self) {
+        self.st_sel.clear();
+        self.node_sel = None;
         if let Some(prev) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.layers, prev));
             self.dirty = true;
@@ -905,7 +1014,219 @@ impl App {
         }
     }
 
+    /// Store each layer's current stitches with it (the embroidery side of
+    /// every design object travels in the project file).
+    fn sync_embroidery(&mut self) {
+        if self.dirty || self.machine.is_some() || self.tab != Tab::Design {
+            return;
+        }
+        let Some(d) = &self.design else { return };
+        for (li, l) in self.layers.iter_mut().enumerate() {
+            if l.embroidery.edited {
+                continue;
+            }
+            let needles = d
+                .layer_needles
+                .get(&li)
+                .map(|v| {
+                    v.iter()
+                        .map(|n| Needle {
+                            p: l.inv(n.p),
+                            jump: n.jump,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            l.embroidery = Embroidery {
+                needles,
+                edited: false,
+                source: l.source_fingerprint(),
+            };
+        }
+    }
+
+    // ---------- editing a design object ----------
+
+    fn edit_layer(&self) -> Option<usize> {
+        let id = match self.edit {
+            Edit::Stitches(id) | Edit::Shape(id) => id,
+            Edit::None => return None,
+        };
+        self.layers.iter().position(|l| l.id == id)
+    }
+
+    fn start_stitch_edit(&mut self, li: usize) {
+        if self.dirty {
+            self.regenerate();
+            self.dirty = false;
+        }
+        self.sync_embroidery();
+        self.edit = Edit::Stitches(self.layers[li].id);
+        self.selected = Some(self.layers[li].id);
+        self.st_sel.clear();
+        self.edit_drag = None;
+        self.playing = false;
+        self.status = "Editing stitches: click or drag a box to select points, drag to move, Delete removes, double-click a stitch to add a point, Esc when done".into();
+    }
+
+    fn start_shape_edit(&mut self, li: usize) {
+        self.hard_checkpoint();
+        let l = &mut self.layers[li];
+        if l.text.take().is_some() {
+            self.status = "Text converted to outlines so its shape can be edited".into();
+        } else {
+            self.status = "Editing shape: drag anchors and handles, double-click the outline to add an anchor, Delete removes one, Esc when done".into();
+        }
+        for s in &mut l.shapes {
+            s.ensure_curves();
+        }
+        self.edit = Edit::Shape(l.id);
+        self.selected = Some(l.id);
+        self.node_sel = None;
+        self.edit_drag = None;
+        self.playing = false;
+    }
+
+    fn end_edit(&mut self) {
+        self.edit = Edit::None;
+        self.st_sel.clear();
+        self.node_sel = None;
+        self.edit_drag = None;
+        self.status = "Done editing".into();
+    }
+
+    /// Mark a layer's stitches as hand-edited (they now match its shape).
+    fn touch_stitches(&mut self, li: usize) {
+        let l = &mut self.layers[li];
+        l.embroidery.edited = true;
+        l.embroidery.source = l.source_fingerprint();
+        self.dirty = true;
+    }
+
+    /// Keys while editing. Returns true if the key was used.
+    fn edit_keys(&mut self, ctx: &egui::Context) -> bool {
+        let Some(li) = self.edit_layer() else {
+            if self.edit != Edit::None {
+                self.end_edit();
+            }
+            return false;
+        };
+        let pressed = |k: egui::Key| ctx.input(|i| i.key_pressed(k));
+        let (shift, cmd) = ctx.input(|i| (i.modifiers.shift, i.modifiers.command));
+        if pressed(egui::Key::Escape) {
+            self.end_edit();
+            return true;
+        }
+        let del = pressed(egui::Key::Delete) || pressed(egui::Key::Backspace);
+        match self.edit {
+            Edit::Stitches(_) => {
+                if cmd && pressed(egui::Key::A) {
+                    self.st_sel = (0..self.layers[li].embroidery.needles.len()).collect();
+                    return true;
+                }
+                if del && !self.st_sel.is_empty() {
+                    self.hard_checkpoint();
+                    let sel = std::mem::take(&mut self.st_sel);
+                    let n = &mut self.layers[li].embroidery.needles;
+                    let mut keep = Vec::with_capacity(n.len());
+                    let mut carry_jump = false;
+                    for (i, nd) in n.iter().enumerate() {
+                        if sel.contains(&i) {
+                            carry_jump |= nd.jump;
+                            continue;
+                        }
+                        let mut nd = *nd;
+                        nd.jump |= carry_jump;
+                        carry_jump = false;
+                        keep.push(nd);
+                    }
+                    *n = keep;
+                    self.touch_stitches(li);
+                    return true;
+                }
+                let step = if shift { 0.5 } else { 0.1 };
+                let mut d = Pt::new(0.0, 0.0);
+                if pressed(egui::Key::ArrowLeft) { d.x -= step; }
+                if pressed(egui::Key::ArrowRight) { d.x += step; }
+                if pressed(egui::Key::ArrowUp) { d.y -= step; }
+                if pressed(egui::Key::ArrowDown) { d.y += step; }
+                if d.len() > 0.0 && !self.st_sel.is_empty() {
+                    self.hard_checkpoint();
+                    let l = &mut self.layers[li];
+                    for &i in &self.st_sel {
+                        if let Some(nd) = l.embroidery.needles.get(i).copied() {
+                            let q = l.tf(nd.p).add(d);
+                            l.embroidery.needles[i].p = l.inv(q);
+                        }
+                    }
+                    self.touch_stitches(li);
+                    return true;
+                }
+            }
+            Edit::Shape(_) => {
+                if del {
+                    if let Some(r) = self.node_sel {
+                        let c = &mut self.layers[li].shapes[r.shape].curves[r.path];
+                        let min = if c.closed { 3 } else { 2 };
+                        if c.nodes.len() > min {
+                            self.hard_checkpoint();
+                            let c = &mut self.layers[li].shapes[r.shape].curves[r.path];
+                            c.nodes.remove(r.node);
+                            self.layers[li].shapes[r.shape].reflatten();
+                            self.node_sel = None;
+                            self.dirty = true;
+                        } else {
+                            self.status = "A path needs at least that many anchors".into();
+                        }
+                    }
+                    return true;
+                }
+            }
+            Edit::None => {}
+        }
+        false
+    }
+
+    /// Panel shown while editing a design object.
+    fn edit_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(li) = self.edit_layer() else { return };
+        let accent = Color32::from_rgb(30, 110, 230);
+        egui::Frame::NONE
+            .fill(accent.gamma_multiply(0.12))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                let l = &self.layers[li];
+                match self.edit {
+                    Edit::Stitches(_) => {
+                        ui.label(RichText::new(format!("Editing stitches · {}", l.name)).strong());
+                        ui.label(format!(
+                            "{} needle points · {} selected",
+                            group(l.embroidery.needles.len()),
+                            self.st_sel.len()
+                        ));
+                        ui.label(RichText::new("Click a point or drag a box to select (Shift adds) · drag to move · arrows nudge 0.1 mm (Shift 0.5) · Delete removes · double-click a stitch to add a point · Ctrl/Cmd+A selects all · right-drag pans").weak().small());
+                    }
+                    Edit::Shape(_) => {
+                        let anchors: usize = l.shapes.iter().flat_map(|s| s.curves.iter()).map(|c| c.nodes.len()).sum();
+                        ui.label(RichText::new(format!("Editing shape · {}", l.name)).strong());
+                        ui.label(format!("{anchors} anchors"));
+                        ui.label(RichText::new("Drag an anchor or handle · double-click the outline to add an anchor · Delete removes the selected anchor · stitches regenerate when you let go").weak().small());
+                        if l.embroidery.edited {
+                            ui.label(RichText::new("This layer's stitches were edited by hand: changing the shape will ask whether to regenerate them.").color(Color32::from_rgb(190, 120, 30)).small());
+                        }
+                    }
+                    Edit::None => {}
+                }
+                if ui.button(RichText::new("Done").strong()).clicked() {
+                    self.end_edit();
+                }
+            });
+        ui.add_space(6.0);
+    }
+
     fn save_to(&mut self, path: PathBuf) -> bool {
+        self.sync_embroidery();
         if let Some(stem) = path.file_stem() {
             self.design_name = stem.to_string_lossy().to_string();
         }
@@ -1516,6 +1837,11 @@ impl App {
                         let rgb = self.layer_thread(li).map(|t| t.rgb).unwrap_or(l.shapes.first().map(|s| s.rgb).unwrap_or([128; 3]));
                         swatch(ui, rgb);
                         let name = if l.visible { RichText::new(&l.name) } else { RichText::new(&l.name).weak().strikethrough() };
+                        if l.out_of_sync() {
+                            ui.label(RichText::new("⚠ check").small().color(Color32::from_rgb(220, 140, 40))).on_hover_text("Stitches were edited by hand, then the shape or settings changed");
+                        } else if l.embroidery.edited {
+                            ui.label(RichText::new("edited").small().color(Color32::from_rgb(90, 150, 240))).on_hover_text("Stitches edited by hand");
+                        }
                         if ui.add(egui::Label::new(name).sense(Sense::click()).truncate()).clicked() {
                             select = Some(l.id);
                         }
@@ -1701,6 +2027,87 @@ impl App {
                 }
             });
 
+            // The design object: its vector shape and its stitches, both kept
+            // and both editable.
+            section(ui, "Shape and stitches");
+            let anchors: usize = l
+                .shapes
+                .iter()
+                .map(|s| {
+                    if s.curves.is_empty() {
+                        0
+                    } else {
+                        s.curves.iter().map(|c| c.nodes.len()).sum()
+                    }
+                })
+                .sum();
+            ui.horizontal(|ui| {
+                ui.label("Shape");
+                ui.label(
+                    RichText::new(if l.text.is_some() {
+                        "live text".to_string()
+                    } else if anchors > 0 {
+                        format!("{anchors} anchors")
+                    } else {
+                        "outline".to_string()
+                    })
+                    .weak(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("Edit shape")
+                        .on_hover_text("Move anchors and curve handles; stitches follow")
+                        .clicked()
+                    {
+                        action = Some("edit-shape");
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Stitches");
+                ui.label(
+                    RichText::new(if l.embroidery.edited {
+                        "edited by hand"
+                    } else {
+                        "made from the shape"
+                    })
+                    .weak(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("Edit stitches")
+                        .on_hover_text("Move, add or delete needle points by hand")
+                        .clicked()
+                    {
+                        action = Some("edit-stitches");
+                    }
+                    if l.embroidery.edited && !l.out_of_sync() && ui
+                        .small_button("Regenerate")
+                        .on_hover_text("Drop the hand edits and make stitches from the shape again")
+                        .clicked()
+                    {
+                        action = Some("regen");
+                    }
+                });
+            });
+            if l.out_of_sync() {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(250, 236, 205))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("⚠ The shape or stitch settings changed after these stitches were edited by hand.").color(Color32::from_rgb(120, 70, 0)));
+                        ui.horizontal(|ui| {
+                            if ui.button("Regenerate stitches").clicked() {
+                                action = Some("regen");
+                            }
+                            if ui.button("Keep my stitches").clicked() {
+                                action = Some("keep");
+                            }
+                        });
+                    });
+            }
+
             section(ui, "Thread");
             let current = l.opts.thread;
             let shown = if let Some(t) = &l.custom {
@@ -1839,7 +2246,8 @@ impl App {
                 .shapes
                 .iter()
                 .all(|s| matches!(s.kind, ShapeKind::Line { .. }));
-            if !is_outline_layer {
+            let shaped_fill = l.opts.stitch == StitchChoice::Fill && l.opts.fill != FillPattern::Tatami;
+            if !is_outline_layer && !shaped_fill {
                 ui.horizontal(|ui| {
                     ui.label("Angle");
                     let mut auto = l.opts.angle_deg.is_none();
@@ -1864,7 +2272,9 @@ impl App {
                         }
                     }
                 });
-                if l.opts.angle_deg.is_none() && varies {
+                if l.opts.angle_deg.is_none() && kinds_turning(&self.design, li) {
+                    ui.label(RichText::new("Auto: satin turns with each stroke. Type a number for one fixed angle instead.").weak().small());
+                } else if l.opts.angle_deg.is_none() && varies {
                     ui.label(RichText::new("Auto: angle varies per piece (each letter gets its own). Type a number to set one angle for all.").weak().small());
                 }
             }
@@ -1963,7 +2373,7 @@ impl App {
                             }
                         });
                 });
-            } else {
+            } else if l.opts.stitch != StitchChoice::Fill {
                 ui.horizontal(|ui| {
                     ui.label("Satin widen");
                     if let Some(w) = num_field(ui, "widen", l.opts.widen, 2, "mm") {
@@ -1972,6 +2382,96 @@ impl App {
                     }
                     ui.label(RichText::new("+ thicker, − thinner").weak().small());
                 });
+            }
+            // ---- fill pattern and this layer's own stitch settings
+            let kinds: Vec<&str> = self
+                .design
+                .as_ref()
+                .map(|d| {
+                    d.objects
+                        .iter()
+                        .filter(|o| o.layer == li)
+                        .map(|o| o.stitch_type)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let is_fill = !is_outline_layer
+                && (l.opts.stitch == StitchChoice::Fill || kinds.iter().any(|k| k.ends_with("fill")));
+            let is_satin = l.opts.stitch == StitchChoice::Satin
+                || kinds.iter().any(|k| k.to_lowercase().contains("satin"));
+            if is_fill {
+                ui.horizontal(|ui| {
+                    ui.label("Fill pattern");
+                    egui::ComboBox::from_id_salt("fill-pattern")
+                        .width(210.0)
+                        .selected_text(l.opts.fill.label())
+                        .show_ui(ui, |ui| {
+                            for f in FillPattern::ALL {
+                                if ui.selectable_value(&mut l.opts.fill, f, f.label()).clicked() {
+                                    if l.opts.stitch == StitchChoice::Auto {
+                                        l.opts.stitch = StitchChoice::Fill;
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
+            }
+            if is_fill || is_satin {
+                let rec = &self.recipe;
+                let own = l.opts.has_own_settings();
+                let head = if own {
+                    "Stitch settings (this layer) •"
+                } else {
+                    "Stitch settings (this layer)"
+                };
+                egui::CollapsingHeader::new(RichText::new(head).small().strong())
+                    .id_salt("own-settings")
+                    .default_open(own)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Blank = the fabric's setting. Type a value to change it for this layer only; ↺ goes back.")
+                                .weak()
+                                .small(),
+                        );
+                        let o = &mut l.opts;
+                        if is_fill {
+                            changed |= own_setting(ui, "Row spacing", "own-dens", &mut o.density, rec.fill_spacing, 2, "mm", (0.15, 3.0));
+                            changed |= own_setting(ui, "Stitch length", "own-len", &mut o.stitch_len, rec.fill_len, 1, "mm", (0.8, 12.0));
+                        } else {
+                            changed |= own_setting(ui, "Satin spacing", "own-dens", &mut o.density, rec.satin_spacing, 2, "mm", (0.15, 3.0));
+                        }
+                        changed |= own_setting(ui, "Pull comp.", "own-pc", &mut o.pull_comp, rec.pull_comp, 2, "mm", (-0.5, 2.0));
+                        if is_fill {
+                            changed |= own_setting(ui, "Underlay spacing", "own-us", &mut o.underlay_spacing, rec.underlay_spacing, 1, "mm", (0.5, 8.0));
+                            changed |= own_setting(ui, "Underlay inset", "own-ui", &mut o.underlay_inset, rec.underlay_inset, 2, "mm", (0.0, 3.0));
+                        }
+                        if is_fill && matches!(o.fill, FillPattern::Tatami | FillPattern::Radial) {
+                            ui.horizontal(|ui| {
+                                ui.label("Needle pattern");
+                                let cur = o.stagger.unwrap_or(3);
+                                for (n, lbl) in [(2u8, "½"), (3, "⅓"), (4, "¼"), (5, "⅕")] {
+                                    if ui
+                                        .selectable_label(cur == n, lbl)
+                                        .on_hover_text(format!("Penetrations shift by 1/{n} of a stitch each row"))
+                                        .clicked()
+                                    {
+                                        o.stagger = if n == 3 { None } else { Some(n) };
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        }
+                        if o.has_own_settings() && ui.small_button("All back to fabric settings").clicked() {
+                            o.density = None;
+                            o.stitch_len = None;
+                            o.pull_comp = None;
+                            o.underlay_spacing = None;
+                            o.underlay_inset = None;
+                            o.stagger = None;
+                            changed = true;
+                        }
+                    });
             }
             ui.horizontal(|ui| {
                 changed |= ui.checkbox(&mut l.visible, "Visible").changed();
@@ -2559,8 +3059,22 @@ impl App {
     }
 
     fn layer_action(&mut self, a: &str, li: usize) {
+        match a {
+            "edit-stitches" => return self.start_stitch_edit(li),
+            "edit-shape" => return self.start_shape_edit(li),
+            _ => {}
+        }
         self.hard_checkpoint();
         match a {
+            "regen" => {
+                self.layers[li].embroidery.edited = false;
+                self.status = "Stitches regenerated from the shape".into();
+            }
+            "keep" => {
+                let l = &mut self.layers[li];
+                l.embroidery.source = l.source_fingerprint();
+                self.status = "Keeping your hand-edited stitches".into();
+            }
             "up" if li > 0 => self.layers.swap(li, li - 1),
             "down" if li + 1 < self.layers.len() => self.layers.swap(li, li + 1),
             "dup" => {
@@ -2599,6 +3113,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.separator();
             } else {
+                self.edit_panel(ui);
                 self.layer_props(ui, now);
             }
             if self.selected.is_some() {
@@ -2919,9 +3434,13 @@ impl App {
                 .map(|l| l.id)
         };
         let editing = self.tab == Tab::Design && self.machine.is_none();
+        let object_edit = editing && self.edit_layer().is_some();
+        if object_edit {
+            self.edit_input(&resp, ui, &to_mm, &to_screen, zoom);
+        }
         let no_layers: Vec<Layer> = Vec::new();
         let hit_src: &[Layer] = if editing { &self.layers } else { &no_layers };
-        if resp.drag_started() {
+        if !object_edit && resp.drag_started() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let hit = hit_layer(pos, hit_src, zoom);
                 if hit.is_some() && (hit == self.selected || ui.input(|i| !i.modifiers.shift)) {
@@ -2932,7 +3451,7 @@ impl App {
                 }
             }
         }
-        if resp.dragged() {
+        if !object_edit && resp.dragged() {
             let dlt = resp.drag_delta();
             match &mut self.moving {
                 Some(m) => *m = m.add(Pt::new((dlt.x / zoom) as f64, (dlt.y / zoom) as f64)),
@@ -2943,7 +3462,7 @@ impl App {
                 }
             }
         }
-        if resp.drag_stopped() {
+        if !object_edit && resp.drag_stopped() {
             if let Some(m) = self.moving.take() {
                 if m.len() > 0.01 {
                     self.hard_checkpoint();
@@ -2956,12 +3475,12 @@ impl App {
                 }
             }
         }
-        if resp.clicked() && editing {
+        if !object_edit && resp.clicked() && editing {
             if let Some(pos) = resp.interact_pointer_pos() {
                 self.selected = hit_layer(pos, &self.layers, zoom);
             }
         }
-        if resp.double_clicked() && self.selected.is_none() {
+        if !object_edit && resp.double_clicked() && self.selected.is_none() {
             self.fit = true;
         }
         if resp.hovered() {
@@ -2986,7 +3505,7 @@ impl App {
                 }
             }
             if let Some(cur) = cursor {
-                if !resp.dragged() && editing && hit_layer(cur, &self.layers, zoom).is_some() {
+                if !object_edit && !resp.dragged() && editing && hit_layer(cur, &self.layers, zoom).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
             }
@@ -3058,8 +3577,15 @@ impl App {
                 rect.expand(20.0),
             ));
         };
+        let hide_layer = match self.edit {
+            Edit::Stitches(_) if editing => self.edit_layer(),
+            _ => None,
+        };
         for o in &d.objects {
             if moving.is_some() && moving_set.contains(&o.layer) {
+                continue;
+            }
+            if Some(o.layer) == hide_layer {
                 continue;
             }
             if let Some((n_logo, keep)) = only_name {
@@ -3087,8 +3613,13 @@ impl App {
             }
         }
 
+        // ---- the object being edited: its needle points or its anchors
+        if editing {
+            self.edit_overlay(&painter, &to_screen, zoom, ui);
+        }
+
         // ---- selection box and stitch-direction arrow
-        if let Some(li) = sel_layer {
+        if let Some(li) = sel_layer.filter(|_| self.edit == Edit::None) {
             let l = &self.layers[li];
             let shift = moving.unwrap_or(Pt::new(0.0, 0.0));
             let lb = l.bbox();
@@ -3169,6 +3700,335 @@ impl App {
             egui::FontId::proportional(13.0),
             Color32::from_rgb(110, 106, 98),
         );
+    }
+
+    /// Mouse input while editing a design object's stitches or shape.
+    fn edit_input(
+        &mut self,
+        resp: &egui::Response,
+        ui: &egui::Ui,
+        to_mm: &dyn Fn(Pos2) -> Pt,
+        to_screen: &dyn Fn(Pt) -> Pos2,
+        zoom: f32,
+    ) {
+        let Some(li) = self.edit_layer() else { return };
+        let shift = ui.input(|i| i.modifiers.shift);
+        let latest = ui.input(|i| i.pointer.latest_pos());
+        let pan = |s: &mut Self| {
+            let dlt = resp.drag_delta();
+            s.view_center = s
+                .view_center
+                .sub(Pt::new((dlt.x / zoom) as f64, (dlt.y / zoom) as f64));
+        };
+        if resp.dragged_by(egui::PointerButton::Secondary)
+            || resp.dragged_by(egui::PointerButton::Middle)
+        {
+            pan(self);
+            return;
+        }
+        let primary_start = resp.drag_started_by(egui::PointerButton::Primary);
+        let primary_drag = resp.dragged_by(egui::PointerButton::Primary);
+        match self.edit {
+            Edit::Stitches(_) => {
+                let near = |s: &Self, pos: Pos2| -> Option<usize> {
+                    let l = &s.layers[li];
+                    let mut best: Option<(usize, f32)> = None;
+                    for (i, n) in l.embroidery.needles.iter().enumerate() {
+                        let d = to_screen(l.tf(n.p)).distance(pos);
+                        if d < 8.0 && best.map(|b| d < b.1).unwrap_or(true) {
+                            best = Some((i, d));
+                        }
+                    }
+                    best.map(|b| b.0)
+                };
+                if primary_start {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if let Some(i) = near(self, pos) {
+                            if !self.st_sel.contains(&i) {
+                                if !shift {
+                                    self.st_sel.clear();
+                                }
+                                self.st_sel.insert(i);
+                            }
+                            self.hard_checkpoint();
+                            let l = &self.layers[li];
+                            let orig = self
+                                .st_sel
+                                .iter()
+                                .filter_map(|&k| l.embroidery.needles.get(k).map(|n| (k, l.tf(n.p))))
+                                .collect();
+                            self.edit_drag = Some(EditDrag::Stitches(to_mm(pos), orig));
+                        } else {
+                            self.edit_drag = Some(EditDrag::Box(pos));
+                        }
+                    }
+                }
+                if primary_drag {
+                    if let (Some(pos), Some(EditDrag::Stitches(start, orig))) = (latest, &self.edit_drag) {
+                        let d = to_mm(pos).sub(*start);
+                        let l = &mut self.layers[li];
+                        for (k, p0) in orig {
+                            let q = l.inv(p0.add(d));
+                            l.embroidery.needles[*k].p = q;
+                        }
+                    }
+                }
+                if resp.drag_stopped() {
+                    match self.edit_drag.take() {
+                        Some(EditDrag::Stitches(..)) => self.touch_stitches(li),
+                        Some(EditDrag::Box(a)) => {
+                            if let Some(b) = latest {
+                                let r = Rect::from_two_pos(a, b);
+                                if !shift {
+                                    self.st_sel.clear();
+                                }
+                                let l = &self.layers[li];
+                                for (i, n) in l.embroidery.needles.iter().enumerate() {
+                                    if r.contains(to_screen(l.tf(n.p))) {
+                                        self.st_sel.insert(i);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if resp.double_clicked() {
+                    // add a needle point on the nearest stitch
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let l = &self.layers[li];
+                        let pts: Vec<Pos2> = l.embroidery.needles.iter().map(|n| to_screen(l.tf(n.p))).collect();
+                        let mut best: Option<(usize, f32, f32)> = None;
+                        for k in 0..pts.len().saturating_sub(1) {
+                            if l.embroidery.needles[k + 1].jump {
+                                continue;
+                            }
+                            let (a, b) = (pts[k], pts[k + 1]);
+                            let ab = b - a;
+                            let t = ((pos - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+                            let d = (a + ab * t).distance(pos);
+                            if d < 8.0 && best.map(|x| d < x.1).unwrap_or(true) {
+                                best = Some((k, d, t));
+                            }
+                        }
+                        if let Some((k, _, t)) = best {
+                            self.hard_checkpoint();
+                            let l = &mut self.layers[li];
+                            let a = l.embroidery.needles[k].p;
+                            let b = l.embroidery.needles[k + 1].p;
+                            l.embroidery.needles.insert(k + 1, Needle { p: a.lerp(b, t as f64), jump: false });
+                            self.st_sel = [k + 1].into_iter().collect();
+                            self.touch_stitches(li);
+                        }
+                    }
+                } else if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        match near(self, pos) {
+                            Some(i) if shift => {
+                                if !self.st_sel.remove(&i) {
+                                    self.st_sel.insert(i);
+                                }
+                            }
+                            Some(i) => self.st_sel = [i].into_iter().collect(),
+                            None if !shift => self.st_sel.clear(),
+                            None => {}
+                        }
+                    }
+                }
+            }
+            Edit::Shape(_) => {
+                let hit = |s: &Self, pos: Pos2| -> Option<NodeRef> {
+                    let l = &s.layers[li];
+                    // handles of the selected anchor first, then any anchor
+                    if let Some(r) = s.node_sel {
+                        if let Some(n) = l.shapes.get(r.shape).and_then(|sh| sh.curves.get(r.path)).and_then(|c| c.nodes.get(r.node)) {
+                            for (part, h) in [(1u8, n.cin), (2u8, n.cout)] {
+                                if h.dist(n.p) > 1e-6 && to_screen(l.tf(h)).distance(pos) < 8.0 {
+                                    return Some(NodeRef { part, ..r });
+                                }
+                            }
+                        }
+                    }
+                    for (si, sh) in l.shapes.iter().enumerate() {
+                        for (ci, c) in sh.curves.iter().enumerate() {
+                            for (ni, n) in c.nodes.iter().enumerate() {
+                                if to_screen(l.tf(n.p)).distance(pos) < 8.0 {
+                                    return Some(NodeRef { shape: si, path: ci, node: ni, part: 0 });
+                                }
+                            }
+                        }
+                    }
+                    None
+                };
+                if primary_start {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if let Some(r) = hit(self, pos) {
+                            self.hard_checkpoint();
+                            self.node_sel = Some(NodeRef { part: 0, ..r });
+                            let n = self.layers[li].shapes[r.shape].curves[r.path].nodes[r.node];
+                            self.edit_drag = Some(EditDrag::Node(r, to_mm(pos), n));
+                        } else {
+                            self.edit_drag = None;
+                        }
+                    }
+                }
+                if primary_drag {
+                    match (&self.edit_drag, latest) {
+                        (Some(EditDrag::Node(r, start, orig)), Some(pos)) => {
+                            let (r, start, orig) = (*r, *start, *orig);
+                            let l = &mut self.layers[li];
+                            let d = l.inv(to_mm(pos)).sub(l.inv(start));
+                            let smooth = orig.is_smooth();
+                            let n = &mut l.shapes[r.shape].curves[r.path].nodes[r.node];
+                            match r.part {
+                                0 => {
+                                    n.p = orig.p.add(d);
+                                    n.cin = orig.cin.add(d);
+                                    n.cout = orig.cout.add(d);
+                                }
+                                1 => {
+                                    n.cin = orig.cin.add(d);
+                                    if smooth {
+                                        let len = orig.cout.dist(orig.p);
+                                        n.cout = n.p.sub(n.cin.sub(n.p).norm().mul(len));
+                                    }
+                                }
+                                _ => {
+                                    n.cout = orig.cout.add(d);
+                                    if smooth {
+                                        let len = orig.cin.dist(orig.p);
+                                        n.cin = n.p.sub(n.cout.sub(n.p).norm().mul(len));
+                                    }
+                                }
+                            }
+                            l.shapes[r.shape].reflatten();
+                        }
+                        (None, _) => pan(self),
+                        _ => {}
+                    }
+                }
+                if resp.drag_stopped() {
+                    if let Some(EditDrag::Node(..)) = self.edit_drag.take() {
+                        self.dirty = true;
+                    }
+                }
+                if resp.double_clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let l = &self.layers[li];
+                        let q = l.inv(to_mm(pos));
+                        let scale = l.sx.abs().min(l.sy.abs()).max(1e-6);
+                        let tol = (8.0 / zoom) as f64 / scale;
+                        let mut best: Option<(usize, usize, usize, f64, f64)> = None;
+                        for (si, sh) in l.shapes.iter().enumerate() {
+                            for (ci, c) in sh.curves.iter().enumerate() {
+                                if let Some((seg, u, d)) = c.nearest(q) {
+                                    if d < tol && best.map(|b| d < b.4).unwrap_or(true) {
+                                        best = Some((si, ci, seg, u, d));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((si, ci, seg, u, _)) = best {
+                            self.hard_checkpoint();
+                            let sh = &mut self.layers[li].shapes[si];
+                            let n = sh.curves[ci].nodes.len();
+                            sh.curves[ci].split(seg, u.clamp(0.02, 0.98));
+                            let j = (seg + 1) % n;
+                            let ni = if j == 0 { n } else { j };
+                            sh.reflatten();
+                            self.node_sel = Some(NodeRef { shape: si, path: ci, node: ni, part: 0 });
+                            self.dirty = true;
+                        }
+                    }
+                } else if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        self.node_sel = hit(self, pos).map(|r| NodeRef { part: 0, ..r });
+                    }
+                }
+            }
+            Edit::None => {}
+        }
+    }
+
+    /// Draw the object being edited: needle points, or anchors and handles.
+    fn edit_overlay(&self, painter: &egui::Painter, to_screen: &dyn Fn(Pt) -> Pos2, zoom: f32, ui: &egui::Ui) {
+        let Some(li) = self.edit_layer() else { return };
+        let l = &self.layers[li];
+        let accent = Color32::from_rgb(30, 110, 230);
+        let orange = Color32::from_rgb(245, 140, 20);
+        match self.edit {
+            Edit::Stitches(_) => {
+                let rgb = self
+                    .design
+                    .as_ref()
+                    .and_then(|d| d.objects.iter().find(|o| o.layer == li).map(|o| d.stops[o.stop].thread.rgb))
+                    .or_else(|| self.layer_thread(li).map(|t| t.rgb))
+                    .unwrap_or([60, 60, 60]);
+                let col = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                let pts: Vec<(Pos2, bool)> = l
+                    .embroidery
+                    .needles
+                    .iter()
+                    .map(|n| (to_screen(l.tf(n.p)), n.jump))
+                    .collect();
+                let w = (0.35 * zoom).clamp(1.0, 6.0);
+                let jump = Stroke::new(1.0_f32, Color32::from_black_alpha(90));
+                for k in 1..pts.len() {
+                    let (a, b) = (pts[k - 1].0, pts[k].0);
+                    if pts[k].1 {
+                        for seg in EShape::dashed_line(&[a, b], jump, 4.0, 3.0) {
+                            painter.add(seg);
+                        }
+                    } else {
+                        painter.line_segment([a, b], Stroke::new(w, col));
+                    }
+                }
+                let r = if zoom >= 6.0 { 2.6 } else { 1.8 };
+                for (i, (p, _)) in pts.iter().enumerate() {
+                    if self.st_sel.contains(&i) {
+                        painter.circle_filled(*p, r + 1.6, orange);
+                        painter.circle_stroke(*p, r + 1.6, Stroke::new(1.0_f32, Color32::BLACK));
+                    } else if zoom >= 3.0 {
+                        painter.circle_filled(*p, r, Color32::WHITE);
+                        painter.circle_stroke(*p, r, Stroke::new(1.0_f32, Color32::from_black_alpha(160)));
+                    }
+                }
+                if let Some(EditDrag::Box(a)) = &self.edit_drag {
+                    if let Some(b) = ui.input(|i| i.pointer.latest_pos()) {
+                        let rr = Rect::from_two_pos(*a, b);
+                        painter.rect_filled(rr, 0.0, accent.gamma_multiply(0.12));
+                        painter.rect_stroke(rr, 0.0, Stroke::new(1.0_f32, accent), egui::StrokeKind::Inside);
+                    }
+                }
+            }
+            Edit::Shape(_) => {
+                for (si, sh) in l.shapes.iter().enumerate() {
+                    for (ci, c) in sh.curves.iter().enumerate() {
+                        let poly: Vec<Pos2> = c.flatten().iter().map(|p| to_screen(l.tf(*p))).collect();
+                        painter.add(EShape::line(poly.clone(), Stroke::new(3.0_f32, Color32::from_white_alpha(200))));
+                        painter.add(EShape::line(poly, Stroke::new(1.5_f32, accent)));
+                        for (ni, n) in c.nodes.iter().enumerate() {
+                            let sel = self.node_sel.map(|r| r.shape == si && r.path == ci && r.node == ni).unwrap_or(false);
+                            let p = to_screen(l.tf(n.p));
+                            if sel {
+                                for h in [n.cin, n.cout] {
+                                    if h.dist(n.p) > 1e-6 {
+                                        let hp = to_screen(l.tf(h));
+                                        painter.line_segment([p, hp], Stroke::new(1.0_f32, accent));
+                                        painter.circle_filled(hp, 4.0, Color32::WHITE);
+                                        painter.circle_stroke(hp, 4.0, Stroke::new(1.5_f32, accent));
+                                    }
+                                }
+                            }
+                            let rect = Rect::from_center_size(p, Vec2::splat(if sel { 9.0 } else { 7.0 }));
+                            painter.rect_filled(rect, 1.0, if sel { accent } else { Color32::WHITE });
+                            painter.rect_stroke(rect, 1.0, Stroke::new(1.2_f32, accent), egui::StrokeKind::Inside);
+                        }
+                    }
+                }
+            }
+            Edit::None => {}
+        }
     }
 
     fn text_window(&mut self, ctx: &egui::Context) {
@@ -3304,6 +4164,7 @@ impl eframe::App for App {
         }
         // shortcuts (ignored while typing in a field)
         let typing = ctx.wants_keyboard_input();
+        let edit_used = !typing && self.edit != Edit::None && self.edit_keys(ctx);
         let (cmd, shift) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
         let pressed = |k: egui::Key| ctx.input(|i| i.key_pressed(k));
         if cmd && pressed(egui::Key::O) {
@@ -3322,7 +4183,7 @@ impl eframe::App for App {
         if cmd && pressed(egui::Key::E) && self.design.is_some() {
             self.show_export = true;
         }
-        if !typing {
+        if !typing && !edit_used {
             if cmd && pressed(egui::Key::Z) {
                 if shift {
                     self.do_redo()
@@ -3336,7 +4197,7 @@ impl eframe::App for App {
             if pressed(egui::Key::Space) && self.design.is_some() {
                 self.playing = !self.playing;
             }
-            if let Some(li) = self.sel_idx() {
+            if let Some(li) = self.sel_idx().filter(|_| self.edit == Edit::None) {
                 let step = if shift { 5.0 } else { 0.5 };
                 let mut nudge = Pt::new(0.0, 0.0);
                 if pressed(egui::Key::ArrowLeft) {
@@ -3370,7 +4231,17 @@ impl eframe::App for App {
             }
         }
 
-        if self.dirty && self.moving.is_none() {
+        // editing ends if the object is no longer the selected one
+        if self.edit != Edit::None {
+            let still = self
+                .edit_layer()
+                .map(|i| Some(self.layers[i].id) == self.selected)
+                .unwrap_or(false);
+            if !still || self.tab != Tab::Design || self.machine.is_some() {
+                self.end_edit();
+            }
+        }
+        if self.dirty && self.moving.is_none() && self.edit_drag.is_none() {
             if self.clean_after_regen {
                 self.clean_after_regen = false;
                 self.modified = false;
@@ -3660,6 +4531,49 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
     }
     let p = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
     Some([p(0)?, p(2)?, p(4)?])
+}
+
+/// A stitch setting a layer can set for itself; blank means the fabric's.
+#[allow(clippy::too_many_arguments)]
+fn own_setting(
+    ui: &mut egui::Ui,
+    label: &str,
+    salt: &str,
+    v: &mut Option<f64>,
+    fabric: f64,
+    decimals: usize,
+    unit: &str,
+    range: (f64, f64),
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.add_sized([112.0, 18.0], egui::Label::new(label));
+        if let Some(n) = num_field(ui, salt, v.unwrap_or(fabric), decimals, unit) {
+            if (n - fabric).abs() > 1e-9 || v.is_some() {
+                *v = Some(n.clamp(range.0, range.1));
+                changed = true;
+            }
+        }
+        if v.is_some() {
+            if ui
+                .small_button("↺")
+                .on_hover_text(format!("Back to the fabric's {fabric:.2} {unit}"))
+                .clicked()
+            {
+                *v = None;
+                changed = true;
+            }
+        } else {
+            ui.label(RichText::new("fabric").weak().small());
+        }
+    });
+    changed
+}
+
+fn kinds_turning(d: &Option<Design>, li: usize) -> bool {
+    d.as_ref()
+        .map(|d| d.objects.iter().any(|o| o.layer == li && o.stitch_type == "Turning satin"))
+        .unwrap_or(false)
 }
 
 fn has_angle(stitch_type: &str) -> bool {
