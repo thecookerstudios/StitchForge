@@ -21,6 +21,7 @@ use stitchforge::{export, sampler, thread};
 
 const SAMPLE_SVG: &str = include_str!("../../examples/left-chest-logo.svg");
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -397,7 +398,7 @@ impl App {
     // ---------- loading ----------
 
     fn open_svg_path(&mut self, path: PathBuf, add: bool) {
-        match std::fs::read_to_string(&path) {
+        match stitchforge::vfs::read_to_string(&path) {
             Ok(data) => {
                 let name = path
                     .file_stem()
@@ -683,7 +684,7 @@ impl App {
                 "flat"
             }
         );
-        let t = std::time::Instant::now();
+        let t = now_ms();
         let opts = BuildOptions {
             keep_order: self.keep_order,
             auto_stops: self.auto_stops,
@@ -696,7 +697,7 @@ impl App {
                     None => d.cmds.len(),
                 };
                 if !self.status.starts_with("Tip:") && !self.status.starts_with("Calibration") {
-                    self.status = format!("Stitches generated in {} ms", t.elapsed().as_millis());
+                    self.status = format!("Stitches generated in {:.0} ms", now_ms() - t);
                 }
                 self.design = Some(d);
                 self.error = None;
@@ -754,22 +755,22 @@ impl App {
             return;
         }
         if self.tab == Tab::Drops {
-            let mut dlg = rfd::FileDialog::new()
-                .set_title("Choose a folder for the drop files and run sheet");
-            if let Some(dir) = &self.last_dir {
-                dlg = dlg.set_directory(dir);
-            }
-            let Some(dir) = dlg.pick_folder() else { return };
+            let Some(dir) = export_dir(
+                "Choose a folder for the drop files and run sheet",
+                self.last_dir.as_ref(),
+            ) else {
+                return;
+            };
             self.export_drops_to(&dir, &fmts);
             return;
         }
-        let mut dlg = rfd::FileDialog::new()
-            .set_title("Choose a folder for the machine files and operator sheet");
-        if let Some(dir) = &self.last_dir {
-            dlg = dlg.set_directory(dir);
-        }
-        let Some(dir) = dlg.pick_folder() else { return };
-        let generated = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        let Some(dir) = export_dir(
+            "Choose a folder for the machine files and operator sheet",
+            self.last_dir.as_ref(),
+        ) else {
+            return;
+        };
+        let generated = stamp();
         let mut job = self.job.clone();
         if job.garment.is_empty() && self.profile == Profile::Cap {
             job.garment = "Cap".into();
@@ -786,7 +787,10 @@ impl App {
                     names.join(", "),
                     dir.display()
                 );
-                open_path(&w.sheet);
+                deliver(&dir, &format!("{}-files", d.name), &w.sheet);
+                if cfg!(target_arch = "wasm32") {
+                    self.status = format!("Downloaded {}-files.zip ({})", d.name, names.join(", "));
+                }
                 self.last_dir = Some(dir);
                 self.show_export = false;
             }
@@ -856,11 +860,28 @@ impl App {
             return false;
         }
         match self.project_path.clone() {
-            Some(p) => self.save_to(p),
-            None => self.save_as(),
+            Some(p) if !cfg!(target_arch = "wasm32") => self.save_to(p),
+            _ => self.save_as(),
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn save_as(&mut self) -> bool {
+        if self.machine.is_some() || self.layers.is_empty() {
+            return false;
+        }
+        let p = PathBuf::from(format!("/out/{}.sfg", self.design_name));
+        if !self.save_to(p.clone()) {
+            return false;
+        }
+        if let Ok(data) = stitchforge::vfs::read(&p) {
+            web::download(&format!("{}.sfg.json", self.design_name), data);
+            self.status = format!("Downloaded {}.sfg.json — open it again with Open…", self.design_name);
+        }
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn save_as(&mut self) -> bool {
         if self.machine.is_some() || self.layers.is_empty() {
             return false;
@@ -919,20 +940,49 @@ impl App {
     }
 
     fn open_dialog(&mut self) {
-        let mut dlg = rfd::FileDialog::new()
-            .set_title("Open")
-            .add_filter(
-                "Everything StitchForge opens",
-                &["sfg", "svg", "dst", "exp", "pes"],
-            )
-            .add_filter("StitchForge project", &["sfg"])
-            .add_filter("SVG artwork", &["svg"])
-            .add_filter("Stitch files", &["dst", "exp", "pes"]);
-        if let Some(dir) = &self.last_dir {
-            dlg = dlg.set_directory(dir);
-        }
-        if let Some(p) = dlg.pick_file() {
-            self.open_any(p);
+        pick(
+            Want::Open,
+            "Open",
+            &[
+                ("Everything StitchForge opens", &["sfg", "json", "svg", "dst", "exp", "pes"]),
+                ("StitchForge project", &["sfg", "json"]),
+                ("SVG artwork", &["svg"]),
+                ("Stitch files", &["dst", "exp", "pes"]),
+            ],
+            self.last_dir.as_ref(),
+        );
+    }
+
+    /// A file came back from a picker (desktop: at once; browser: after upload).
+    fn handle_picked(&mut self, want: Want, p: PathBuf) {
+        match want {
+            Want::Open => self.open_any(p),
+            Want::AddSvg => self.open_svg_path(p, true),
+            Want::Names => self.load_names_path(p),
+            Want::Chart => match thread::load_chart_csv(&p.to_string_lossy()) {
+                Ok(c) => {
+                    self.chart_name = p.file_stem().unwrap().to_string_lossy().to_string();
+                    self.chart = c;
+                    for l in &mut self.layers {
+                        l.opts.thread = None;
+                    }
+                    self.dirty = true;
+                }
+                Err(e) => self.error = Some(e),
+            },
+            Want::Font => match stitchforge::vfs::read(&p)
+                .map_err(|e| e.to_string())
+                .and_then(import::add_font_data)
+            {
+                Ok(fam) => {
+                    self.fonts = None;
+                    self.font_opts = None;
+                    self.font = fam.clone();
+                    self.status = format!("Font added: {fam}");
+                    self.dirty = true;
+                }
+                Err(e) => self.error = Some(format!("Couldn't use that font: {e}")),
+            },
         }
     }
 
@@ -943,7 +993,7 @@ impl App {
             .unwrap_or_default();
         self.last_dir = path.parent().map(|p| p.to_path_buf());
         match ext.as_str() {
-            "sfg" => match Project::load(&path) {
+            "sfg" | "json" => match Project::load(&path) {
                 Ok(p) => {
                     self.apply_project(p, Some(path.clone()));
                     self.status = format!("Opened {}", path.display());
@@ -1151,12 +1201,10 @@ impl App {
     }
 
     fn pick_svg(&mut self, add: bool) {
-        let mut dlg = rfd::FileDialog::new().add_filter("SVG artwork", &["svg"]);
-        if let Some(dir) = &self.last_dir {
-            dlg = dlg.set_directory(dir);
-        }
-        if let Some(p) = dlg.pick_file() {
-            self.open_svg_path(p, add);
+        if add {
+            pick(Want::AddSvg, "Add art", &[("SVG artwork", &["svg"])], self.last_dir.as_ref());
+        } else {
+            pick(Want::Open, "Open SVG", &[("SVG artwork", &["svg"])], self.last_dir.as_ref());
         }
     }
 
@@ -2019,18 +2067,12 @@ impl App {
     }
 
     fn pick_names_file(&mut self) {
-        let mut dlg = rfd::FileDialog::new()
-            .set_title("Names: Excel or CSV")
-            .add_filter(
-                "Spreadsheet",
-                &["xlsx", "xlsm", "xls", "ods", "csv", "tsv", "txt"],
-            );
-        if let Some(dir) = &self.last_dir {
-            dlg = dlg.set_directory(dir);
-        }
-        if let Some(p) = dlg.pick_file() {
-            self.load_names_path(p);
-        }
+        pick(
+            Want::Names,
+            "Names: Excel or CSV",
+            &[("Spreadsheet", &["xlsx", "xlsm", "xls", "ods", "csv", "tsv", "txt"])],
+            self.last_dir.as_ref(),
+        );
     }
 
     fn load_names_path(&mut self, path: PathBuf) {
@@ -2074,7 +2116,7 @@ impl App {
 
     fn export_drops_to(&mut self, dir: &std::path::Path, fmts: &[Format]) {
         let proj = self.to_project();
-        let generated = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        let generated = stamp();
         let res = {
             let opt = self.fonts_db();
             drops_mod::export_drops(&proj, opt, dir, fmts, &generated)
@@ -2086,7 +2128,7 @@ impl App {
                     ex.files.len() / fmts.len().max(1),
                     dir.display()
                 );
-                open_path(&ex.sheet);
+                deliver(dir, &format!("{}-name-drops", proj.name), &ex.sheet);
                 self.last_dir = Some(dir.to_path_buf());
                 self.show_export = false;
             }
@@ -2667,19 +2709,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(format!("Threads: {}", self.chart_name));
                     if ui.small_button("Load chart CSV…").on_hover_text("Columns: code,name,r,g,b").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().add_filter("Thread chart", &["csv"]).pick_file() {
-                            match thread::load_chart_csv(&p.to_string_lossy()) {
-                                Ok(c) => {
-                                    self.chart_name = p.file_stem().unwrap().to_string_lossy().to_string();
-                                    self.chart = c;
-                                    for l in &mut self.layers {
-                                        l.opts.thread = None;
-                                    }
-                                    self.dirty = true;
-                                }
-                                Err(e) => self.error = Some(e),
-                            }
-                        }
+                        pick(Want::Chart, "Thread chart", &[("Thread chart", &["csv"])], self.last_dir.as_ref());
                     }
                 });
             }
@@ -3202,7 +3232,16 @@ impl App {
                             }
                         }
                     });
-                ui.label(RichText::new(format!("Selected: {}", self.font)).weak());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Selected: {}", self.font)).weak());
+                    if ui
+                        .small_button("Load font file…")
+                        .on_hover_text("Any .ttf or .otf font file")
+                        .clicked()
+                    {
+                        pick(Want::Font, "Font file", &[("Font", &["ttf", "otf", "ttc"])], self.last_dir.as_ref());
+                    }
+                });
                 if let Some(e) = &self.error {
                     ui.label(RichText::new(e).color(Color32::from_rgb(210, 70, 60)));
                 }
@@ -3222,6 +3261,14 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = ctx.input(|i| i.time);
+        CTX.with(|c| {
+            if c.borrow().is_none() {
+                *c.borrow_mut() = Some(ctx.clone());
+            }
+        });
+        for (want, p) in PICKED.with(|v| std::mem::take(&mut *v.borrow_mut())) {
+            self.handle_picked(want, p);
+        }
         // closing with unsaved work: ask first
         if ctx.input(|i| i.viewport().close_requested()) && self.modified && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -3232,7 +3279,15 @@ impl eframe::App for App {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .filter_map(|f| {
+                    f.path.clone().or_else(|| {
+                        // browser: the file's bytes come with the drop
+                        let bytes = f.bytes.as_ref()?;
+                        let p = PathBuf::from(format!("/in/{}", f.name));
+                        stitchforge::vfs::write(&p, &bytes[..]).ok()?;
+                        Some(p)
+                    })
+                })
                 .collect()
         });
         for p in dropped {
@@ -3722,6 +3777,7 @@ fn group(n: usize) -> String {
     out
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn open_path(p: &std::path::Path) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(p).spawn();
@@ -3732,4 +3788,185 @@ fn open_path(p: &std::path::Path) {
         .spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open").arg(p).spawn();
+}
+
+// ---------------------------------------------------------------- platform
+// Desktop: native dialogs and the real disk. Browser: an upload picker that
+// puts the file in the in-memory file store, and downloads for results.
+
+/// What a picked file is for.
+#[derive(Clone, Copy)]
+enum Want {
+    Open,
+    AddSvg,
+    Names,
+    Chart,
+    Font,
+}
+
+thread_local! {
+    static PICKED: std::cell::RefCell<Vec<(Want, PathBuf)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CTX: std::cell::RefCell<Option<egui::Context>> = const { std::cell::RefCell::new(None) };
+}
+
+fn picked(want: Want, p: PathBuf) {
+    PICKED.with(|v| v.borrow_mut().push((want, p)));
+    CTX.with(|c| {
+        if let Some(c) = c.borrow().as_ref() {
+            c.request_repaint();
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pick(want: Want, title: &str, filters: &[(&str, &[&str])], dir: Option<&PathBuf>) {
+    let mut dlg = rfd::FileDialog::new().set_title(title);
+    for (n, e) in filters {
+        dlg = dlg.add_filter(*n, e);
+    }
+    if let Some(d) = dir {
+        dlg = dlg.set_directory(d);
+    }
+    if let Some(p) = dlg.pick_file() {
+        picked(want, p);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick(want: Want, title: &str, filters: &[(&str, &[&str])], _dir: Option<&PathBuf>) {
+    // One combined filter: browsers show a single "accept" list anyway.
+    let mut all: Vec<&str> = Vec::new();
+    for (_, e) in filters {
+        all.extend(e.iter().copied());
+    }
+    let dlg = rfd::AsyncFileDialog::new()
+        .set_title(title)
+        .add_filter("Files", &all);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Some(f) = dlg.pick_file().await {
+            let name = f.file_name();
+            let data = f.read().await;
+            let p = PathBuf::from(format!("/in/{name}"));
+            let _ = stitchforge::vfs::write(&p, &data);
+            picked(want, p);
+        }
+    });
+}
+
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+    }
+}
+
+fn stamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// Where exports go: a folder the user picks, or (browser) a scratch
+/// folder that is zipped and downloaded afterwards.
+#[cfg(not(target_arch = "wasm32"))]
+fn export_dir(title: &str, last: Option<&PathBuf>) -> Option<PathBuf> {
+    let mut dlg = rfd::FileDialog::new().set_title(title);
+    if let Some(d) = last {
+        dlg = dlg.set_directory(d);
+    }
+    dlg.pick_folder()
+}
+#[cfg(target_arch = "wasm32")]
+fn export_dir(_title: &str, _last: Option<&PathBuf>) -> Option<PathBuf> {
+    let d = PathBuf::from("/out/export");
+    stitchforge::vfs::remove_dir_all(&d);
+    Some(d)
+}
+
+/// After an export: open the sheet (desktop) or download everything as a
+/// zip and show the sheet in the page (browser).
+#[cfg(not(target_arch = "wasm32"))]
+fn deliver(_dir: &std::path::Path, _zip_name: &str, sheet: &std::path::Path) {
+    open_path(sheet);
+}
+#[cfg(target_arch = "wasm32")]
+fn deliver(dir: &std::path::Path, zip_name: &str, sheet: &std::path::Path) {
+    use std::io::Write;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut buf);
+        let o: zip::write::SimpleFileOptions =
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut files = stitchforge::vfs::list(dir);
+        files.sort();
+        for f in files {
+            if let Ok(data) = stitchforge::vfs::read(&f) {
+                let name = f.file_name().unwrap().to_string_lossy().to_string();
+                if z.start_file(name, o).is_ok() {
+                    let _ = z.write_all(&data);
+                }
+            }
+        }
+        let _ = z.finish();
+    }
+    web::download(&format!("{zip_name}.zip"), buf.into_inner());
+    if let Ok(html) = stitchforge::vfs::read_to_string(sheet) {
+        web::show_html(&html);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub mod web {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_name = sfDownload)]
+        fn sf_download(name: &str, data: js_sys::Uint8Array);
+        #[wasm_bindgen(js_name = sfShowHtml)]
+        fn sf_show_html(html: &str);
+    }
+
+    pub fn download(name: &str, data: Vec<u8>) {
+        sf_download(name, js_sys::Uint8Array::from(&data[..]));
+    }
+    pub fn show_html(html: &str) {
+        sf_show_html(html);
+    }
+
+    /// Fonts bundled with the web app (no installed fonts in a browser).
+    pub fn bundled_fonts() -> Vec<&'static [u8]> {
+        crate::BUNDLED_FONTS.to_vec()
+    }
+
+    #[wasm_bindgen]
+    pub struct WebHandle {
+        runner: eframe::WebRunner,
+    }
+
+    #[wasm_bindgen]
+    impl WebHandle {
+        #[wasm_bindgen(constructor)]
+        pub fn new() -> Self {
+            eframe::WebLogger::init(log::LevelFilter::Warn).ok();
+            Self { runner: eframe::WebRunner::new() }
+        }
+        #[wasm_bindgen]
+        pub async fn start(&self, canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
+            for f in bundled_fonts() {
+                let _ = stitchforge::import::add_font_data(f.to_vec());
+            }
+            self.runner
+                .start(
+                    canvas,
+                    eframe::WebOptions::default(),
+                    Box::new(|cc| Ok(Box::new(super::App::new(cc)))),
+                )
+                .await
+        }
+    }
 }

@@ -551,7 +551,7 @@ pub fn read_pes(bytes: &[u8]) -> Result<MachineFile, String> {
 
 /// Read any supported stitch file by its extension.
 pub fn read_file(path: &std::path::Path) -> Result<MachineFile, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = crate::vfs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_string())

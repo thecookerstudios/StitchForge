@@ -5,6 +5,7 @@
 
 pub mod design;
 pub mod drops;
+pub mod vfs;
 pub mod dst;
 pub mod export;
 pub mod formats;

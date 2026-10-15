@@ -308,12 +308,12 @@ impl Project {
         let json = serde_json::to_string(self).map_err(|e| e.to_string())?;
         // write to a temp file first so a crash never leaves a half-written project
         let tmp = path.with_extension("sfg.tmp");
-        std::fs::write(&tmp, json).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+        crate::vfs::write(&tmp, json).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        crate::vfs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
-        let data = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let data = crate::vfs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let p: Project = serde_json::from_str(&data)
             .map_err(|e| format!("{} is not a StitchForge project: {e}", path.display()))?;
         if p.format != FORMAT {

@@ -149,12 +149,47 @@ pub struct Artwork {
 
 const PX_TO_MM: f64 = 25.4 / 96.0;
 
+thread_local! {
+    /// Fonts added at run time (bundled in the web app, or loaded from a
+    /// font file the user picked). Used alongside the installed fonts.
+    static EXTRA_FONTS: std::cell::RefCell<Vec<std::sync::Arc<Vec<u8>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Make a font file's faces available to text layers. Returns the first
+/// family name in it.
+pub fn add_font_data(data: Vec<u8>) -> Result<String, String> {
+    let mut db = usvg::fontdb::Database::new();
+    db.load_font_data(data.clone());
+    let fam = db
+        .faces()
+        .next()
+        .and_then(|f| f.families.first().map(|x| x.0.clone()))
+        .ok_or("no usable font faces in that file")?;
+    EXTRA_FONTS.with(|e| e.borrow_mut().push(std::sync::Arc::new(data)));
+    Ok(fam)
+}
+
+fn load_fonts(db: &mut usvg::fontdb::Database) {
+    db.load_system_fonts();
+    EXTRA_FONTS.with(|e| {
+        for f in e.borrow().iter() {
+            db.load_font_source(usvg::fontdb::Source::Binary(f.clone()));
+        }
+    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        db.set_sans_serif_family("Liberation Sans");
+        db.set_serif_family("Liberation Serif");
+    }
+}
+
 pub fn font_options(
     font_file: Option<&str>,
 ) -> Result<(usvg::Options<'static>, Option<String>), String> {
     let mut opt = usvg::Options::default();
     let db = opt.fontdb_mut();
-    db.load_system_fonts();
+    load_fonts(db);
     let mut family = None;
     if let Some(f) = font_file {
         let before = db.len();
@@ -173,7 +208,7 @@ pub fn font_options(
 
 pub fn list_fonts() -> Vec<String> {
     let mut db = usvg::fontdb::Database::new();
-    db.load_system_fonts();
+    load_fonts(&mut db);
     let mut v: Vec<String> = db
         .faces()
         .filter_map(|f| f.families.first().map(|x| x.0.clone()))
@@ -207,7 +242,7 @@ pub fn load_svg_str(svg: &str, opt: &usvg::Options) -> Result<Artwork, String> {
 }
 
 pub fn load_svg_file(path: &str, font_file: Option<&str>) -> Result<Artwork, String> {
-    let data = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let data = crate::vfs::read_to_string(std::path::Path::new(path)).map_err(|e| format!("cannot read {path}: {e}"))?;
     let (opt, _) = font_options(font_file)?;
     load_svg_str(&data, &opt)
 }

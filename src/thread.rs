@@ -59,7 +59,7 @@ pub fn generic_chart() -> Vec<Thread> {
 }
 
 pub fn load_chart_csv(path: &str) -> Result<Vec<Thread>, String> {
-    let data = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let data = crate::vfs::read_to_string(std::path::Path::new(path)).map_err(|e| format!("cannot read {path}: {e}"))?;
     let brand = std::path::Path::new(path)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())

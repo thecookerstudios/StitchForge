@@ -34,11 +34,11 @@ pub fn write_formats(
     generated: &str,
     fmts: &[Format],
 ) -> Result<Written, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    crate::vfs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let base = &d.name;
     let p = |ext: &str| dir.join(format!("{base}.{ext}"));
     let write = |path: PathBuf, data: &[u8]| {
-        std::fs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))
+        crate::vfs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))
     };
     let mut machine = Vec::new();
     for f in fmts {

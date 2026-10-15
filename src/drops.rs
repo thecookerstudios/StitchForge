@@ -72,7 +72,7 @@ pub fn read_table(path: &Path) -> Result<Table, String> {
     let raw = match ext.as_str() {
         "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" => read_workbook(path)?,
         "csv" | "tsv" | "txt" => {
-            let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let data = crate::vfs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
             let text = String::from_utf8_lossy(&data)
                 .trim_start_matches('\u{feff}')
                 .to_string();
@@ -102,8 +102,10 @@ pub fn read_table(path: &Path) -> Result<Table, String> {
 }
 
 fn read_workbook(path: &Path) -> Result<Vec<Vec<String>>, String> {
-    use calamine::{Data, Reader, open_workbook_auto};
-    let mut wb = open_workbook_auto(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    use calamine::{Data, Reader, open_workbook_auto_from_rs};
+    let bytes = crate::vfs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut wb = open_workbook_auto_from_rs(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     for name in wb.sheet_names().to_owned() {
         let Ok(range) = wb.worksheet_range(&name) else {
             continue;
@@ -510,7 +512,7 @@ pub fn export_drops(
     fmts: &[Format],
     generated: &str,
 ) -> Result<DropExport, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    crate::vfs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let n = project.drops.drop_count();
     let mut files = Vec::new();
     let mut html_drops = String::new();
@@ -520,7 +522,7 @@ pub fn export_drops(
         let base = &d.name;
         for f in fmts {
             let p = dir.join(format!("{base}.{}", f.ext()));
-            std::fs::write(&p, formats::write(&d, *f))
+            crate::vfs::write(&p, formats::write(&d, *f))
                 .map_err(|e| format!("{}: {e}", p.display()))?;
             files.push(p);
         }
@@ -531,7 +533,7 @@ pub fn export_drops(
             .collect();
         job.notes = format!("Name drop {} of {}. {}", drop + 1, n, names.join("; "));
         let sheet_path = dir.join(format!("{base}.sheet.html"));
-        std::fs::write(&sheet_path, sheet::operator_sheet(&d, &job, generated))
+        crate::vfs::write(&sheet_path, sheet::operator_sheet(&d, &job, generated))
             .map_err(|e| format!("{}: {e}", sheet_path.display()))?;
         let file = format!("{base}.{}", fmts.first().map(|f| f.ext()).unwrap_or("dst"));
         let plan = stop_plan(&d, n_logo, &slots);
@@ -595,9 +597,9 @@ pub fn export_drops(
         }
     );
     let sheet = dir.join(format!("{}-name-drops.html", project.name));
-    std::fs::write(&sheet, html).map_err(|e| format!("{}: {e}", sheet.display()))?;
+    crate::vfs::write(&sheet, html).map_err(|e| format!("{}: {e}", sheet.display()))?;
     let csv_path = dir.join(format!("{}-name-drops.csv", project.name));
-    std::fs::write(&csv_path, csv).map_err(|e| format!("{}: {e}", csv_path.display()))?;
+    crate::vfs::write(&csv_path, csv).map_err(|e| format!("{}: {e}", csv_path.display()))?;
     Ok(DropExport { files, sheet })
 }
 
