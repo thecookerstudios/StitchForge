@@ -672,6 +672,7 @@ impl App {
             }
         }
         let art = Artwork {
+            fixed: Default::default(),
             shapes,
             warnings: Vec::new(),
         };

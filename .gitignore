@@ -2,3 +2,5 @@ target/
 out/
 StitchForge.app/
 StitchForge.exe
+web/target/
+web/www/pkg/

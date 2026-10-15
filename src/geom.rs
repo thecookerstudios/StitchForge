@@ -663,3 +663,170 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------- vector paths
+
+/// One anchor of an editable vector path, with its two Bézier handles
+/// (equal to the anchor for a sharp corner or straight line).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Node {
+    pub p: Pt,
+    /// Handle on the side coming into this anchor.
+    pub cin: Pt,
+    /// Handle on the side going out of this anchor.
+    pub cout: Pt,
+}
+
+impl Node {
+    pub fn corner(p: Pt) -> Node {
+        Node { p, cin: p, cout: p }
+    }
+    /// Handles in line with each other: moving one turns the other.
+    pub fn is_smooth(&self) -> bool {
+        let (a, b) = (self.cin.sub(self.p), self.cout.sub(self.p));
+        a.len() > 1e-6 && b.len() > 1e-6 && (a.x * b.y - a.y * b.x).abs() < 0.05 * a.len() * b.len()
+            && (a.x * b.x + a.y * b.y) < 0.0
+    }
+}
+
+/// An editable vector path: the "vector representation" of a design
+/// object. Stitches are generated from it; its flattened polyline is what
+/// the stitch engine reads.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VPath {
+    pub nodes: Vec<Node>,
+    pub closed: bool,
+}
+
+/// Points along a cubic from `a` to `b`, excluding `a`.
+pub fn flatten_cubic(a: &Node, b: &Node, out: &mut Vec<Pt>) {
+    let (p0, p1, p2, p3) = (a.p, a.cout, b.cin, b.p);
+    if p1.dist(p0) < 1e-9 && p2.dist(p3) < 1e-9 {
+        out.push(p3);
+        return;
+    }
+    let n = ((p0.dist(p1) + p1.dist(p2) + p2.dist(p3)) / 0.25)
+        .ceil()
+        .clamp(2.0, 96.0) as usize;
+    for k in 1..=n {
+        out.push(cubic_at(p0, p1, p2, p3, k as f64 / n as f64));
+    }
+}
+
+pub fn cubic_at(p0: Pt, p1: Pt, p2: Pt, p3: Pt, u: f64) -> Pt {
+    let a1 = p0.lerp(p1, u);
+    let b1 = p1.lerp(p2, u);
+    let c1 = p2.lerp(p3, u);
+    a1.lerp(b1, u).lerp(b1.lerp(c1, u), u)
+}
+
+impl VPath {
+    /// Polyline for stitching. Closed paths end back at the start.
+    pub fn flatten(&self) -> Vec<Pt> {
+        let mut out = Vec::new();
+        let Some(first) = self.nodes.first() else {
+            return out;
+        };
+        out.push(first.p);
+        for w in self.nodes.windows(2) {
+            flatten_cubic(&w[0], &w[1], &mut out);
+        }
+        if self.closed && self.nodes.len() > 1 {
+            flatten_cubic(self.nodes.last().unwrap(), first, &mut out);
+        }
+        out.dedup_by(|a, b| a.dist(*b) < 1e-6);
+        out
+    }
+
+    /// Number of segments (a closed path has one more, back to the start).
+    pub fn segments(&self) -> usize {
+        let n = self.nodes.len();
+        if self.closed { n } else { n.saturating_sub(1) }
+    }
+
+    /// Split segment `seg` at `u` (0..1), adding an anchor there.
+    pub fn split(&mut self, seg: usize, u: f64) {
+        let n = self.nodes.len();
+        let (i, j) = (seg, (seg + 1) % n);
+        let (a, b) = (self.nodes[i], self.nodes[j]);
+        let (p0, p1, p2, p3) = (a.p, a.cout, b.cin, b.p);
+        let q0 = p0.lerp(p1, u);
+        let q1 = p1.lerp(p2, u);
+        let q2 = p2.lerp(p3, u);
+        let r0 = q0.lerp(q1, u);
+        let r1 = q1.lerp(q2, u);
+        let s = r0.lerp(r1, u);
+        self.nodes[i].cout = q0;
+        self.nodes[j].cin = q2;
+        let node = Node { p: s, cin: r0, cout: r1 };
+        if j == 0 {
+            self.nodes.push(node);
+        } else {
+            self.nodes.insert(j, node);
+        }
+    }
+
+    /// Nearest point on the path: (segment, u, distance).
+    pub fn nearest(&self, q: Pt) -> Option<(usize, f64, f64)> {
+        let n = self.nodes.len();
+        let mut best: Option<(usize, f64, f64)> = None;
+        for s in 0..self.segments() {
+            let (a, b) = (self.nodes[s], self.nodes[(s + 1) % n]);
+            for k in 0..=40 {
+                let u = k as f64 / 40.0;
+                let d = cubic_at(a.p, a.cout, b.cin, b.p, u).dist(q);
+                if best.map(|x| d < x.2).unwrap_or(true) {
+                    best = Some((s, u, d));
+                }
+            }
+        }
+        best
+    }
+
+    /// A path from a polyline, simplified to the anchors that matter.
+    pub fn from_polyline(pts: &[Pt], closed: bool, tol: f64) -> VPath {
+        let keep = simplify(pts, tol);
+        let mut nodes: Vec<Node> = keep.into_iter().map(Node::corner).collect();
+        if closed && nodes.len() > 1 && nodes[0].p.dist(nodes.last().unwrap().p) < 1e-6 {
+            nodes.pop();
+        }
+        VPath { nodes, closed }
+    }
+}
+
+/// Ramer–Douglas–Peucker simplification.
+pub fn simplify(pts: &[Pt], tol: f64) -> Vec<Pt> {
+    if pts.len() <= 2 {
+        return pts.to_vec();
+    }
+    let mut keep = vec![false; pts.len()];
+    keep[0] = true;
+    keep[pts.len() - 1] = true;
+    let mut stack = vec![(0usize, pts.len() - 1)];
+    while let Some((a, b)) = stack.pop() {
+        let (pa, pb) = (pts[a], pts[b]);
+        let d = pb.sub(pa);
+        let l = d.len();
+        let mut far = (0.0, a);
+        for (k, p) in pts.iter().enumerate().take(b).skip(a + 1) {
+            let e = if l < 1e-12 {
+                p.dist(pa)
+            } else {
+                ((p.x - pa.x) * d.y - (p.y - pa.y) * d.x).abs() / l
+            };
+            if e > far.0 {
+                far = (e, k);
+            }
+        }
+        if far.0 > tol {
+            keep[far.1] = true;
+            stack.push((a, far.1));
+            stack.push((far.1, b));
+        }
+    }
+    pts.iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(p, _)| *p)
+        .collect()
+}

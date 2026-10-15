@@ -2,13 +2,14 @@
 //! stitches are always regenerated from them.
 
 use crate::geom::*;
-use crate::import::{Artwork, Cap, Corner, ShapeKind, ShapeOpts, StitchChoice};
+use crate::fills::{self, Field};
+use crate::import::{Artwork, Cap, Corner, FillPattern, ShapeKind, ShapeOpts, StitchChoice};
 use crate::settings::{Limits, Profile, Recipe};
 use crate::thread::{Thread, nearest};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::f64::consts::FRAC_PI_2;
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Needle {
     pub p: Pt,
     /// Travel to this point without sewing (start of a new section).
@@ -304,7 +305,40 @@ pub fn plan(
 
 /// Generate needle points for one object. `from` is where the needle is now
 /// (or the cap anchor); sections start at the closest available end.
+/// The fabric's stitch settings with this layer's own changes applied.
+pub fn effective(r: &Recipe, o: &ShapeOpts) -> Recipe {
+    let mut e = r.clone();
+    if let Some(v) = o.density {
+        e.fill_spacing = v.clamp(0.15, 3.0);
+        e.satin_spacing = v.clamp(0.15, 3.0);
+    }
+    if let Some(v) = o.stitch_len {
+        e.fill_len = v.clamp(0.8, 12.0);
+    }
+    if let Some(v) = o.pull_comp {
+        e.pull_comp = v.clamp(-0.5, 2.0);
+    }
+    if let Some(v) = o.underlay_spacing {
+        e.underlay_spacing = v.clamp(0.5, 8.0);
+    }
+    if let Some(v) = o.underlay_inset {
+        e.underlay_inset = v.clamp(0.0, 3.0);
+    }
+    e
+}
+
+impl Planned {
+    /// What the operator sheet and layer list call this object's stitching.
+    pub fn stitch_label(&self) -> &'static str {
+        match self.kind {
+            StitchType::Fill => self.opts.fill.short(),
+            k => k.label(),
+        }
+    }
+}
+
 pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Needle> {
+    let r = &effective(r, &p.opts);
     let mut out = Vec::new();
     let pc = r.pull_comp + if profile == Profile::Cap { 0.05 } else { 0.0 };
     match (&p.shape, p.kind) {
@@ -336,22 +370,39 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
                     &|_| true,
                 );
             }
-            let rows = p.rows(rings, *rule, p.angle, r.fill_spacing, 0.3);
-            sew_layer(
-                &mut out,
-                rings,
-                *rule,
-                rows,
-                p.angle,
-                &|s| (s.x0 - pc, s.x1 + pc),
-                r.fill_len,
-                3,
-                r.fill_spacing,
-                cur,
-                &|q| p.covered(q),
-            );
+            match p.opts.fill {
+                FillPattern::Tatami => {
+                    let rows = p.rows(rings, *rule, p.angle, r.fill_spacing, 0.3);
+                    sew_layer(
+                        &mut out,
+                        rings,
+                        *rule,
+                        rows,
+                        p.angle,
+                        &|s| (s.x0 - pc, s.x1 + pc),
+                        r.fill_len,
+                        p.opts.stagger.unwrap_or(3).clamp(1, 8) as i64,
+                        r.fill_spacing,
+                        cur,
+                        &|q| p.covered(q),
+                    );
+                }
+                FillPattern::Contour | FillPattern::Spiral => {
+                    let spiral = p.opts.fill == FillPattern::Spiral;
+                    contour_fill(&mut out, p, rings, *rule, r, pc, cur, spiral);
+                }
+                FillPattern::Radial => {
+                    radial_fill(&mut out, p, rings, *rule, r, pc, cur);
+                }
+            }
         }
+        (ShapeKind::Area { rings, rule }, _)
+            if p.opts.angle_deg.is_none() && p.knockouts.is_empty() && {
+                let pc = pc + p.opts.widen / 2.0;
+                turning_satin(&mut out, p, rings, *rule, r, pc, from)
+            } => {}
         (ShapeKind::Area { rings, rule }, _) => {
+            out.clear();
             let pc = pc + p.opts.widen / 2.0;
             // Satin from an outline. Stitches run across the stroke at the
             // object's angle; bands where that would make stitches too long
@@ -546,6 +597,523 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
         }
     }
     out
+}
+
+/// Join the next piece of a shaped fill: a direct stitch when it is close,
+/// hidden travel inside the shape when possible, otherwise a jump.
+#[allow(clippy::too_many_arguments)]
+fn join_piece(
+    out: &mut Vec<Needle>,
+    rings: &[Ring],
+    rule: FillRule,
+    pts: &[Pt],
+    len: f64,
+    near: f64,
+    hidden: &dyn Fn(Pt) -> bool,
+) {
+    let Some(first) = pts.first().copied() else {
+        return;
+    };
+    match out.last().map(|n| n.p) {
+        Some(c) if c.dist(first) <= near => {
+            // skip points right on top of the needle (e.g. where spiral
+            // rings meet) so there are no tiny stitches
+            let k = pts.iter().take_while(|q| q.dist(c) < 0.3).count();
+            push_continue(out, &pts[k.min(pts.len())..], len)
+        }
+        _ => start_in_shape(out, rings, rule, pts, len, hidden),
+    }
+}
+
+/// Contour fill: rings that follow the outline inward, outermost first.
+/// Spiral: the same rings, each one drifting inward as it goes round so
+/// they join into one continuous line.
+#[allow(clippy::too_many_arguments)]
+fn contour_fill(
+    out: &mut Vec<Needle>,
+    p: &Planned,
+    rings: &[Ring],
+    rule: FillRule,
+    r: &Recipe,
+    pc: f64,
+    from: Pt,
+    spiral: bool,
+) -> Pt {
+    let sp = r.fill_spacing;
+    // Rings curve all the way round, so stitches stay shorter than tatami;
+    // the outermost ring (the visible edge) shortest of all.
+    let len_in = r.fill_len.min(2.8);
+    let field = Field::new(rings, rule, (sp / 3.0).clamp(0.05, 0.2));
+    let mut cur = from;
+    let mut k = 0usize;
+    loop {
+        let level = sp * (k as f64 + 0.5) - pc;
+        if level > field.max() - sp * 0.3 || k > 2000 {
+            break;
+        }
+        let mut loops = field.loops(level);
+        let deeper = |q: Pt| p.covered(q) || field.at(q) > level + sp * 0.6;
+        while !loops.is_empty() {
+            // nearest ring next, starting at its point nearest the needle
+            let (li, si) = loops
+                .iter()
+                .enumerate()
+                .flat_map(|(i, l)| l.iter().enumerate().map(move |(j, q)| (i, j, q.dist(cur))))
+                .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+                .map(|(i, j, _)| (i, j))
+                .unwrap();
+            let mut ring = loops.swap_remove(li);
+            ring.rotate_left(si);
+            let len = if k == 0 { len_in.min(2.0) } else { len_in };
+            let mut pts = even_loop(&ring, len);
+            if spiral {
+                let n = pts.len().max(2) - 1;
+                for (i, q) in pts.iter_mut().enumerate() {
+                    let u = i as f64 / n as f64;
+                    *q = q.add(field.inward(*q).mul(u * sp));
+                }
+            }
+            let pieces = if p.knockouts.is_empty() {
+                vec![pts]
+            } else {
+                p.visible_paths(&[pts])
+                    .into_iter()
+                    .map(|v| resample(&v, len))
+                    .collect()
+            };
+            for piece in pieces {
+                join_piece(out, rings, rule, &piece, len, sp * 3.0 + 0.3, &deeper);
+                cur = out.last().map(|n| n.p).unwrap_or(cur);
+            }
+        }
+        k += 1;
+    }
+    cur
+}
+
+/// Turning satin: satin that runs across each stroke and turns with it as
+/// it curves, the way lettering is hand-digitized. Strokes come from the
+/// shape's centre line (see `skeleton`). Each stroke gets a centre-run
+/// underlay on the way out (which is also how the needle travels, hidden
+/// under the satin) and its satin on the way back; strokes that carry on
+/// straight through a junction are sewn as one unbroken column.
+/// Returns false (and sews nothing) if the shape has no usable centre line.
+#[allow(clippy::too_many_arguments)]
+fn turning_satin(
+    out: &mut Vec<Needle>,
+    p: &Planned,
+    rings: &[Ring],
+    rule: FillRule,
+    r: &Recipe,
+    pc: f64,
+    from: Pt,
+) -> bool {
+    use crate::skeleton::{Graph, skeleton};
+    let b = BBox::of(rings.iter().flatten());
+    let res = (b.width().max(b.height()) / 500.0).clamp(0.04, 0.12);
+    let field = Field::new(rings, rule, res);
+    let g: Graph = skeleton(&field);
+    let total: f64 = g
+        .edges
+        .iter()
+        .map(|e| e.pts.windows(2).map(|w| w[0].dist(w[1])).sum::<f64>())
+        .sum();
+    if g.edges.is_empty() || total < 1.0 {
+        return false;
+    }
+    let deg: Vec<usize> = (0..g.nodes.len()).map(|n| g.degree(n)).collect();
+    // Edge path as seen leaving node `n` (self-loops: as stored).
+    let leaving = |e: usize, n: usize| -> Vec<Pt> {
+        let ed = &g.edges[e];
+        if ed.a == n {
+            ed.pts.clone()
+        } else {
+            ed.pts.iter().rev().copied().collect()
+        }
+    };
+    let dir_from = |e: usize, n: usize| -> Pt {
+        let pts = leaving(e, n);
+        let mut acc = 0.0;
+        for w in pts.windows(2) {
+            acc += w[0].dist(w[1]);
+            if acc >= 1.0 {
+                return w[1].sub(pts[0]).norm();
+            }
+        }
+        pts.last().unwrap().sub(pts[0]).norm()
+    };
+    // Straight-through pairs at junctions: the two strokes that line up best.
+    let mut through: std::collections::HashMap<(usize, usize), usize> = Default::default();
+    for n in 0..g.nodes.len() {
+        if deg[n] < 3 {
+            continue;
+        }
+        let es: Vec<usize> = (0..g.edges.len())
+            .filter(|&k| (g.edges[k].a == n) != (g.edges[k].b == n))
+            .collect();
+        let mut best: Option<(f64, usize, usize)> = None;
+        for i in 0..es.len() {
+            for j in i + 1..es.len() {
+                let (d1, d2) = (dir_from(es[i], n), dir_from(es[j], n));
+                let dot = d1.x * d2.x + d1.y * d2.y; // -1 = straight on
+                if dot < -0.77 && best.map(|b| dot < b.0).unwrap_or(true) {
+                    best = Some((dot, es[i], es[j]));
+                }
+            }
+        }
+        if let Some((_, e1, e2)) = best {
+            through.insert((n, e1), e2);
+            through.insert((n, e2), e1);
+        }
+    }
+    let ext = |n: usize, e: usize| -> f64 {
+        let d = field.at(g.nodes[n]).max(0.1);
+        if deg[n] == 1 {
+            d * 1.3 + 0.3 // free end: reach the rounded tip
+        } else if through.contains_key(&(n, e)) || g.edges[e].a == g.edges[e].b {
+            0.0
+        } else {
+            d * 0.7 // tuck under the stroke it joins
+        }
+    };
+    // Ribs across a stroke path (in its direction), from edge to edge.
+    let ribs = |path: &[Pt], e0: f64, e1: f64| -> Vec<(Pt, Pt)> {
+        let mut pts = path.to_vec();
+        if pts.len() < 2 {
+            return Vec::new();
+        }
+        let d0 = pts[0].sub(pts[1.min(pts.len() - 1)]).norm();
+        let n = pts.len();
+        let d1 = pts[n - 1].sub(pts[n - 2]).norm();
+        if e0 > 0.0 {
+            pts.insert(0, pts[0].add(d0.mul(e0)));
+        }
+        if e1 > 0.0 {
+            let l = *pts.last().unwrap();
+            pts.push(l.add(d1.mul(e1)));
+        }
+        let sp = resample(&pts, 0.1);
+        let k = 8usize; // direction from ±0.8 mm along the stroke
+        let mut out = Vec::with_capacity(sp.len());
+        for i in 0..sp.len() {
+            let c = sp[i];
+            let depth = field.at(c);
+            if depth < 0.08 {
+                continue;
+            }
+            let t = sp[(i + k).min(sp.len() - 1)].sub(sp[i.saturating_sub(k)]);
+            if t.len() < 1e-9 {
+                continue;
+            }
+            let t = t.norm();
+            let nrm = Pt::new(-t.y, t.x);
+            let limit = depth * 2.4 + 0.8;
+            let march = |dir: Pt| -> f64 {
+                let mut lo = 0.0;
+                let mut x = 0.05;
+                while x <= limit {
+                    if field.at(c.add(dir.mul(x))) <= 0.0 {
+                        let mut hi = x;
+                        for _ in 0..8 {
+                            let m = (lo + hi) / 2.0;
+                            if field.at(c.add(dir.mul(m))) > 0.0 {
+                                lo = m;
+                            } else {
+                                hi = m;
+                            }
+                        }
+                        return (lo + hi) / 2.0;
+                    }
+                    lo = x;
+                    x += 0.05;
+                }
+                limit
+            };
+            let (l, rr) = (march(nrm), march(nrm.mul(-1.0)));
+            out.push((c.add(nrm.mul(l + pc)), c.sub(nrm.mul(rr + pc))));
+        }
+        out
+    };
+    let underlay = !p.opts.no_underlay;
+    let step = r.satin_spacing / 2.0;
+    let sew_back = |out: &mut Vec<Needle>, back: &[(Pt, Pt)]| {
+        if back.len() < 2 {
+            return;
+        }
+        let zz = ribs_to_zigzag(back, step);
+        push_continue(out, &split_long(&zz, Limits::SATIN_MAX), Limits::SATIN_MAX);
+    };
+    // Out along a stroke: centre run (or a light zig-zag on wide strokes).
+    let run_out = |out: &mut Vec<Needle>, path: &[Pt], fwd: &[(Pt, Pt)]| {
+        let wide = fwd.iter().map(|(a, b)| a.dist(*b)).sum::<f64>() / fwd.len().max(1) as f64 > 3.5;
+        if underlay && wide {
+            let inset = r.underlay_inset + pc;
+            let inner: Vec<(Pt, Pt)> = fwd
+                .iter()
+                .map(|(a, b)| {
+                    let m = a.lerp(*b, 0.5);
+                    let h = (a.dist(*b) / 2.0 - inset).max(0.2);
+                    let d = a.sub(*b).norm();
+                    (m.add(d.mul(h)), m.sub(d.mul(h)))
+                })
+                .collect();
+            let zz = ribs_to_zigzag(&inner, r.underlay_spacing.min(2.0) / 2.0);
+            push_continue(out, &zz, Limits::SATIN_MAX);
+        } else {
+            let pts = resample(path, Limits::RUN_LEN);
+            push_continue(out, &pts[1..], Limits::RUN_LEN);
+        }
+    };
+    let mut edge_done = vec![false; g.edges.len()];
+    let mut node_seen = vec![false; g.nodes.len()];
+    // Depth-first over strokes, kept as an explicit stack. Each frame is a
+    // stroke on its way out; side strokes at its far end are sewn first,
+    // then the straight-through stroke, whose satin is owed back and sewn
+    // together with this one as one unbroken column.
+    struct Frame {
+        e: usize,
+        y: usize,
+        fwd: Vec<(Pt, Pt)>,
+        pending: Vec<usize>,
+        thru: Option<usize>,
+        owed: Vec<(Pt, Pt)>,
+        stage: u8,
+    }
+    let start = (0..g.nodes.len())
+        .filter(|&n| deg[n] == 1)
+        .min_by(|&a, &b| {
+            g.nodes[a]
+                .dist(from)
+                .partial_cmp(&g.nodes[b].dist(from))
+                .unwrap()
+        })
+        .or_else(|| {
+            (0..g.nodes.len())
+                .filter(|&n| deg[n] > 0)
+                .min_by(|&a, &b| g.nodes[a].dist(from).partial_cmp(&g.nodes[b].dist(from)).unwrap())
+        });
+    let Some(mut root) = start else {
+        return false;
+    };
+    let begin = out.len();
+    loop {
+        node_seen[root] = true;
+        // the start point: a free end begins at its tip
+        let first_e = (0..g.edges.len()).find(|&k| !edge_done[k] && (g.edges[k].a == root || g.edges[k].b == root));
+        let Some(first_e) = first_e else { break };
+        let start_pt = {
+            let path = leaving(first_e, root);
+            let e0 = ext(root, first_e);
+            let d = path[0].sub(path[1.min(path.len() - 1)]).norm();
+            let tip = path[0].add(d.mul((e0 - 0.4).max(0.0)));
+            if field.at(tip) > 0.05 { tip } else { path[0] }
+        };
+        if out.is_empty() {
+            out.push(Needle { p: start_pt, jump: true });
+        } else {
+            start_in_shape(out, rings, rule, &[start_pt], Limits::RUN_LEN, &|q| p.covered(q));
+        }
+        let mut stack: Vec<Frame> = Vec::new();
+        // root level: each stroke at the root is its own column
+        let mut root_edges: Vec<usize> = (0..g.edges.len())
+            .filter(|&k| !edge_done[k] && (g.edges[k].a == root || g.edges[k].b == root))
+            .collect();
+        root_edges.reverse();
+        let open = |e: usize, x: usize, edge_done: &mut Vec<bool>, out: &mut Vec<Needle>| -> Frame {
+            edge_done[e] = true;
+            let path = leaving(e, x);
+            let y = if g.edges[e].a == x { g.edges[e].b } else { g.edges[e].a };
+            let fwd = ribs(&path, ext(x, e), ext(y, e));
+            run_out(out, &path, &fwd);
+            Frame { e, y, fwd, pending: Vec::new(), thru: None, owed: Vec::new(), stage: 0 }
+        };
+        while let Some(e) = root_edges.pop() {
+            if edge_done[e] {
+                continue;
+            }
+            stack.push(open(e, root, &mut edge_done, out));
+            while let Some(top) = stack.last_mut() {
+                match top.stage {
+                    0 => {
+                        let y = top.y;
+                        top.stage = 1;
+                        if !node_seen[y] {
+                            node_seen[y] = true;
+                            let thru = through.get(&(y, top.e)).copied().filter(|&f| !edge_done[f]);
+                            top.thru = thru;
+                            top.pending = (0..g.edges.len())
+                                .filter(|&k| {
+                                    !edge_done[k]
+                                        && Some(k) != thru
+                                        && (g.edges[k].a == y || g.edges[k].b == y)
+                                })
+                                .collect();
+                        }
+                    }
+                    1 => {
+                        // side strokes at y: each sewn completely, back to y
+                        if let Some(k) = top.pending.pop() {
+                            if !edge_done[k] {
+                                let y = top.y;
+                                let f = open(k, y, &mut edge_done, out);
+                                stack.push(f);
+                            }
+                        } else {
+                            top.stage = 2;
+                            if let Some(f) = top.thru.filter(|&f| !edge_done[f]) {
+                                let y = top.y;
+                                let fr = open(f, y, &mut edge_done, out);
+                                stack.last_mut().unwrap().stage = 3; // wait for through
+                                stack.push(fr);
+                            }
+                        }
+                    }
+                    2 | 3 => {
+                        let mut fr = stack.pop().unwrap();
+                        let mut back: Vec<(Pt, Pt)> = std::mem::take(&mut fr.owed);
+                        back.extend(fr.fwd.iter().rev().map(|(a, b)| (*b, *a)));
+                        // owed to the parent if this was its through-stroke
+                        match stack.last_mut() {
+                            Some(parent) if parent.stage == 3 && parent.thru == Some(fr.e) => {
+                                parent.owed = back;
+                                parent.stage = 2;
+                            }
+                            _ => sew_back(out, &back),
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        // anything not reached (a separate piece of centre line)
+        let next = (0..g.edges.len()).find(|&k| !edge_done[k]);
+        match next {
+            Some(k) => {
+                let (a, b) = (g.edges[k].a, g.edges[k].b);
+                let cur = out.last().map(|n| n.p).unwrap_or(from);
+                root = if g.nodes[a].dist(cur) <= g.nodes[b].dist(cur) { a } else { b };
+            }
+            None => break,
+        }
+    }
+    out.len() > begin + 2
+}
+
+/// A traced ring smoothed (the grid leaves tiny steps) and cut into even
+/// stitches, closed back to its start. Small, tight rings get shorter
+/// stitches so they stay round.
+fn even_loop(ring: &[Pt], len: f64) -> Vec<Pt> {
+    let n = ring.len();
+    let mut pts = ring.to_vec();
+    for _ in 0..4 {
+        pts = (0..n)
+            .map(|i| {
+                let (a, b, c) = (pts[(i + n - 1) % n], pts[i], pts[(i + 1) % n]);
+                Pt::new((a.x + 2.0 * b.x + c.x) / 4.0, (a.y + 2.0 * b.y + c.y) / 4.0)
+            })
+            .collect();
+    }
+    pts.push(pts[0]);
+    let total: f64 = pts.windows(2).map(|w| w[0].dist(w[1])).sum();
+    let len = len.min((total / 14.0).max(0.8));
+    let k = (total / len).ceil().max(3.0) as usize;
+    let step = total / k as f64;
+    let mut out = vec![pts[0]];
+    let (mut acc, mut next) = (0.0, step);
+    for w in pts.windows(2) {
+        let d = w[0].dist(w[1]);
+        while d > 0.0 && acc + d >= next && out.len() < k {
+            out.push(w[0].lerp(w[1], (next - acc) / d));
+            next += step;
+        }
+        acc += d;
+    }
+    out.push(pts[0]);
+    out
+}
+
+/// Radial fill: rows from the middle of the shape out to its edge, with
+/// alternating rays stopping short of the centre so it doesn't pile up.
+#[allow(clippy::too_many_arguments)]
+fn radial_fill(
+    out: &mut Vec<Needle>,
+    p: &Planned,
+    rings: &[Ring],
+    rule: FillRule,
+    r: &Recipe,
+    pc: f64,
+    from: Pt,
+) -> Pt {
+    let centre = fills::centroid(rings);
+    let len = r.fill_len;
+    let stagger = p.opts.stagger.unwrap_or(3).clamp(1, 8) as usize;
+    let mut rays = fills::rays(rings, rule, centre, r.fill_spacing, pc);
+    // start at the ray nearest the needle and go round
+    if let Some(k) = rays
+        .iter()
+        .enumerate()
+        .min_by(|a, b| {
+            let pa = centre.add(Pt::new(a.1.x1, 0.0).rot(a.1.angle));
+            let pb = centre.add(Pt::new(b.1.x1, 0.0).rot(b.1.angle));
+            pa.dist(from).partial_cmp(&pb.dist(from)).unwrap()
+        })
+        .map(|(k, _)| k)
+    {
+        rays.rotate_left(k);
+    }
+    let mut outward = false;
+    let mut cur = from;
+    let n_rays = rays.iter().map(|r| r.index).max().unwrap_or(0) + 1;
+    let mut prev: Option<usize> = None;
+    for ray in &rays {
+        // Neighbouring rays: the step between their inner ends runs along
+        // the next ray, which sews straight over it, so it never shows.
+        let adjacent = prev
+            .map(|i| {
+                let d = (ray.index + n_rays - i) % n_rays;
+                // (rays that would end before reaching the edge are skipped,
+                // so neighbours can be a few indexes apart)
+                d <= 8 || d >= n_rays - 8
+            })
+            .unwrap_or(false);
+        prev = Some(ray.index);
+        let off = (ray.index % stagger) as f64 * len / stagger as f64;
+        let mut xs = vec![ray.x0];
+        let mut m = ((ray.x0 + 0.6 - off) / len).ceil() as i64;
+        loop {
+            let x = off + m as f64 * len;
+            if x >= ray.x1 - 0.6 {
+                break;
+            }
+            if x > ray.x0 + 0.6 {
+                xs.push(x);
+            }
+            m += 1;
+        }
+        xs.push(ray.x1);
+        if !outward {
+            xs.reverse();
+        }
+        outward = !outward;
+        let pts: Vec<Pt> = xs
+            .into_iter()
+            .map(|x| centre.add(Pt::new(x, 0.0).rot(ray.angle)))
+            .collect();
+        let pieces = if p.knockouts.is_empty() {
+            vec![pts]
+        } else {
+            p.visible_paths(&[pts])
+                .into_iter()
+                .map(|v| resample(&v, len))
+                .collect()
+        };
+        for piece in pieces {
+            let near = if adjacent { 15.0 } else { 2.5 };
+            join_piece(out, rings, rule, &piece, len, near, &|q| p.covered(q));
+            cur = out.last().map(|n| n.p).unwrap_or(cur);
+        }
+    }
+    cur
 }
 
 /// Sew satin rows (one direction) as columns: centre-run underlay up the

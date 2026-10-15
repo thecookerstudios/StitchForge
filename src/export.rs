@@ -50,7 +50,12 @@ pub fn write_formats(
         sheet::operator_sheet(d, job, generated).as_bytes(),
     )?;
     write(p("stops.csv"), sheet::stops_csv(d).as_bytes())?;
-    write(p("preview.png"), &sheet::preview_png(d, 12.0)?)?;
+    // SF_PREVIEW_SCALE (pixels per mm) is a development aid for close-ups.
+    let scale = std::env::var("SF_PREVIEW_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(12.0);
+    write(p("preview.png"), &sheet::preview_png(d, scale)?)?;
     write(
         p("preview.svg"),
         sheet::preview_svg(d, 1.0, "#f4f1ea").as_bytes(),

@@ -3,7 +3,7 @@
 use crate::geom::{BBox, Pt};
 use crate::import::Artwork;
 use crate::settings::{Limits, Profile, Recipe};
-use crate::stitch::{Planned, StitchType, generate, plan};
+use crate::stitch::{Needle, Planned, StitchType, generate, plan};
 use crate::thread::Thread;
 use serde::Serialize;
 
@@ -93,6 +93,10 @@ pub struct Design {
     pub stats: Stats,
     pub bbox: BBox,
     pub warnings: Vec<String>,
+    /// Each layer's needle points as sewn (design mm, layer index → points):
+    /// the embroidery side of each design object, kept with the project.
+    #[serde(skip)]
+    pub layer_needles: std::collections::BTreeMap<usize, Vec<Needle>>,
 }
 
 /// Sequence objects. Stacking order is respected wherever objects overlap
@@ -194,7 +198,12 @@ pub fn build_with(
     opts: BuildOptions,
 ) -> Result<Design, String> {
     let mut warnings = art.warnings.clone();
-    let objs = plan(art, chart, profile, &mut warnings);
+    let mut objs = plan(art, chart, profile, &mut warnings);
+    // Hand-edited layers sew their own stitches: one object per layer.
+    if !art.fixed.is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        objs.retain(|o| !art.fixed.contains_key(&o.layer) || seen.insert(o.layer));
+    }
     if objs.is_empty() {
         return Err("nothing left to stitch after skipping tiny shapes".into());
     }
@@ -214,6 +223,7 @@ pub fn build_with(
     let mut cur_thread: Option<usize> = None;
     let mut last_dir = Pt::new(1.0, 0.0);
     let mut last_layer: Option<usize> = None;
+    let mut layer_needles: std::collections::BTreeMap<usize, Vec<Needle>> = Default::default();
 
     for (seq, &oi) in order.iter().enumerate() {
         let o = &objs[oi];
@@ -222,7 +232,14 @@ pub fn build_with(
             (_, Some(p)) => p,
             (_, None) => bbox.min,
         };
-        let needles = generate(o, recipe, profile, from);
+        let needles = match art.fixed.get(&o.layer) {
+            Some(n) => n.clone(),
+            None => generate(o, recipe, profile, from),
+        };
+        layer_needles
+            .entry(o.layer)
+            .or_insert_with(Vec::new)
+            .extend(needles.iter().copied());
         if needles.is_empty() {
             warnings.push(format!("{}: produced no stitches", o.label));
             continue;
@@ -315,7 +332,7 @@ pub fn build_with(
         infos.push(ObjectInfo {
             sequence: seq + 1,
             label: o.label.clone(),
-            stitch_type: o.kind.label(),
+            stitch_type: o.stitch_label(),
             thread_code: chart[o.thread].code.clone(),
             color_match_delta_e: (o.color_error * 10.0).round() / 10.0,
             stitches: added,
@@ -378,6 +395,7 @@ pub fn build_with(
         stats,
         bbox,
         warnings,
+        layer_needles,
     })
 }
 
@@ -486,6 +504,7 @@ pub fn from_machine(
         stats,
         bbox,
         warnings: Vec::new(),
+        layer_needles: Default::default(),
     })
 }
 
@@ -545,6 +564,7 @@ mod tests {
             Pt::new(x, 8.0),
         ];
         Shape {
+            curves: Vec::new(),
             kind: ShapeKind::Area {
                 rings: vec![r],
                 rule: FillRule::NonZero,
@@ -571,6 +591,7 @@ mod tests {
             rings.extend(r2);
         }
         let art = Artwork {
+            fixed: Default::default(),
             shapes: vec![square(0.0, [20, 140, 70], 0, None), s2],
             warnings: vec![],
         };
@@ -595,6 +616,7 @@ mod tests {
     #[test]
     fn forced_stop_with_same_thread() {
         let art = Artwork {
+            fixed: Default::default(),
             shapes: vec![
                 square(0.0, [20, 140, 70], 0, None),
                 square(20.0, [20, 140, 70], 1, Some(true)),
@@ -633,6 +655,7 @@ mod option_tests {
             Pt::new(x, y + s),
         ];
         Shape {
+            curves: Vec::new(),
             kind: ShapeKind::Area {
                 rings: vec![r],
                 rule: FillRule::NonZero,
@@ -646,6 +669,7 @@ mod option_tests {
 
     fn stitches(shapes: Vec<Shape>) -> usize {
         let art = Artwork {
+            fixed: Default::default(),
             shapes,
             warnings: vec![],
         };

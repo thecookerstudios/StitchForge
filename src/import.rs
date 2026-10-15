@@ -2,7 +2,7 @@
 //! Text is converted to outlines by the SVG engine using the font itself,
 //! so no special embroidery font format is ever needed.
 
-use crate::geom::{BBox, FillRule, Pt, Ring};
+use crate::geom::{BBox, FillRule, Node, Pt, Ring, VPath};
 use serde::{Deserialize, Serialize};
 
 use usvg::tiny_skia_path::PathSegment;
@@ -39,7 +39,7 @@ impl StitchChoice {
     pub fn label(&self) -> &'static str {
         match self {
             StitchChoice::Auto => "Auto (by width)",
-            StitchChoice::Fill => "Tatami fill",
+            StitchChoice::Fill => "Fill",
             StitchChoice::Satin => "Satin",
             StitchChoice::Run => "Run (outline)",
             StitchChoice::TripleRun => "Triple run (outline)",
@@ -92,6 +92,45 @@ impl Cap {
     }
 }
 
+/// The stitch pattern used to fill an area.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FillPattern {
+    /// Straight back-and-forth rows with a staggered (brick) needle pattern.
+    #[default]
+    Tatami,
+    /// Rows that follow the outline inward, ring by ring.
+    Contour,
+    /// One continuous line spiralling in from the outline.
+    Spiral,
+    /// Rows radiating from the middle of the shape.
+    Radial,
+}
+
+impl FillPattern {
+    pub const ALL: [FillPattern; 4] = [
+        FillPattern::Tatami,
+        FillPattern::Contour,
+        FillPattern::Spiral,
+        FillPattern::Radial,
+    ];
+    pub fn label(&self) -> &'static str {
+        match self {
+            FillPattern::Tatami => "Tatami (rows)",
+            FillPattern::Contour => "Contour (follows the outline)",
+            FillPattern::Spiral => "Spiral",
+            FillPattern::Radial => "Radial (from the middle)",
+        }
+    }
+    pub fn short(&self) -> &'static str {
+        match self {
+            FillPattern::Tatami => "Tatami fill",
+            FillPattern::Contour => "Contour fill",
+            FillPattern::Spiral => "Spiral fill",
+            FillPattern::Radial => "Radial fill",
+        }
+    }
+}
+
 /// Per-layer choices made by the user. Anything left `None`/`Auto` is decided
 /// by the engine.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -120,6 +159,34 @@ pub struct ShapeOpts {
     /// Sews on top without cutting holes in the layers under it (used for
     /// name drops, where each name runs on a different head).
     pub overlay: bool,
+
+    // ---- this layer's stitch settings (None = the fabric's default) ----
+    /// Fill stitch pattern.
+    pub fill: FillPattern,
+    /// Spacing between fill rows or satin stitches, mm.
+    pub density: Option<f64>,
+    /// Fill (and contour/radial run) stitch length, mm.
+    pub stitch_len: Option<f64>,
+    /// Pull compensation, mm.
+    pub pull_comp: Option<f64>,
+    /// Underlay row spacing, mm.
+    pub underlay_spacing: Option<f64>,
+    /// How far underlay stays inside the edge, mm.
+    pub underlay_inset: Option<f64>,
+    /// Tatami needle pattern repeats every N rows (2 = half offset, 3 = thirds…).
+    pub stagger: Option<u8>,
+}
+
+impl ShapeOpts {
+    /// Does this layer change any stitch setting from the fabric defaults?
+    pub fn has_own_settings(&self) -> bool {
+        self.density.is_some()
+            || self.stitch_len.is_some()
+            || self.pull_comp.is_some()
+            || self.underlay_spacing.is_some()
+            || self.underlay_inset.is_some()
+            || self.stagger.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,9 +197,65 @@ pub struct Shape {
     /// Shapes from the same SVG element (e.g. one text block) share a group.
     pub group: usize,
     pub opts: ShapeOpts,
+    /// The editable vector paths (anchors and Bézier handles) this shape's
+    /// rings or lines are flattened from. Empty for shapes from older files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub curves: Vec<VPath>,
 }
 
 impl Shape {
+    /// Rebuild the stitchable polylines after the vector paths changed.
+    pub fn reflatten(&mut self) {
+        if self.curves.is_empty() {
+            return;
+        }
+        match &mut self.kind {
+            ShapeKind::Area { rings, .. } => {
+                *rings = self
+                    .curves
+                    .iter()
+                    .map(|c| {
+                        let mut r = c.flatten();
+                        if r.len() > 1 && r[0].dist(*r.last().unwrap()) < 1e-6 {
+                            r.pop();
+                        }
+                        r
+                    })
+                    .filter(|r| r.len() >= 3)
+                    .collect();
+            }
+            ShapeKind::Line { paths, .. } => {
+                *paths = self
+                    .curves
+                    .iter()
+                    .map(|c| c.flatten())
+                    .filter(|p| p.len() >= 2)
+                    .collect();
+            }
+        }
+    }
+
+    /// Make sure there are editable paths (older files and text keep only
+    /// polylines; those become paths of simplified corner anchors).
+    pub fn ensure_curves(&mut self) {
+        if !self.curves.is_empty() {
+            return;
+        }
+        self.curves = match &self.kind {
+            ShapeKind::Area { rings, .. } => rings
+                .iter()
+                .map(|r| VPath::from_polyline(r, true, 0.03))
+                .collect(),
+            ShapeKind::Line { paths, .. } => paths
+                .iter()
+                .map(|p| {
+                    let closed = p.len() > 2 && p[0].dist(*p.last().unwrap()) < 1e-6;
+                    VPath::from_polyline(p, closed, 0.03)
+                })
+                .collect(),
+        };
+    }
+
     pub fn points(&self) -> Box<dyn Iterator<Item = &Pt> + '_> {
         match &self.kind {
             ShapeKind::Area { rings, .. } => Box::new(rings.iter().flatten()),
@@ -141,10 +264,13 @@ impl Shape {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Artwork {
     pub shapes: Vec<Shape>,
     pub warnings: Vec<String>,
+    /// Layers whose stitches were edited by hand: their needle points
+    /// (design mm), sewn as they are instead of being generated.
+    pub fixed: std::collections::BTreeMap<usize, Vec<crate::stitch::Needle>>,
 }
 
 const PX_TO_MM: f64 = 25.4 / 96.0;
@@ -221,6 +347,7 @@ pub fn list_fonts() -> Vec<String> {
 pub fn load_svg_str(svg: &str, opt: &usvg::Options) -> Result<Artwork, String> {
     let tree = usvg::Tree::from_str(svg, opt).map_err(|e| format!("SVG parse error: {e}"))?;
     let mut art = Artwork {
+        fixed: Default::default(),
         shapes: Vec::new(),
         warnings: Vec::new(),
     };
@@ -340,6 +467,19 @@ pub fn apply_id_tags(opts: &mut ShapeOpts, id: &str) {
             opts.cap = cap;
         }
     }
+    for (tag, f) in [
+        ("sf-contour", FillPattern::Contour),
+        ("sf-spiral", FillPattern::Spiral),
+        ("sf-radial", FillPattern::Radial),
+        ("sf-tatami", FillPattern::Tatami),
+    ] {
+        if id.contains(tag) {
+            opts.fill = f;
+            if opts.stitch == StitchChoice::Auto {
+                opts.stitch = StitchChoice::Fill;
+            }
+        }
+    }
     if id.contains("sf-no-underlay") {
         opts.no_underlay = true;
     }
@@ -356,6 +496,15 @@ pub fn apply_id_tags(opts: &mut ShapeOpts, id: &str) {
     };
     if let Some(w) = num_after("sf-width-") {
         opts.column_width = Some(w);
+    }
+    if let Some(v) = num_after("sf-density-") {
+        opts.density = Some(v);
+    }
+    if let Some(v) = num_after("sf-len-") {
+        opts.stitch_len = Some(v);
+    }
+    if let Some(v) = num_after("sf-pull-") {
+        opts.pull_comp = Some(v);
     }
     if let Some(i) = id.find("sf-angle-") {
         let num: String = id[i + 9..]
@@ -448,65 +597,75 @@ fn add_path(p: &usvg::Path, art: &mut Artwork, outer: Option<usvg::Transform>, g
     };
     let scale = ((t.sx as f64 * t.sy as f64 - t.kx as f64 * t.ky as f64).abs()).sqrt();
 
-    // Flatten curves into polylines (one per subpath).
-    let mut subs: Vec<(Vec<Pt>, bool)> = Vec::new();
-    let mut cur: Vec<Pt> = Vec::new();
-    let mut last = Pt::new(0.0, 0.0);
-    let flush = |cur: &mut Vec<Pt>, closed: bool, subs: &mut Vec<(Vec<Pt>, bool)>| {
-        if cur.len() >= 2 {
-            subs.push((std::mem::take(cur), closed));
-        } else {
-            cur.clear();
+    // Keep every subpath as an editable vector path (anchors + handles),
+    // then flatten each into a polyline for stitching.
+    let mut vps: Vec<VPath> = Vec::new();
+    let mut cur: Option<VPath> = None;
+    let flush = |cur: &mut Option<VPath>, vps: &mut Vec<VPath>| {
+        if let Some(v) = cur.take() {
+            if v.nodes.len() >= 2 || (v.closed && v.nodes.len() >= 2) {
+                vps.push(v);
+            }
         }
     };
     for seg in p.data().segments() {
         match seg {
             PathSegment::MoveTo(a) => {
-                flush(&mut cur, false, &mut subs);
-                last = map(a.x, a.y);
-                cur.push(last);
+                flush(&mut cur, &mut vps);
+                cur = Some(VPath {
+                    nodes: vec![Node::corner(map(a.x, a.y))],
+                    closed: false,
+                });
             }
             PathSegment::LineTo(a) => {
-                last = map(a.x, a.y);
-                cur.push(last);
+                if let Some(v) = cur.as_mut() {
+                    v.nodes.push(Node::corner(map(a.x, a.y)));
+                }
             }
             PathSegment::QuadTo(c, a) => {
-                let (p0, p1, p2) = (last, map(c.x, c.y), map(a.x, a.y));
-                let n = ((p0.dist(p1) + p1.dist(p2)) / 0.25).ceil().clamp(2.0, 64.0) as usize;
-                for k in 1..=n {
-                    let u = k as f64 / n as f64;
-                    cur.push(p0.lerp(p1, u).lerp(p1.lerp(p2, u), u));
+                if let Some(v) = cur.as_mut() {
+                    let (c, a) = (map(c.x, c.y), map(a.x, a.y));
+                    let last = v.nodes.last_mut().unwrap();
+                    last.cout = last.p.lerp(c, 2.0 / 3.0);
+                    v.nodes.push(Node {
+                        p: a,
+                        cin: a.lerp(c, 2.0 / 3.0),
+                        cout: a,
+                    });
                 }
-                last = p2;
             }
             PathSegment::CubicTo(c1, c2, a) => {
-                let (p0, p1, p2, p3) = (last, map(c1.x, c1.y), map(c2.x, c2.y), map(a.x, a.y));
-                let n = ((p0.dist(p1) + p1.dist(p2) + p2.dist(p3)) / 0.25)
-                    .ceil()
-                    .clamp(2.0, 96.0) as usize;
-                for k in 1..=n {
-                    let u = k as f64 / n as f64;
-                    let a1 = p0.lerp(p1, u);
-                    let b1 = p1.lerp(p2, u);
-                    let c1 = p2.lerp(p3, u);
-                    cur.push(a1.lerp(b1, u).lerp(b1.lerp(c1, u), u));
+                if let Some(v) = cur.as_mut() {
+                    let a = map(a.x, a.y);
+                    v.nodes.last_mut().unwrap().cout = map(c1.x, c1.y);
+                    v.nodes.push(Node {
+                        p: a,
+                        cin: map(c2.x, c2.y),
+                        cout: a,
+                    });
                 }
-                last = p3;
             }
             PathSegment::Close => {
-                if let Some(f) = cur.first().copied() {
-                    // Close the loop so outlines include the last edge.
-                    if cur.last().map(|l| l.dist(f) > 1e-6).unwrap_or(false) {
-                        cur.push(f);
+                if let Some(v) = cur.as_mut() {
+                    v.closed = true;
+                    // an explicit line back to the start is the closing edge
+                    if v.nodes.len() > 1 && v.nodes[0].p.dist(v.nodes.last().unwrap().p) < 1e-6 {
+                        let last = v.nodes.pop().unwrap();
+                        v.nodes[0].cin = last.cin;
                     }
-                    flush(&mut cur, true, &mut subs);
-                    last = f;
-                    cur.push(f);
+                    let start = v.nodes[0].p;
+                    flush(&mut cur, &mut vps);
+                    // a path may carry on from the start point after closing
+                    cur = Some(VPath {
+                        nodes: vec![Node::corner(start)],
+                        closed: false,
+                    });
                 }
             }
         }
     }
-    flush(&mut cur, false, &mut subs);
+    flush(&mut cur, &mut vps);
+    let mut subs: Vec<(Vec<Pt>, bool)> = vps.iter().map(|v| (v.flatten(), v.closed)).collect();
 
     // Drop duplicate consecutive points.
     for (s, _) in subs.iter_mut() {
@@ -518,25 +677,23 @@ fn add_path(p: &usvg::Path, art: &mut Artwork, outer: Option<usvg::Transform>, g
             usvg::FillRule::NonZero => FillRule::NonZero,
             usvg::FillRule::EvenOdd => FillRule::EvenOdd,
         };
-        let rings: Vec<Ring> = subs
-            .iter()
-            .filter(|(s, _)| s.len() >= 3)
-            .map(|(s, _)| {
-                let mut r = s.clone();
-                if r.len() > 1 && r[0].dist(*r.last().unwrap()) < 1e-6 {
-                    r.pop();
-                }
-                r
-            })
-            .collect();
-        if !rings.is_empty() {
-            art.shapes.push(Shape {
-                kind: ShapeKind::Area { rings, rule },
-                rgb: paint_rgb(fill.paint()),
-                label: p.id().to_string(),
-                group,
-                opts: ShapeOpts::default(),
-            });
+        let mut shape = Shape {
+            kind: ShapeKind::Area {
+                rings: Vec::new(),
+                rule,
+            },
+            rgb: paint_rgb(fill.paint()),
+            label: p.id().to_string(),
+            group,
+            opts: ShapeOpts::default(),
+            curves: vps.clone(),
+        };
+        shape.reflatten();
+        // keep only the paths that became rings, so the two stay paired
+        shape.curves.retain(|c| c.flatten().len() >= 3 + usize::from(c.closed));
+        shape.reflatten();
+        if matches!(&shape.kind, ShapeKind::Area { rings, .. } if !rings.is_empty()) {
+            art.shapes.push(shape);
         }
     }
     if let Some(stroke) = p.stroke() {
@@ -544,6 +701,7 @@ fn add_path(p: &usvg::Path, art: &mut Artwork, outer: Option<usvg::Transform>, g
         let paths: Vec<Vec<Pt>> = subs.iter().map(|(s, _)| s.clone()).collect();
         if !paths.is_empty() {
             art.shapes.push(Shape {
+                curves: vps.clone(),
                 kind: ShapeKind::Line { paths, width },
                 rgb: paint_rgb(stroke.paint()),
                 label: if p.id().is_empty() {

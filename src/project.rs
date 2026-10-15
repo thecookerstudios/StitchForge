@@ -6,6 +6,7 @@ use crate::design::{BuildOptions, Design, build_with};
 use crate::geom::{BBox, Pt, spans_at};
 use crate::import::{Artwork, Shape, ShapeKind, ShapeOpts};
 use crate::settings::{Profile, Recipe};
+use crate::stitch::Needle;
 use crate::sheet::JobInfo;
 use crate::thread::{self, Thread};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,23 @@ pub struct TextSpec {
     pub font: String,
     pub height_mm: f64,
     pub rgb: [u8; 3],
+}
+
+/// The embroidery side of a design object: its needle points, kept in the
+/// project next to the vector shape. Generated from the shape and settings
+/// until someone edits stitches by hand; after that they are sewn as they
+/// are, and a later change to the shape is flagged instead of silently
+/// throwing the hand edits away.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Embroidery {
+    /// Needle points in the layer's own frame (mm, before the layer's
+    /// move, resize and rotate, so those apply to stitches and shape alike).
+    pub needles: Vec<Needle>,
+    /// Stitches were edited by hand: sew these, don't regenerate.
+    pub edited: bool,
+    /// Fingerprint of the shape and stitch settings the stitches match.
+    pub source: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,6 +62,8 @@ pub struct Layer {
     /// Layers sharing a link move, rotate and resize together (e.g. a shape's
     /// fill and its outline).
     pub link: Option<u64>,
+    #[serde(default)]
+    pub embroidery: Embroidery,
 }
 
 impl Layer {
@@ -65,7 +85,35 @@ impl Layer {
             text: None,
             is_outline,
             link: None,
+            embroidery: Embroidery::default(),
         }
+    }
+
+    /// Fingerprint of everything the stitches are generated from: the
+    /// vector shape and this layer's stitch settings (not its position,
+    /// size, thread or stop, which don't change the stitches themselves).
+    pub fn source_fingerprint(&self) -> u64 {
+        let mut o = self.opts.clone();
+        o.thread = None;
+        o.stop = None;
+        o.layer = 0;
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut feed = |b: &[u8]| {
+            for x in b {
+                h ^= *x as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        };
+        for sh in &self.shapes {
+            feed(serde_json::to_string(&sh.kind).unwrap_or_default().as_bytes());
+        }
+        feed(serde_json::to_string(&o).unwrap_or_default().as_bytes());
+        h
+    }
+
+    /// Hand-edited stitches whose shape or settings changed since.
+    pub fn out_of_sync(&self) -> bool {
+        self.embroidery.edited && self.embroidery.source != self.source_fingerprint()
     }
 
     pub fn tf(&self, p: Pt) -> Pt {
@@ -159,6 +207,7 @@ fn seg_dist(p: Pt, a: Pt, b: Pt) -> f64 {
 pub fn compose(layers: &[Layer], chart: &[Thread]) -> (Artwork, Vec<Thread>) {
     let mut chart = chart.to_vec();
     let mut shapes = Vec::new();
+    let mut fixed = std::collections::BTreeMap::new();
     for (li, l) in layers.iter().enumerate() {
         if !l.visible {
             continue;
@@ -176,9 +225,22 @@ pub fn compose(layers: &[Layer], chart: &[Thread]) -> (Artwork, Vec<Thread>) {
             s.label = l.name.clone();
             shapes.push(s);
         }
+        if l.embroidery.edited && !l.embroidery.needles.is_empty() {
+            let pts = l
+                .embroidery
+                .needles
+                .iter()
+                .map(|n| Needle {
+                    p: l.tf(n.p),
+                    jump: n.jump,
+                })
+                .collect();
+            fixed.insert(li, pts);
+        }
     }
     (
         Artwork {
+            fixed,
             shapes,
             warnings: Vec::new(),
         },
@@ -344,6 +406,7 @@ mod tests {
             Pt::new(0.0, 10.0),
         ];
         let shape = Shape {
+            curves: Vec::new(),
             kind: ShapeKind::Area {
                 rings: vec![ring],
                 rule: FillRule::NonZero,
@@ -365,5 +428,92 @@ mod tests {
         assert_eq!(before.stats.stitches, after.stats.stitches);
         assert_eq!(q.layers[0].rotation, 30.0);
         assert_eq!(q.layers[0].opts.angle_deg, Some(45.0));
+    }
+}
+
+#[cfg(test)]
+mod object_tests {
+    use super::*;
+    use crate::geom::{FillRule, Pt};
+    use crate::import::{FillPattern, StitchChoice};
+
+    fn square_layer(id: u64, x: f64, s: f64) -> Layer {
+        let shape = Shape {
+            kind: ShapeKind::Area {
+                rings: vec![vec![
+                    Pt::new(x, 0.0),
+                    Pt::new(x + s, 0.0),
+                    Pt::new(x + s, s),
+                    Pt::new(x, s),
+                ]],
+                rule: FillRule::NonZero,
+            },
+            rgb: [20, 40, 120],
+            label: "sq".into(),
+            group: 0,
+            opts: ShapeOpts::default(),
+            curves: Vec::new(),
+        };
+        Layer::new(id, format!("Square {id}"), vec![shape], false)
+    }
+
+    fn build(layers: Vec<Layer>) -> crate::design::Design {
+        let mut p = Project::new("t", layers);
+        p.keep_order = true;
+        p.build().unwrap()
+    }
+
+    #[test]
+    fn layer_settings_change_only_that_layer() {
+        let a = square_layer(1, 0.0, 20.0);
+        let mut b = square_layer(2, 30.0, 20.0);
+        let base = build(vec![a.clone(), b.clone()]);
+        b.opts.stitch = StitchChoice::Fill;
+        b.opts.density = Some(0.8);
+        let d = build(vec![a, b]);
+        let n = |d: &crate::design::Design, i: usize| d.objects[i].stitches;
+        assert_eq!(n(&base, 0), n(&d, 0), "first layer untouched");
+        assert!(n(&d, 1) < n(&base, 1) * 7 / 10, "sparser rows on the second");
+    }
+
+    #[test]
+    fn fill_patterns_sew_inside_the_shape() {
+        for f in [FillPattern::Contour, FillPattern::Spiral, FillPattern::Radial] {
+            let mut l = square_layer(1, 0.0, 20.0);
+            l.opts.stitch = StitchChoice::Fill;
+            l.opts.fill = f;
+            let d = build(vec![l]);
+            assert!(d.objects[0].stitches > 300, "{f:?}: {}", d.objects[0].stitches);
+            let b = &d.bbox;
+            for c in &d.cmds {
+                if let crate::design::Cmd::Stitch(p) = c {
+                    assert!(p.x > b.min.x - 1.0 && p.x < b.max.x + 1.0, "{f:?} {p:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hand_edited_stitches_are_kept_and_move_with_the_layer() {
+        let mut l = square_layer(1, 0.0, 10.0);
+        let d = build(vec![l.clone()]);
+        let made = d.layer_needles[&0].clone();
+        // edit: drop every other needle point, store in the layer's own frame
+        l.embroidery = Embroidery {
+            needles: made.iter().step_by(2).map(|n| Needle { p: l.inv(n.p), jump: n.jump }).collect(),
+            edited: true,
+            source: l.source_fingerprint(),
+        };
+        let d2 = build(vec![l.clone()]);
+        assert_eq!(d2.layer_needles[&0].len(), l.embroidery.needles.len());
+        // moving the object moves its stitches too, without regenerating
+        l.offset = Pt::new(15.0, 0.0);
+        let d3 = build(vec![l.clone()]);
+        let (a, b) = (d2.layer_needles[&0][3].p, d3.layer_needles[&0][3].p);
+        assert!((b.x - a.x - 15.0).abs() < 1e-6);
+        assert!(!l.out_of_sync(), "moving doesn't change the source");
+        // changing the stitch settings does flag it
+        l.opts.density = Some(0.6);
+        assert!(l.out_of_sync());
     }
 }
