@@ -303,11 +303,77 @@ fn load_fonts(db: &mut usvg::fontdb::Database) {
             db.load_font_source(usvg::fontdb::Source::Binary(f.clone()));
         }
     });
-    #[cfg(target_arch = "wasm32")]
-    {
-        db.set_sans_serif_family("Liberation Sans");
-        db.set_serif_family("Liberation Serif");
+    // Generic families point at a font that is really there, so text in a
+    // missing font still comes out (in a plain sans) instead of vanishing.
+    let has = |db: &usvg::fontdb::Database, f: &str| {
+        db.faces()
+            .any(|x| x.families.iter().any(|(n, _)| n.eq_ignore_ascii_case(f)))
+    };
+    for f in ["Arial", "Helvetica", "Liberation Sans", "DejaVu Sans", "Noto Sans", "Segoe UI"] {
+        if has(db, f) {
+            db.set_sans_serif_family(f);
+            break;
+        }
     }
+    for f in ["Times New Roman", "Times", "Liberation Serif", "DejaVu Serif", "Georgia"] {
+        if has(db, f) {
+            db.set_serif_family(f);
+            break;
+        }
+    }
+}
+
+/// Fonts named in an SVG that aren't installed; their text gets a fallback.
+fn missing_fonts(svg: &str, opt: &usvg::Options) -> (String, Vec<String>) {
+    let generic = ["serif", "sans-serif", "monospace", "cursive", "fantasy"];
+    let mut missing: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(svg.len() + 64);
+    let mut rest = svg;
+    while let Some(i) = rest.find("font-family") {
+        out.push_str(&rest[..i + 11]);
+        rest = &rest[i + 11..];
+        // value: ="..." / ='...' (attribute) or :...; (style)
+        let t = rest.trim_start();
+        let skip = rest.len() - t.len();
+        let (open, close) = match t.chars().next() {
+            Some('=') => {
+                let q = t[1..].trim_start().chars().next().unwrap_or('"');
+                (t.find(q).map(|k| k + 1), Some(q))
+            }
+            Some(':') => (Some(1), None),
+            _ => (None, None),
+        };
+        let Some(open) = open else { continue };
+        let body = &t[open..];
+        let end = match close {
+            Some(q) => body.find(q),
+            None => body.find([';', '"', '\'', '}']),
+        }
+        .unwrap_or(body.len());
+        let value = &body[..end];
+        let fams: Vec<String> = value
+            .split(',')
+            .map(|f| f.trim().trim_matches(['\'', '"']).replace("&quot;", "").trim().to_string())
+            .filter(|f| !f.is_empty())
+            .collect();
+        let any_present = fams.iter().any(|f| {
+            generic.contains(&f.to_ascii_lowercase().as_str())
+                || opt.fontdb.faces().any(|x| x.families.iter().any(|(n, _)| n.eq_ignore_ascii_case(f)))
+        });
+        out.push_str(&rest[..skip + open]);
+        out.push_str(value);
+        if !any_present {
+            if let Some(f) = fams.first() {
+                if !missing.contains(f) {
+                    missing.push(f.clone());
+                }
+            }
+            out.push_str(", sans-serif");
+        }
+        rest = &body[end..];
+    }
+    out.push_str(rest);
+    (out, missing)
 }
 
 pub fn font_options(
@@ -345,11 +411,19 @@ pub fn list_fonts() -> Vec<String> {
 }
 
 pub fn load_svg_str(svg: &str, opt: &usvg::Options) -> Result<Artwork, String> {
-    let tree = usvg::Tree::from_str(svg, opt).map_err(|e| format!("SVG parse error: {e}"))?;
+    let (svg, missing) = missing_fonts(svg, opt);
+    let tree = usvg::Tree::from_str(&svg, opt).map_err(|e| format!("SVG parse error: {e}"))?;
     let mut art = Artwork {
         fixed: Default::default(),
         shapes: Vec::new(),
-        warnings: Vec::new(),
+        warnings: missing
+            .iter()
+            .map(|f| {
+                format!(
+                    "Font \"{f}\" isn't installed on this computer, so its text uses a plain sans font. Install the font, or convert the text to outlines in your art app."
+                )
+            })
+            .collect(),
     };
     let mut groups = 0usize;
     walk(tree.root(), &mut art, None, &mut groups);
