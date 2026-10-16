@@ -327,7 +327,7 @@ impl App {
             play_acc: 0.0,
             pending_progress: None,
             pending_zoom: None,
-            status: "Open an SVG, drop one on the window, or add text.".into(),
+            status: "Open art, a PDF or a picture (or drop one on the window), or add text.".into(),
             last_dir: None,
             project_path: None,
             modified: false,
@@ -849,7 +849,12 @@ impl App {
                                     "{:.2} × {:.2} in · {} colors · {} shapes · {} points{}",
                                     t.w as f64 * t.mm_per_px / 25.4,
                                     t.height_mm() / 25.4,
-                                    t.layers.len(),
+                                    {
+                                        let mut c: Vec<usize> = t.layers.iter().map(|l| l.color).collect();
+                                        c.sort();
+                                        c.dedup();
+                                        c.len()
+                                    },
                                     t.layers.iter().map(|l| l.paths.len()).sum::<usize>(),
                                     pts,
                                     if t.mockup { " · garment removed" } else { "" }
@@ -4378,7 +4383,7 @@ impl App {
             painter.text(
                 c + Vec2::new(0.0, 16.0),
                 egui::Align2::CENTER_CENTER,
-                "or drop an SVG here, Open…, Add text…",
+                "or drop art, a PDF or a picture here, Open…, Add text…",
                 egui::FontId::proportional(14.0),
                 Color32::from_rgb(130, 126, 118),
             );
