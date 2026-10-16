@@ -494,6 +494,21 @@ mod object_tests {
     }
 
     #[test]
+    fn art_exports_and_reimports() {
+        let mut l = square_layer(1, 0.0, 20.0);
+        l.rotation = 30.0;
+        let svg = art_svg(&[l.clone()], &crate::thread::generic_chart());
+        let (opt, _) = crate::import::font_options(None).unwrap();
+        let art = crate::import::load_svg_str(&svg, &opt).unwrap();
+        assert_eq!(art.shapes.len(), 1);
+        let a = match &art.shapes[0].kind {
+            ShapeKind::Area { rings, rule } => crate::geom::rings_area(rings, *rule),
+            _ => 0.0,
+        };
+        assert!((a - 400.0).abs() < 2.0, "{a}");
+    }
+
+    #[test]
     fn hand_edited_stitches_are_kept_and_move_with_the_layer() {
         let mut l = square_layer(1, 0.0, 10.0);
         let d = build(vec![l.clone()]);
@@ -516,4 +531,73 @@ mod object_tests {
         l.opts.density = Some(0.6);
         assert!(l.out_of_sync());
     }
+}
+
+/// The project's artwork as an SVG file (mm units): every visible layer's
+/// shape with its thread colour, so the art can go back to Inkscape or
+/// Illustrator, or to the customer as a proof.
+pub fn art_svg(layers: &[Layer], chart: &[Thread]) -> String {
+    use crate::geom::BBox;
+    let mut b = BBox::empty();
+    for l in layers.iter().filter(|l| l.visible) {
+        let lb = l.bbox();
+        if lb.is_valid() {
+            b.add(lb.min);
+            b.add(lb.max);
+        }
+    }
+    if !b.is_valid() {
+        return "<svg xmlns=\"http://www.w3.org/2000/svg\"/>".into();
+    }
+    let pad = 2.0;
+    let (x0, y0) = (b.min.x - pad, b.min.y - pad);
+    let (w, h) = (b.width() + 2.0 * pad, b.height() + 2.0 * pad);
+    let mut out = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:.2}mm\" height=\"{h:.2}mm\" viewBox=\"0 0 {w:.3} {h:.3}\">\n"
+    );
+    let esc = |s: &str| s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;");
+    for l in layers.iter().filter(|l| l.visible) {
+        let rgb = l
+            .custom
+            .as_ref()
+            .map(|t| t.rgb)
+            .or_else(|| l.opts.thread.and_then(|t| chart.get(t)).map(|t| t.rgb))
+            .unwrap_or_else(|| l.shapes.first().map(|s| s.rgb).unwrap_or([0, 0, 0]));
+        let col = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+        let tf = |p: Pt| {
+            let q = l.tf(p);
+            Pt::new(q.x - x0, q.y - y0)
+        };
+        for s in &l.shapes {
+            let mut sh = s.clone();
+            sh.ensure_curves();
+            let d: Vec<String> = sh.curves.iter().map(|c| crate::vector::path_d(c, &tf)).collect();
+            if d.is_empty() {
+                continue;
+            }
+            match &s.kind {
+                ShapeKind::Area { rule, .. } => {
+                    let fr = match rule {
+                        crate::geom::FillRule::EvenOdd => "evenodd",
+                        crate::geom::FillRule::NonZero => "nonzero",
+                    };
+                    out.push_str(&format!(
+                        "  <path id=\"{}\" d=\"{}\" fill=\"{col}\" fill-rule=\"{fr}\"/>\n",
+                        esc(&l.name),
+                        d.join(" ")
+                    ));
+                }
+                ShapeKind::Line { width, .. } => {
+                    let w = l.opts.column_width.unwrap_or(*width) * (l.sx * l.sy).abs().sqrt();
+                    out.push_str(&format!(
+                        "  <path id=\"{}\" d=\"{}\" fill=\"none\" stroke=\"{col}\" stroke-width=\"{w:.3}\"/>\n",
+                        esc(&l.name),
+                        d.join(" ")
+                    ));
+                }
+            }
+        }
+    }
+    out.push_str("</svg>\n");
+    out
 }

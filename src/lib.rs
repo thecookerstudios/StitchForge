@@ -7,6 +7,7 @@ pub mod design;
 pub mod drops;
 pub mod fills;
 pub mod skeleton;
+pub mod vector;
 pub mod vfs;
 pub mod dst;
 pub mod export;
