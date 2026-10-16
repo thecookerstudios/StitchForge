@@ -55,10 +55,10 @@ pub fn write_formats(
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(12.0);
-    write(p("preview.png"), &sheet::preview_png(d, scale)?)?;
+    write(p("preview.png"), &sheet::preview_png(d, scale, &job.fabric_hex())?)?;
     write(
         p("preview.svg"),
-        sheet::preview_svg(d, 1.0, "#f4f1ea").as_bytes(),
+        sheet::preview_svg(d, 1.0, &job.fabric_hex()).as_bytes(),
     )?;
     let files: Vec<String> = machine
         .iter()

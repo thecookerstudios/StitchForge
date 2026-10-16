@@ -166,6 +166,9 @@ struct OutputArgs {
     placement: String,
     #[arg(long, default_value = "")]
     garment: String,
+    /// Garment colour for the previews, e.g. "#111111" for a black cap
+    #[arg(long)]
+    garment_color: Option<String>,
     #[arg(long, default_value = "")]
     notes: String,
 }
@@ -412,6 +415,10 @@ fn produce(mut art: import::Artwork, name: &str, o: &OutputArgs) -> Result<(), S
                 o.garment.clone()
             },
             notes: o.notes.clone(),
+            garment_rgb: match &o.garment_color {
+                Some(c) => Some(parse_hex(c)?),
+                None => None,
+            },
         };
         let fmts: Vec<stitchforge::formats::Format> = o
             .formats

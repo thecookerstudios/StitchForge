@@ -398,6 +398,12 @@ impl App {
                     };
                 }
                 "--pro" => self.pro = true,
+                "--garment" => {
+                    if let Some(rgb) = args.get(i + 1).and_then(|v| parse_hex(v)) {
+                        self.job.garment_rgb = Some(rgb);
+                    }
+                    i += 1;
+                }
                 "--flat-view" => self.view = View::Flat,
                 "--sample" => self.open_svg_data(SAMPLE_SVG, "sample-logo", false),
                 "--select" => {
@@ -4040,6 +4046,31 @@ impl App {
             ui.selectable_value(&mut self.view, View::Flat, "Flat")
                 .on_hover_text("Plain lines");
             ui.toggle_value(&mut self.show_jumps, "Jumps");
+            // garment colour the design is shown on (also used on the sheet)
+            let cur = self.job.garment_rgb.unwrap_or(CANVAS);
+            let name = GARMENTS.iter().find(|g| g.1 == cur).map(|g| g.0).unwrap_or("Custom");
+            let before = self.job.garment_rgb;
+            ui.label("Garment");
+            egui::ComboBox::from_id_salt("garment")
+                .width(110.0)
+                .selected_text(name)
+                .show_ui(ui, |ui| {
+                    for (n, rgb) in GARMENTS {
+                        ui.horizontal(|ui| {
+                            swatch(ui, *rgb);
+                            if ui.selectable_label(cur == *rgb, *n).clicked() {
+                                self.job.garment_rgb = if *rgb == CANVAS { None } else { Some(*rgb) };
+                            }
+                        });
+                    }
+                });
+            let mut c = cur;
+            if ui.color_edit_button_srgb(&mut c).on_hover_text("Any garment colour").changed() {
+                self.job.garment_rgb = Some(c);
+            }
+            if self.job.garment_rgb != before {
+                self.modified = true;
+            }
             if ui
                 .button("Fit")
                 .on_hover_text("Fit design to view (F)")
@@ -4057,8 +4088,10 @@ impl App {
     fn canvas(&mut self, ui: &mut egui::Ui, now: f64) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
-        let fabric = Color32::from_rgb(242, 239, 232);
+        let g = self.job.garment_rgb.unwrap_or(CANVAS);
+        let fabric = Color32::from_rgb(g[0], g[1], g[2]);
         painter.rect_filled(rect, 0.0, fabric);
+        let dark_garment = (g[0] as u32 * 299 + g[1] as u32 * 587 + g[2] as u32 * 114) / 1000 < 110;
 
         // An empty design is a blank canvas to draw on.
         let blank = Design::empty(self.profile, &self.recipe);
@@ -4242,7 +4275,29 @@ impl App {
         let painter = painter.with_clip_rect(rect);
 
         // grid every 10 mm, and a slightly darker hoop-ish area around the design
-        let grid = Color32::from_rgba_unmultiplied(0, 0, 0, 12);
+        let grid = if dark_garment {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+        } else {
+            Color32::from_rgba_unmultiplied(0, 0, 0, 12)
+        };
+        // the garment's weave (twill) when zoomed in on the 3D view
+        if self.view == View::ThreeD && zoom >= 3.0 && self.job.garment_rgb.is_some() {
+            let pitch = 0.6 * zoom; // twill ribs about 0.6 mm apart
+            let ink = if dark_garment {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 9)
+            } else {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 13)
+            };
+            let h = rect.height();
+            let mut x = rect.left() - h;
+            while x < rect.right() {
+                painter.line_segment(
+                    [Pos2::new(x, rect.bottom()), Pos2::new(x + h, rect.top())],
+                    Stroke::new((pitch * 0.35).max(1.0), ink),
+                );
+                x += pitch;
+            }
+        }
         let tl = to_mm(rect.min);
         let br = to_mm(rect.max);
         if zoom > 1.2 {
@@ -6214,22 +6269,21 @@ fn stitch_shapes(
             }
         }
         View::ThreeD => {
-            // Delicate thread look (after Tim's reference): the thread colour,
-            // a soft gradient across its width (lit top edge, shaded bottom
-            // edge, untouched middle) and, when zoomed in, faint diagonal
-            // twist lines like the ply of real thread.
-            let light = Vec2::new(0.0, -1.0); // light from the top of the screen
+            // Thread as it lies on fabric: each stitch is a rounded strand
+            // that tapers and darkens where it dives into the needle holes,
+            // casts a soft shadow, and catches the light by its angle (so
+            // satin shows long glossy strands and tatami its woven,
+            // brick-like texture from the staggered needle points).
+            let light = Vec2::new(-0.45, -0.9).normalized(); // from the upper left
+            let shadow_off = Vec2::new(0.22, 0.38) * w;
+            let detailed = w >= 2.2;
+            let across: &[(f32, f32)] = if detailed {
+                // (position across the strand, base shading) — lit edge first
+                &[(1.0, -0.1), (0.62, 0.06), (0.3, 0.05), (0.0, 0.0), (-0.35, -0.08), (-0.7, -0.2), (-1.0, -0.34)]
+            } else {
+                &[(1.0, 0.02), (0.0, 0.0), (-1.0, -0.3)]
+            };
             let mut mesh = egui::Mesh::default();
-            let across: [(f32, f32); 5] = [
-                (-1.0, -0.36),
-                (-0.55, -0.16),
-                (0.0, 0.0),
-                (0.55, 0.12),
-                (1.0, 0.26),
-            ];
-            let half = w * 0.6;
-            let twist = w >= 3.0; // only when a thread is wide enough to show it
-            let pitch = (w * 1.1).max(3.0); // px between twist lines
             for r in runs.iter().filter(|r| r.len() >= 2) {
                 for s in r.windows(2) {
                     let (a, b) = (s[0], s[1]);
@@ -6245,34 +6299,48 @@ fn stitch_shapes(
                     let dir = v / len;
                     let mut n = Vec2::new(-dir.y, dir.x);
                     if n.dot(light) < 0.0 {
-                        n = -n; // +n always points toward the light
+                        n = -n; // +n points toward the light
                     }
-                    // stations along the stitch; twist lines are thin darker bands
-                    let mut stations: Vec<(f32, f32)> = vec![(0.0, 0.0)];
-                    if twist && len > pitch * 1.5 {
-                        let k = (len / pitch).floor() as usize;
-                        for i in 1..k {
-                            let t = i as f32 * pitch;
-                            stations.push((t - 0.18 * pitch, 0.0));
-                            stations.push((t, -0.12));
-                            stations.push((t + 0.18 * pitch, 0.0));
+                    let half = w * 0.64;
+                    // sheen: thread is brightest lying across the light
+                    let cross = (dir.x * light.y - dir.y * light.x).abs();
+                    let sheen = cross * cross;
+                    let long = (len / (w * 3.0)).clamp(0.0, 1.0);
+                    let lift = (sheen - 0.5) * 0.14;
+                    let gloss = (0.03 + 0.15 * sheen) * (0.4 + 0.6 * long);
+                    // stations along the stitch: (distance, width factor, darkening)
+                    let tl = (len * 0.32).min(w * 0.9);
+                    let st: [(f32, f32, f32); 6] = [
+                        (0.0, 0.62, -0.3),
+                        (tl * 0.45, 0.88, -0.12),
+                        (tl, 1.0, 0.0),
+                        (len - tl, 1.0, 0.0),
+                        (len - tl * 0.45, 0.88, -0.12),
+                        (len, 0.62, -0.3),
+                    ];
+                    let stations: &[(f32, f32, f32)] = if detailed { &st } else { &[(0.0, 0.6, -0.25), (len * 0.5, 1.0, 0.0), (len, 0.6, -0.25)] };
+                    // soft shadow on the fabric under the strand
+                    if detailed {
+                        let base = mesh.vertices.len() as u32;
+                        let sc = Color32::from_black_alpha(28);
+                        for &(t, wf, _) in stations {
+                            let c = a + dir * t + shadow_off;
+                            mesh.colored_vertex(c + n * (half * wf * 1.1), sc);
+                            mesh.colored_vertex(c - n * (half * wf * 1.1), sc);
+                        }
+                        for i in 0..(stations.len() as u32 - 1) {
+                            let i0 = base + i * 2;
+                            mesh.add_triangle(i0, i0 + 1, i0 + 2);
+                            mesh.add_triangle(i0 + 1, i0 + 3, i0 + 2);
                         }
                     }
-                    stations.push((len, 0.0));
-                    // needle holes: the very ends sink slightly
-                    stations[0].1 = -0.1;
-                    let last = stations.len() - 1;
-                    stations[last].1 = -0.1;
-                    let slant = if twist { half * 0.9 } else { 0.0 };
                     let base = mesh.vertices.len() as u32;
                     let cols = across.len() as u32;
-                    for &(t, dk) in &stations {
-                        for &(sgn, tone) in &across {
-                            // twist lines lean across the thread
-                            let tt = (t + sgn * slant * if t > 0.0 && t < len { 1.0 } else { 0.0 })
-                                .clamp(0.0, len);
-                            let p = a + dir * tt + n * (sgn * half);
-                            mesh.colored_vertex(p, tone_col(col, tone + dk));
+                    for &(t, wf, dk) in stations {
+                        for &(sgn, tone) in across {
+                            let g = if sgn > 0.2 && sgn < 0.8 { gloss } else if sgn > 0.0 && sgn <= 0.2 { gloss * 0.45 } else { 0.0 };
+                            let p = a + dir * t + n * (sgn * half * wf);
+                            mesh.colored_vertex(p, tone_col(col, tone + dk + lift + g * (1.0 + dk * 2.0).max(0.0)));
                         }
                     }
                     for si in 0..(stations.len() as u32 - 1) {
@@ -6674,6 +6742,25 @@ fn open_path(p: &std::path::Path) {
 // puts the file in the in-memory file store, and downloads for results.
 
 /// What a picked file is for.
+/// The default canvas colour (no garment chosen).
+const CANVAS: [u8; 3] = [242, 239, 232];
+
+/// Common garment colours for the canvas and sheet previews.
+const GARMENTS: &[(&str, [u8; 3])] = &[
+    ("Canvas (none)", CANVAS),
+    ("White", [250, 250, 248]),
+    ("Black", [22, 22, 24]),
+    ("Navy", [28, 34, 58]),
+    ("Charcoal", [62, 64, 68]),
+    ("Heather gray", [160, 162, 164]),
+    ("Royal", [36, 66, 150]),
+    ("Red", [170, 28, 36]),
+    ("Maroon", [96, 26, 36]),
+    ("Forest", [30, 70, 46]),
+    ("Khaki", [196, 180, 140]),
+    ("Orange", [232, 110, 36]),
+];
+
 /// File types opened as artwork (vector, PDF, or traced pictures).
 const ART_EXT: &[&str] = &["svg", "pdf", "ai", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"];
 

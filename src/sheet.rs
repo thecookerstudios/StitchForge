@@ -14,6 +14,16 @@ pub struct JobInfo {
     pub placement: String,
     pub garment: String,
     pub notes: String,
+    /// Garment colour the previews are drawn on (None = natural canvas).
+    #[serde(default)]
+    pub garment_rgb: Option<[u8; 3]>,
+}
+
+impl JobInfo {
+    /// Background colour for previews, as #rrggbb.
+    pub fn fabric_hex(&self) -> String {
+        self.garment_rgb.map(hex).unwrap_or_else(|| "#f4f1ea".into())
+    }
 }
 
 fn esc(s: &str) -> String {
@@ -109,8 +119,8 @@ pub fn preview_svg(d: &Design, scale: f64, fabric: &str) -> String {
     s
 }
 
-pub fn preview_png(d: &Design, px_per_mm: f32) -> Result<Vec<u8>, String> {
-    let svg = preview_svg(d, 1.0, "#f4f1ea");
+pub fn preview_png(d: &Design, px_per_mm: f32, fabric: &str) -> Result<Vec<u8>, String> {
+    let svg = preview_svg(d, 1.0, fabric);
     let opt = usvg::Options::default();
     let tree = usvg::Tree::from_str(&svg, &opt).map_err(|e| e.to_string())?;
     let size = tree.size();
@@ -166,7 +176,7 @@ pub fn operator_sheet(d: &Design, job: &JobInfo, generated: &str) -> String {
     } else {
         "Shown at actual size (print at 100%, no fit-to-page)".into()
     };
-    let preview = preview_svg(d, scale, "#f6f3ec");
+    let preview = preview_svg(d, scale, &job.fabric_hex());
     let field = |label: &str, v: &str| -> String {
         if v.trim().is_empty() {
             format!("<div class='f'><span>{label}</span><b class='blank'>&nbsp;</b></div>")

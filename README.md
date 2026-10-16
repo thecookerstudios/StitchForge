@@ -200,7 +200,12 @@ changes on flats, center-out on caps), **Automatic stops at color
 changes** (turn off to place every stop yourself).
 
 **Bottom bar.** Play the sew-out, **3D / Flat** thread view, show jumps,
-fit.
+**Garment** colour (presets like Black, Navy, Heather gray, or any colour;
+saved with the project and used on the operator sheet and previews), fit.
+The 3D view draws each stitch as thread lying on fabric: it tapers into the
+needle holes, casts a soft shadow and catches the light by its angle, so
+tatami shows its woven brick texture and satin its long glossy strands. On a
+chosen garment, zooming in shows the twill weave.
 
 **Export DST + sheet…** writes the DST, operator sheet, stops CSV and
 preview into a folder you choose, and opens the sheet.
