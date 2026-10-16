@@ -25,6 +25,35 @@ pub struct Recipe {
     /// spacings above are for 40 wt and are scaled for other weights.
     #[serde(default)]
     pub weight: crate::thread::ThreadWeight,
+    /// Cap front size limits (adult or youth) when sewing on caps.
+    #[serde(default)]
+    pub cap_size: CapSize,
+}
+
+/// Cap front sizes: the most a standard structured cap front takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CapSize {
+    /// Adult caps: up to 4" wide × 2.25" high.
+    #[default]
+    Adult,
+    /// Youth/kids caps: up to 4" wide × 2" high.
+    Youth,
+}
+
+impl CapSize {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CapSize::Adult => "Adult (4 × 2.25 in)",
+            CapSize::Youth => "Youth (4 × 2 in)",
+        }
+    }
+    /// Max (width, height) in mm.
+    pub fn limit(&self) -> (f64, f64) {
+        match self {
+            CapSize::Adult => (101.6, 57.15),
+            CapSize::Youth => (101.6, 50.8),
+        }
+    }
 }
 
 pub fn recipe(name: &str) -> Option<Recipe> {
@@ -39,6 +68,7 @@ pub fn recipe(name: &str) -> Option<Recipe> {
         backing: "Cutaway 2.5 oz".into(),
         topping: "None".into(),
         weight: Default::default(),
+        cap_size: Default::default(),
     };
     Some(match name {
         "pique" => base,
@@ -124,7 +154,7 @@ impl Profile {
     pub fn frame_limit(&self) -> (f64, f64) {
         match self {
             Profile::Flat => (360.0, 360.0),
-            Profile::Cap => (130.0, 57.0),
+            Profile::Cap => CapSize::Adult.limit(),
         }
     }
 }

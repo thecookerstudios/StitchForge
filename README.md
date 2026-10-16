@@ -1,4 +1,4 @@
-# StitchForge v0.9 — embroidery app
+# StitchForge v0.10 — embroidery app
 
 Vector art, PDFs, pictures (PNG/JPG, even mockup photos) and any-font text
 in; machine-ready DST, a printable operator
@@ -68,6 +68,36 @@ work). **Weight guide** compares them side by side: needle size, spacing,
 narrowest satin, smallest letters. The operator sheet and stops CSV list each
 stop's weight, needle size and thread use; Production shows thread per piece
 and pieces per cone.
+
+**Views.** Switch any time with the buttons at the top left of the canvas
+(or keys 1, 2, 3): **Vector** shows the artwork itself (shapes and live text
+for drawing and editing), **Stitches 3D** shows thread on fabric (satin
+columns with their rounded bevel, a split satin as two bevels, tatami's
+woven texture, puff raised), **Flat lines** shows plain stitch lines.
+
+**Text spacing.** Text layers stay editable text. Under the font and letter
+height: letter spacing, word spacing, line spacing (× normal), alignment
+(left, center, right), and **Kerning (letter by letter)** for each pair.
+
+**Satin settings** (per layer, under Stitching): satin underlay (Auto, center
+run, edge run, zigzag, edge run + zigzag, double zigzag, none), split satin
+over (default 8 mm), short stitches on curves (on by default), satin spacing
+and pull compensation under "Stitch settings (this layer)".
+
+**Fill (tatami) settings:** fill underlay (Auto, tatami across, edge run,
+edge run + tatami, double tatami, none), row spacing, stitch length, needle
+pattern (½, ⅓, ¼, ⅕ offset), underlay spacing and inset, pull compensation.
+Auto adds an edge run and a second underlay layer on caps.
+
+**3D puff** (per layer): satin sewn over foam. StitchForge sews a contour
+first, then stops (the operator sheet says "place 3 mm puff foam"), then a
+tack-down run, tight satin (0.2 mm spacing, no split under 12 mm) and end
+caps that wrap the foam at every open end. Puff always sews after the flat
+parts. Foam 2, 3 or 6 mm. Columns under 3 mm are flagged.
+
+**Cap sizes.** Sewing on Cap: choose Adult (4 × 2.25 in max) or Youth
+(4 × 2 in max); "Fit cap" scales the design to the largest size that fits,
+and larger designs are flagged.
 
 **Measure (D).** Drag across a column, letter stroke or gap: shows mm and
 inches and which thread weights it suits as a satin column and as a letter

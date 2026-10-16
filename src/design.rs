@@ -25,6 +25,8 @@ pub struct Stop {
     pub needle: usize,
     pub stitches: usize,
     pub objects: Vec<String>,
+    /// What the operator does at this stop (e.g. place the puff foam).
+    pub note: String,
     /// Estimated top thread and bobbin used by this stop (m).
     pub top_m: f64,
     pub bobbin_m: f64,
@@ -37,6 +39,8 @@ pub struct ObjectInfo {
     pub stitch_type: &'static str,
     pub thread_code: String,
     pub weight: ThreadWeight,
+    /// Sewn over puff foam (drawn raised in 3D).
+    pub puff: bool,
     pub color_match_delta_e: f64,
     pub stitches: usize,
     pub trims: usize,
@@ -149,8 +153,9 @@ pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox, keep_order: b
                 (b.min.x - cx).abs().min((b.max.x - cx).abs())
             };
             match profile {
-                Profile::Flat => (o.layer, 0, 0, i),
+                Profile::Flat => (o.puff_stage as usize, o.layer, 0, 0, i),
                 Profile::Cap => (
+                    o.puff_stage as usize,
                     o.layer,
                     (d / 5.0).floor() as i64,
                     -(b.max.y * 10.0) as i64,
@@ -164,6 +169,12 @@ pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox, keep_order: b
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for j in 0..n {
         for i in 0..j {
+            // 3D puff sews after everything flat (all contours, then the
+            // foam, then all puff satin), whatever the stacking says
+            let (pi, pj) = (objs[i].puff_stage, objs[j].puff_stage);
+            if (pi > 0 || pj > 0) && !(objs[i].layer == objs[j].layer && pi < pj) {
+                continue;
+            }
             if objs[i].bbox.overlaps(&objs[j].bbox, 0.3) {
                 preds[j] += 1;
                 succ[i].push(j);
@@ -189,10 +200,11 @@ pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox, keep_order: b
                 let o = &objs[i];
                 let color_change = (Some((o.thread, o.opts.weight)) != cur_thread) as i64;
                 match profile {
-                    Profile::Flat => (0, color_change, o.stack as i64, 0),
+                    Profile::Flat => (o.puff_stage as i64, 0, color_change, o.stack as i64, 0),
                     // each colour center-out from the bottom; change colour
                     // only when that colour has nothing left that can sew
                     Profile::Cap => (
+                        o.puff_stage as i64,
                         color_change,
                         center_bucket(&o.bbox),
                         -(o.bbox.max.y * 10.0) as i64,
@@ -235,6 +247,25 @@ pub fn build_with(
     for o in objs.iter_mut() {
         o.opts.weight = Some(o.opts.weight.unwrap_or(recipe.weight));
     }
+    // 3D puff objects sew in two stages: the contour before the foam goes
+    // on, then (after a stop to place the foam) the satin over it
+    if objs.iter().any(|o| o.opts.puff) {
+        let mut ex = Vec::with_capacity(objs.len() + 4);
+        for o in objs {
+            if o.opts.puff && !art.fixed.contains_key(&o.layer) {
+                let mut a = o.clone();
+                a.puff_stage = 1;
+                a.label = format!("{} (puff contour)", o.label);
+                let mut b = o;
+                b.puff_stage = 2;
+                ex.push(a);
+                ex.push(b);
+            } else {
+                ex.push(o);
+            }
+        }
+        objs = ex;
+    }
     // Hand-edited layers sew their own stitches: one object per layer.
     if !art.fixed.is_empty() {
         let mut seen = std::collections::HashSet::new();
@@ -249,6 +280,8 @@ pub fn build_with(
         bbox.add(o.bbox.max);
     }
     let order = sequence(&objs, profile, &bbox, opts.keep_order);
+    // the first puff satin object gets a stop: the operator places the foam
+    let foam_at = order.iter().copied().find(|&i| objs[i].puff_stage == 2);
     let anchor = Pt::new(bbox.center().x, bbox.max.y);
 
     let mut cmds = Vec::new();
@@ -288,7 +321,8 @@ pub fn build_with(
         last_layer = Some(o.layer);
         let wt = o.opts.weight.unwrap_or(recipe.weight);
         let differs = cur_thread != Some((o.thread, wt));
-        let new_stop = if cur_thread.is_none() {
+        let foam_here = Some(oi) == foam_at && !needles.is_empty();
+        let new_stop = if cur_thread.is_none() || foam_here {
             true
         } else if layer_start && o.stop.is_some() {
             o.stop.unwrap()
@@ -319,6 +353,14 @@ pub fn build_with(
                 needle,
                 stitches: 0,
                 objects: Vec::new(),
+                note: if foam_here {
+                    format!(
+                        "STOP: place {:.0} mm puff foam over the puff area, then continue",
+                        o.opts.foam_mm.unwrap_or(3.0)
+                    )
+                } else {
+                    String::new()
+                },
                 top_m: 0.0,
                 bobbin_m: 0.0,
             });
@@ -386,6 +428,7 @@ pub fn build_with(
             stitch_type: o.stitch_label(),
             thread_code: chart[o.thread].code.clone(),
             weight: wt,
+            puff: o.puff_stage == 2,
             color_match_delta_e: (o.color_error * 10.0).round() / 10.0,
             stitches: added,
             trims: cmds.iter().filter(|c| matches!(c, Cmd::Trim)).count() - trims_before,
@@ -408,7 +451,10 @@ pub fn build_with(
                 }
                 _ => o.bbox.width().min(o.bbox.height()),
             };
-            if narrow < wt.min_column() - 0.05 {
+            if o.puff_stage == 2 && narrow < 3.0 {
+                let e = thin.entry(usize::MAX - o.layer).or_insert((format!("{} (3D puff)", piece_name(&o.label)), wt, narrow));
+                e.2 = e.2.min(narrow);
+            } else if narrow < wt.min_column() - 0.05 {
                 let e = thin.entry(o.layer).or_insert((piece_name(&o.label), wt, narrow));
                 e.2 = e.2.min(narrow);
             }
@@ -418,7 +464,13 @@ pub fn build_with(
     cmds.push(Cmd::Trim);
     cmds.push(Cmd::End);
 
-    for (name, wt, narrow) in thin.values() {
+    for (key, (name, wt, narrow)) in thin.iter() {
+        if *key > usize::MAX / 2 {
+            warnings.push(format!(
+                "{name}: columns as thin as {narrow:.1} mm; puff needs at least 3 mm to rise and cover the foam"
+            ));
+            continue;
+        }
         let finer = ThreadWeight::ALL
             .iter()
             .filter(|w| w.min_column() <= *narrow + 0.05 && **w != *wt)
@@ -434,18 +486,44 @@ pub fn build_with(
             wt.min_column()
         ));
     }
+    if foam_at.is_some() {
+        warnings.push(
+            "3D puff: run at 500–700 stitches/min; tear away the loose foam and touch up with a little heat after sewing"
+                .into(),
+        );
+    }
     let mut stats = compute_stats(&cmds, &bbox, profile);
     thread_usage(&cmds, &mut stops, &mut stats);
-    let (fw, fh) = profile.frame_limit();
-    if bbox.width() > fw || bbox.height() > fh {
-        warnings.push(format!(
-            "design {:.0} × {:.0} mm exceeds the {} frame limit of {:.0} × {:.0} mm",
-            bbox.width(),
-            bbox.height(),
-            profile.label(),
-            fw,
-            fh
-        ));
+    match profile {
+        Profile::Cap => {
+            let (fw, fh) = recipe.cap_size.limit();
+            if bbox.width() > fw + 0.5 || bbox.height() > fh + 0.5 {
+                warnings.push(format!(
+                    "design {:.2} × {:.2} in is larger than the {} cap front limit ({:.2} × {:.2} in max)",
+                    bbox.width() / 25.4,
+                    bbox.height() / 25.4,
+                    match recipe.cap_size {
+                        crate::settings::CapSize::Adult => "adult",
+                        crate::settings::CapSize::Youth => "youth (kids)",
+                    },
+                    fw / 25.4,
+                    fh / 25.4
+                ));
+            }
+        }
+        Profile::Flat => {
+            let (fw, fh) = profile.frame_limit();
+            if bbox.width() > fw || bbox.height() > fh {
+                warnings.push(format!(
+                    "design {:.0} × {:.0} mm exceeds the {} frame limit of {:.0} × {:.0} mm",
+                    bbox.width(),
+                    bbox.height(),
+                    profile.label(),
+                    fw,
+                    fh
+                ));
+            }
+        }
     }
     if stats.short_stitches > 0 {
         warnings.push(format!(
@@ -546,6 +624,7 @@ pub fn from_machine(
                 stitch_type: "Stitches",
                 thread_code: st.thread.code.clone(),
                 weight: st.weight,
+                puff: false,
                 color_match_delta_e: 0.0,
                 stitches: count,
                 trims,
@@ -579,6 +658,7 @@ pub fn from_machine(
                     needle,
                     stitches: 0,
                     objects: vec![format!("Stop {}", k + 1)],
+                    note: String::new(),
                     top_m: 0.0,
                     bobbin_m: 0.0,
                 });
@@ -689,6 +769,91 @@ fn compute_stats(cmds: &[Cmd], bbox: &BBox, profile: Profile) -> Stats {
 
 #[cfg(test)]
 mod tests {
+    fn art(svg: &str) -> Artwork {
+        let (opt, _) = crate::import::font_options(None).unwrap();
+        crate::import::load_svg_str(svg, &opt).unwrap()
+    }
+    fn stitches(d: &Design) -> usize {
+        d.stats.stitches
+    }
+
+    #[test]
+    fn underlay_kinds_change_the_stitching() {
+        let chart = crate::thread::generic_chart();
+        let rec = crate::settings::recipe("pique").unwrap();
+        let svg = |tag: &str| format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='60mm' height='40mm' viewBox='0 0 60 40'>\
+             <rect id='bar {tag}' x='5' y='15' width='50' height='6' fill='#123'/>\
+             <rect id='panel sf-fill' x='5' y='25' width='50' height='12' fill='#a33'/></svg>");
+        let build = |tag: &str, ul: crate::import::Underlay, fill_ul: crate::import::Underlay| {
+            let mut a = art(&svg(tag));
+            a.shapes[0].opts.stitch = crate::import::StitchChoice::Satin;
+            a.shapes[0].opts.satin_underlay = ul;
+            a.shapes[1].opts.fill_underlay = fill_ul;
+            build("t", &a, &chart, &rec, Profile::Flat).unwrap()
+        };
+        use crate::import::Underlay as U;
+        let center = stitches(&build("", U::CenterRun, U::Tatami));
+        let edge_zz = stitches(&build("", U::EdgeZigzag, U::Tatami));
+        let none = stitches(&build("", U::Off, U::Off));
+        let double = stitches(&build("", U::CenterRun, U::DoubleTatami));
+        assert!(edge_zz > center + 40, "{center} {edge_zz}");
+        assert!(none < center, "{none} {center}");
+        assert!(double > center + 40, "{double} {center}");
+    }
+
+    #[test]
+    fn puff_gets_contour_foam_stop_and_sews_last() {
+        let chart = crate::thread::generic_chart();
+        let rec = crate::settings::recipe("cap").unwrap();
+        let a = art("<svg xmlns='http://www.w3.org/2000/svg' width='80mm' height='40mm' viewBox='0 0 80 40'>\
+             <rect id='bar sf-puff' x='10' y='5' width='60' height='8' fill='#eee'/>\
+             <rect id='line' x='10' y='25' width='60' height='4' fill='#22a'/></svg>");
+        let d = build("p", &a, &chart, &rec, Profile::Cap).unwrap();
+        // flat line first, then puff contour, then the foam stop + puff satin
+        let kinds: Vec<&str> = d.objects.iter().map(|o| o.stitch_type).collect();
+        assert_eq!(kinds.last(), Some(&"3D puff satin"), "{kinds:?}");
+        assert!(kinds.iter().position(|k| *k == "Puff contour").unwrap() > 0);
+        let foam = d.stops.iter().filter(|s| s.note.contains("foam")).count();
+        assert_eq!(foam, 1);
+        assert!(d.objects.last().unwrap().puff);
+        // puff satin is packed tight: many more stitches than flat satin
+        let mut flat = a.clone();
+        flat.shapes[0].opts.puff = false;
+        flat.shapes[0].opts.split_width = Some(12.0);
+        let f = build("f", &flat, &chart, &rec, Profile::Cap).unwrap();
+        assert!(d.stats.stitches > f.stats.stitches + 300, "puff {} flat {} {:?}", d.stats.stitches, f.stats.stitches, d.objects.iter().map(|o| (o.stitch_type, o.stitches)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cap_sizes_adult_and_youth() {
+        let chart = crate::thread::generic_chart();
+        let mut rec = crate::settings::recipe("cap").unwrap();
+        // 2.1 in tall: fine on adult caps, too tall for youth
+        let a = art("<svg xmlns='http://www.w3.org/2000/svg' width='90mm' height='60mm' viewBox='0 0 90 60'>\
+             <rect id='box sf-fill' x='0' y='0' width='90' height='53.3' fill='#333'/></svg>");
+        let adult = build("a", &a, &chart, &rec, Profile::Cap).unwrap();
+        assert!(!adult.warnings.iter().any(|w| w.contains("cap front")), "{:?}", adult.warnings);
+        rec.cap_size = crate::settings::CapSize::Youth;
+        let youth = build("y", &a, &chart, &rec, Profile::Cap).unwrap();
+        assert!(youth.warnings.iter().any(|w| w.contains("youth")), "{:?}", youth.warnings);
+    }
+
+    #[test]
+    fn short_stitches_on_curves() {
+        // a tight arc: the inside edge gets fewer full-depth penetrations
+        let ribs: Vec<Pt> = (0..40)
+            .map(|i| {
+                let a = i as f64 * 0.05;
+                let r = if i % 2 == 0 { 2.0 } else { 6.0 };
+                Pt::new(r * a.cos(), r * a.sin())
+            })
+            .collect();
+        let s = crate::stitch::short_stitches_for_test(&ribs, 0.4);
+        let moved = ribs.iter().zip(&s).filter(|(a, b)| a.dist(**b) > 0.01).count();
+        assert!(moved >= 5, "{moved}");
+    }
+
     use super::*;
     use crate::geom::{FillRule, Pt};
     use crate::import::{Shape, ShapeKind, ShapeOpts};

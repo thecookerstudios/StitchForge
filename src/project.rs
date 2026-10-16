@@ -18,6 +18,41 @@ pub struct TextSpec {
     pub font: String,
     pub height_mm: f64,
     pub rgb: [u8; 3],
+    /// Extra space between every letter (mm; negative tightens).
+    #[serde(default)]
+    pub letter_spacing: f64,
+    /// Extra space at each word space (mm).
+    #[serde(default)]
+    pub word_spacing: f64,
+    /// Line spacing as a multiple of the font's normal (1 = normal).
+    #[serde(default = "one")]
+    pub line_spacing: f64,
+    /// Kerning: extra space before each letter, by its position in the
+    /// text (line breaks not counted), mm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kerning: Vec<f64>,
+    #[serde(default)]
+    pub align: crate::import::TextAlign,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+impl Default for TextSpec {
+    fn default() -> Self {
+        TextSpec {
+            text: String::new(),
+            font: "sans-serif".into(),
+            height_mm: 10.0,
+            rgb: [0, 0, 0],
+            letter_spacing: 0.0,
+            word_spacing: 0.0,
+            line_spacing: 1.0,
+            kerning: Vec::new(),
+            align: Default::default(),
+        }
+    }
 }
 
 /// The embroidery side of a design object: its needle points, kept in the
@@ -69,6 +104,12 @@ pub struct Layer {
 impl Layer {
     pub fn new(id: u64, name: String, shapes: Vec<Shape>, is_outline: bool) -> Self {
         let b = BBox::of(shapes.iter().flat_map(|s| s.points()));
+        // stitch instructions that came with the art (sf- tags) start as the
+        // layer's own settings
+        let opts = shapes
+            .first()
+            .map(|s| ShapeOpts { layer: 0, thread: None, ..s.opts.clone() })
+            .unwrap_or_default();
         Layer {
             id,
             name,
@@ -80,7 +121,7 @@ impl Layer {
             lock: true,
             custom: None,
             rotation: 0.0,
-            opts: ShapeOpts::default(),
+            opts,
             visible: true,
             text: None,
             is_outline,
@@ -279,7 +320,23 @@ const PX_TO_MM: f64 = 25.4 / 96.0;
 /// capital-letter height, so every name in a run comes out the same size and
 /// sits on the same baseline whatever its letters.
 pub fn text_shapes(opt: &usvg::Options, spec: &TextSpec) -> Result<Vec<Shape>, String> {
-    let art = crate::import::load_text_with(opt, &spec.text, &spec.font, spec.rgb)?;
+    // the capital height sets the scale; spacing is given in final mm and
+    // turned into the font's units with it
+    let h = crate::import::load_text_with(opt, "H", &spec.font, spec.rgb)?;
+    let hb = BBox::of(h.shapes.iter().flat_map(|s| s.points()));
+    let cap0 = if hb.is_valid() && hb.height() > 0.0 { Some(hb.height()) } else { None };
+    let to_px = |mm: f64| match cap0 {
+        Some(c) => mm * c / spec.height_mm.max(0.1) / PX_TO_MM,
+        None => 0.0,
+    };
+    let layout = crate::import::TextLayout {
+        letter_px: to_px(spec.letter_spacing),
+        word_px: to_px(spec.word_spacing),
+        line: spec.line_spacing.clamp(0.3, 4.0),
+        kern_px: spec.kerning.iter().map(|k| to_px(*k)).collect(),
+        align: spec.align,
+    };
+    let art = crate::import::load_text_laid_out(opt, &spec.text, &spec.font, spec.rgb, &layout)?;
     let b = BBox::of(art.shapes.iter().flat_map(|s| s.points()));
     if !b.is_valid() || b.width() <= 0.0 {
         return Err(format!(
@@ -288,21 +345,23 @@ pub fn text_shapes(opt: &usvg::Options, spec: &TextSpec) -> Result<Vec<Shape>, S
             spec.font
         ));
     }
-    let h = crate::import::load_text_with(opt, "H", &spec.font, spec.rgb)?;
-    let hb = BBox::of(h.shapes.iter().flat_map(|s| s.points()));
-    let cap = if hb.is_valid() && hb.height() > 0.0 {
-        hb.height()
-    } else {
-        b.height()
-    };
+    let cap = cap0.unwrap_or(b.height());
     let lines = spec.text.lines().count().max(1) as f64;
-    let last_base = hb.max.y + (lines - 1.0) * 240.0 * PX_TO_MM;
+    let last_base = hb.max.y + (lines - 1.0) * 240.0 * layout.line * PX_TO_MM;
     let c = Pt::new(b.center().x, (hb.min.y + last_base) / 2.0);
     let k = spec.height_mm / cap;
     Ok(art
         .shapes
         .into_iter()
         .map(|mut s| {
+            // the editable curves move and scale with the outlines
+            for v in s.curves.iter_mut() {
+                for n in v.nodes.iter_mut() {
+                    n.p = n.p.sub(c).mul(k);
+                    n.cin = n.cin.sub(c).mul(k);
+                    n.cout = n.cout.sub(c).mul(k);
+                }
+            }
             match &mut s.kind {
                 ShapeKind::Area { rings, .. } => rings
                     .iter_mut()
@@ -419,6 +478,32 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn text_spacing_kerning_and_lines() {
+        let (opt, _) = crate::import::font_options(None).unwrap();
+        let width = |spec: &TextSpec| {
+            let sh = text_shapes(&opt, spec).unwrap();
+            BBox::of(sh.iter().flat_map(|s| s.points())).width()
+        };
+        let base = TextSpec { text: "TEAM".into(), font: "DejaVu Sans".into(), height_mm: 10.0, ..Default::default() };
+        let w0 = width(&base);
+        // 1 mm more between each of 4 letters: about 3 mm wider
+        let wide = TextSpec { letter_spacing: 1.0, ..base.clone() };
+        let w1 = width(&wide);
+        assert!((w1 - w0 - 3.0).abs() < 0.6, "{w0} -> {w1}");
+        // kerning the A–M pair tighter by 1 mm
+        let kern = TextSpec { kerning: vec![0.0, 0.0, 0.0, -1.0], ..base.clone() };
+        assert!((width(&kern) - (w0 - 1.0)).abs() < 0.3);
+        // word spacing only acts on spaces
+        let two = TextSpec { text: "A B".into(), ..base.clone() };
+        let two_wide = TextSpec { word_spacing: 2.0, ..two.clone() };
+        assert!((width(&two_wide) - width(&two) - 2.0).abs() < 0.4);
+        // double line spacing makes two lines taller
+        let lines = TextSpec { text: "AB\nCD".into(), ..base.clone() };
+        let h = |spec: &TextSpec| BBox::of(text_shapes(&opt, spec).unwrap().iter().flat_map(|s| s.points())).height();
+        assert!(h(&TextSpec { line_spacing: 2.0, ..lines.clone() }) > h(&lines) + 8.0);
+    }
+
     use super::*;
     use crate::geom::FillRule;
 

@@ -141,11 +141,11 @@ pub fn preview_png(d: &Design, px_per_mm: f32, fabric: &str) -> Result<Vec<u8>, 
 
 pub fn stops_csv(d: &Design) -> String {
     let mut s = String::from(
-        "stop,needle,brand,code,name,hex,weight,needle_size,stitches,top_thread_m,bobbin_m\n",
+        "stop,needle,brand,code,name,hex,weight,needle_size,stitches,top_thread_m,bobbin_m,note\n",
     );
     for (i, st) in d.stops.iter().enumerate() {
         s.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{:.1},{:.1}\n",
+            "{},{},{},{},{},{},{},{},{},{:.1},{:.1},{}\n",
             i + 1,
             st.needle,
             st.thread.brand,
@@ -156,7 +156,8 @@ pub fn stops_csv(d: &Design) -> String {
             st.weight.needle(),
             st.stitches,
             st.top_m,
-            st.bobbin_m
+            st.bobbin_m,
+            st.note.replace(',', ";")
         ));
     }
     s
@@ -188,8 +189,10 @@ pub fn operator_sheet(d: &Design, job: &JobInfo, generated: &str) -> String {
     for (i, s) in d.stops.iter().enumerate() {
         rows.push_str(&format!(
             "<tr><td class='n'>{}</td><td class='n'>{}</td><td><span class='sw' style='background:{}'></span></td>\
-             <td><b>{}</b> {}</td><td>{}</td><td>{}{}</td><td class='n'>{}</td><td class='n'>{:.1} m</td></tr>",
-            i + 1, s.needle, hex(s.thread.rgb), esc(&s.thread.code), esc(&s.thread.name), esc(&s.thread.brand),
+             <td><b>{}</b> {}{}</td><td>{}</td><td>{}{}</td><td class='n'>{}</td><td class='n'>{:.1} m</td></tr>",
+            i + 1, s.needle, hex(s.thread.rgb), esc(&s.thread.code), esc(&s.thread.name),
+            if s.note.is_empty() { String::new() } else { format!("<br><b style='color:#b4231a'>{}</b>", esc(&s.note)) },
+            esc(&s.thread.brand),
             s.weight.label(),
             if s.weight == crate::thread::ThreadWeight::W40 { String::new() } else { format!(" · needle {}", s.weight.needle()) },
             fmt_int(s.stitches), s.top_m

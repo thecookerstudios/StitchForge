@@ -731,6 +731,7 @@ mod tests {
             font: "DejaVu Sans".into(),
             height_mm: 8.0,
             rgb: [20, 20, 20],
+            ..Default::default()
         };
         let mut name = Layer::new(2, "Name".into(), text_shapes(&opt, &spec).unwrap(), false);
         name.origin = crate::geom::Pt::new(0.0, 0.0);
@@ -765,6 +766,7 @@ mod tests {
             font: "DejaVu Sans".into(),
             height_mm: 8.0,
             rgb: [20, 20, 20],
+            ..Default::default()
         };
         let mut name = Layer::new(2, "Name".into(), text_shapes(&opt, &spec).unwrap(), false);
         name.origin = crate::geom::Pt::new(0.0, 0.0);

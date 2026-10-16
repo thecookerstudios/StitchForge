@@ -19,7 +19,7 @@ use stitchforge::project::Embroidery;
 use stitchforge::stitch::Needle;
 use stitchforge::trace;
 use stitchforge::import::{self, Artwork, Shape, ShapeKind, ShapeOpts, StitchChoice};
-use stitchforge::import::{Cap, Corner};
+use stitchforge::import::{Cap, Corner, Underlay};
 use stitchforge::project::{Layer, Project, TextSpec};
 use stitchforge::settings::{self, Profile, Recipe};
 use stitchforge::sheet::JobInfo;
@@ -174,8 +174,38 @@ enum EditDrag {
 
 #[derive(PartialEq, Clone, Copy)]
 enum View {
-    Flat,
+    /// The artwork itself (filled vector shapes), for drawing and text.
+    Vector,
+    /// Stitches as thread on fabric.
     ThreeD,
+    /// Stitches as plain lines.
+    Flat,
+}
+
+impl View {
+    const ALL: [View; 3] = [View::Vector, View::ThreeD, View::Flat];
+    fn label(&self) -> &'static str {
+        match self {
+            View::Vector => "Vector",
+            View::ThreeD => "Stitches 3D",
+            View::Flat => "Flat lines",
+        }
+    }
+    fn key(&self) -> egui::Key {
+        match self {
+            View::Vector => egui::Key::Num1,
+            View::ThreeD => egui::Key::Num2,
+            View::Flat => egui::Key::Num3,
+        }
+    }
+}
+
+/// The vector view's picture of the art, re-made when the art or zoom changes.
+struct VecTex {
+    key: (u64, i32),
+    tex: egui::TextureHandle,
+    origin: Pt,
+    size: Pt,
 }
 
 struct App {
@@ -266,6 +296,9 @@ struct App {
     show_weights: bool,
     measure: Option<(Pt, Pt)>,
     trace_dlg: Option<TraceDlg>,
+    /// Bumped whenever the design is rebuilt (vector view cache key).
+    layers_rev: u64,
+    vec_tex: Option<VecTex>,
     /// Notes about the opened file (live text in a PDF, garment removed…).
     file_notes: Vec<String>,
     border_dist: f64,
@@ -367,6 +400,8 @@ impl App {
             show_weights: false,
             measure: None,
             trace_dlg: None,
+            layers_rev: 0,
+            vec_tex: None,
             file_notes: Vec::new(),
             border_dist: 1.5,
             border_round: true,
@@ -391,9 +426,10 @@ impl App {
                     self.profile = Profile::Cap;
                     self.fabric = "cap".into();
                     self.recipe = {
-                        let w = self.recipe.weight;
+                        let (w, cs) = (self.recipe.weight, self.recipe.cap_size);
                         let mut r = settings::recipe("cap").unwrap();
                         r.weight = w;
+                        r.cap_size = cs;
                         r
                     };
                 }
@@ -641,6 +677,42 @@ impl App {
     }
 
     // ---------- loading ----------
+
+    /// Re-render the vector view's picture when the art or zoom changed.
+    fn refresh_vector_texture(&mut self, ctx: &egui::Context) {
+        let zb = (self.zoom.max(0.05).ln() / 1.25f32.ln()).round() as i32;
+        let key = (self.layers_rev, zb);
+        if self.vec_tex.as_ref().map(|v| v.key == key).unwrap_or(false) {
+            return;
+        }
+        let vis: Vec<Layer> = self.layers.iter().filter(|l| l.visible).cloned().collect();
+        let mut b = BBox::empty();
+        for l in &vis {
+            let lb = l.bbox();
+            if lb.is_valid() {
+                b.add(lb.min);
+                b.add(lb.max);
+            }
+        }
+        if !b.is_valid() {
+            self.vec_tex = None;
+            return;
+        }
+        let pad = 2.0; // art_svg's margin
+        let (w, h) = (b.width() + 2.0 * pad, b.height() + 2.0 * pad);
+        let ppp = ctx.pixels_per_point();
+        let max_px = ((w.max(h) as f32) * self.zoom * ppp).clamp(64.0, 4096.0) as u32;
+        let svg = stitchforge::project::art_svg(&vis, &self.chart);
+        if let Some((pw, ph, px)) = render_svg(&svg, max_px) {
+            let tex = ctx.load_texture("vector-view", egui::ColorImage::from_rgba_unmultiplied([pw, ph], &px), egui::TextureOptions::LINEAR);
+            self.vec_tex = Some(VecTex {
+                key,
+                tex,
+                origin: Pt::new(b.min.x - pad, b.min.y - pad),
+                size: Pt::new(w, h),
+            });
+        }
+    }
 
     /// PDF/AI files and pictures: vector PDFs open like SVG; pictures (and
     /// PDFs that only hold a picture) go to the trace window.
@@ -1110,14 +1182,21 @@ impl App {
                 None => {
                     key.push(k);
                     let n = out.len() + 1;
-                    let name = if s.label.is_empty() {
+                    // sf- stitch tags in the art's names are settings, not names
+                    let label: String = s
+                        .label
+                        .split_whitespace()
+                        .filter(|w| !w.starts_with("sf-"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let name = if label.is_empty() {
                         if outline {
                             format!("Outline {n}")
                         } else {
                             format!("Shape {n}")
                         }
                     } else {
-                        s.label.clone()
+                        label
                     };
                     let id = self.next_id;
                     self.next_id += 1;
@@ -1181,6 +1260,7 @@ impl App {
             font: self.font.clone(),
             height_mm: self.text_height_in * 25.4,
             rgb: self.text_color,
+            ..Default::default()
         };
         match self.text_shapes(&spec) {
             Ok(shapes) => {
@@ -1239,6 +1319,7 @@ impl App {
 
     fn regenerate(&mut self) {
         self.dirty = false;
+        self.layers_rev += 1;
         if self.tab == Tab::Drops && self.machine.is_none() {
             self.drop_info = None;
             let n = self.drops.drop_count();
@@ -2577,6 +2658,73 @@ impl App {
                         }
                     }
                 });
+                // spacing: the text stays editable; spacing is applied by the
+                // font engine every time it is laid out
+                egui::Grid::new("text-spacing").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                    ui.label("Letter spacing");
+                    ui.horizontal(|ui| {
+                        text_changed |= ui
+                            .add(egui::DragValue::new(&mut spec.letter_spacing).speed(0.02).range(-5.0..=20.0).suffix(" mm").max_decimals(2))
+                            .on_hover_text("Space added between every letter (negative tightens)")
+                            .changed();
+                    });
+                    ui.end_row();
+                    ui.label("Word spacing");
+                    text_changed |= ui
+                        .add(egui::DragValue::new(&mut spec.word_spacing).speed(0.05).range(-5.0..=30.0).suffix(" mm").max_decimals(2))
+                        .on_hover_text("Extra space at each space between words")
+                        .changed();
+                    ui.end_row();
+                    ui.label("Line spacing");
+                    text_changed |= ui
+                        .add(egui::DragValue::new(&mut spec.line_spacing).speed(0.01).range(0.3..=4.0).suffix(" ×").max_decimals(2))
+                        .on_hover_text("1 = the font's normal line height")
+                        .changed();
+                    ui.end_row();
+                    ui.label("Align");
+                    ui.horizontal(|ui| {
+                        for (a, lbl) in [(import::TextAlign::Left, "Left"), (import::TextAlign::Center, "Center"), (import::TextAlign::Right, "Right")] {
+                            if ui.selectable_label(spec.align == a, lbl).clicked() && spec.align != a {
+                                spec.align = a;
+                                text_changed = true;
+                            }
+                        }
+                    });
+                    ui.end_row();
+                });
+                // kerning, pair by pair
+                let chars: Vec<char> = spec.text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+                if chars.len() >= 2 {
+                    let kerned = spec.kerning.iter().any(|k| k.abs() > 1e-6);
+                    egui::CollapsingHeader::new(RichText::new(if kerned { "Kerning (letter by letter) •" } else { "Kerning (letter by letter)" }).small().strong())
+                        .id_salt("kerning")
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Space before each letter, mm. Drag a number or type it.").weak().small());
+                            spec.kerning.resize(chars.len(), 0.0);
+                            // pairs within a line only
+                            let mut pos = 0usize;
+                            ui.horizontal_wrapped(|ui| {
+                                for line in spec.text.lines() {
+                                    let lc: Vec<char> = line.chars().collect();
+                                    for k in 1..lc.len() {
+                                        let i = pos + k;
+                                        ui.label(RichText::new(format!("{}{}", lc[k - 1], lc[k])).monospace());
+                                        if let Some(v) = spec.kerning.get_mut(i) {
+                                            text_changed |= ui
+                                                .add(egui::DragValue::new(v).speed(0.02).range(-5.0..=10.0).max_decimals(2))
+                                                .changed();
+                                        }
+                                        ui.add_space(6.0);
+                                    }
+                                    pos += lc.len();
+                                }
+                            });
+                            if kerned && ui.small_button("Reset kerning").clicked() {
+                                spec.kerning.clear();
+                                text_changed = true;
+                            }
+                        });
+                }
             }
             let (ow, oh) = l.own_size();
             ui.horizontal(|ui| {
@@ -2919,17 +3067,33 @@ impl App {
                     ui.label(RichText::new(if s { "(stops)" } else { "(no stop)" }).weak());
                 }
             });
+            // 3D puff: satin over foam, with a stop to place the foam
             ui.horizontal(|ui| {
-                ui.label("Underlay");
-                let mut on = !l.opts.no_underlay;
-                let label = if on { "On" } else { "Off" };
+                ui.label("3D puff");
+                let puff_label = if l.opts.puff { "On" } else { "Off" };
                 if ui
-                    .checkbox(&mut on, label)
-                    .on_hover_text("Foundation stitches under the top stitching")
+                    .checkbox(&mut l.opts.puff, puff_label)
+                    .on_hover_text("Raised satin sewn over foam: a contour first, a stop to place the foam, then tight satin with end caps. Sews after everything flat. Best for bold letters and shapes at least 3 mm wide.")
                     .changed()
                 {
-                    l.opts.no_underlay = !on;
+                    if l.opts.puff && l.opts.stitch == StitchChoice::Fill {
+                        l.opts.stitch = StitchChoice::Satin;
+                    }
                     changed = true;
+                }
+                if l.opts.puff {
+                    ui.label("Foam");
+                    let cur = l.opts.foam_mm.unwrap_or(3.0);
+                    for f in [2.0, 3.0, 6.0] {
+                        if ui
+                            .selectable_label((cur - f).abs() < 0.01, format!("{f:.0} mm"))
+                            .on_hover_text(if f >= 6.0 { "Tall look; needs bold, wide columns" } else { "Standard for caps" })
+                            .clicked()
+                        {
+                            l.opts.foam_mm = if (f - 3.0).abs() < 0.01 { None } else { Some(f) };
+                            changed = true;
+                        }
+                    }
                 }
             });
             ui.horizontal(|ui| {
@@ -3044,6 +3208,50 @@ impl App {
                         });
                 });
             }
+            // underlay and the satin / fill specifics
+            let underlay_combo = |ui: &mut egui::Ui, salt: &str, label: &str, v: &mut Underlay, list: &[Underlay], no: &mut bool| -> bool {
+                let mut ch = false;
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    let shown = if *no { Underlay::Off } else { *v };
+                    egui::ComboBox::from_id_salt(salt)
+                        .width(170.0)
+                        .selected_text(shown.label())
+                        .show_ui(ui, |ui| {
+                            for u in list {
+                                if ui.selectable_label(shown == *u, u.label()).on_hover_text(u.hint()).clicked() {
+                                    *v = *u;
+                                    *no = false;
+                                    ch = true;
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(shown.hint());
+                });
+                ch
+            };
+            if is_satin || l.opts.puff {
+                let o = &mut l.opts;
+                changed |= underlay_combo(ui, "satin-ul", "Satin underlay", &mut o.satin_underlay, &Underlay::SATIN, &mut o.no_underlay);
+                ui.horizontal(|ui| {
+                    let mut short = o.short_stitches.unwrap_or(true);
+                    if ui
+                        .checkbox(&mut short, "Short stitches on curves")
+                        .on_hover_text("Every other stitch stops short on the inside of tight curves so needle holes don't pile up")
+                        .changed()
+                    {
+                        o.short_stitches = if short { None } else { Some(false) };
+                        changed = true;
+                    }
+                });
+                let def_split = if o.puff { 12.0 } else { 8.0 };
+                changed |= own_setting(ui, "Split satin over", "own-split", &mut o.split_width, def_split, 1, "mm", (3.0, 12.5));
+            }
+            if is_fill && !l.opts.puff {
+                let o = &mut l.opts;
+                changed |= underlay_combo(ui, "fill-ul", "Fill underlay", &mut o.fill_underlay, &Underlay::FILL, &mut o.no_underlay);
+            }
             if is_fill || is_satin {
                 let rec = &self.recipe;
                 let own = l.opts.has_own_settings();
@@ -3090,6 +3298,10 @@ impl App {
                             });
                         }
                         if o.has_own_settings() && ui.small_button("All back to fabric settings").clicked() {
+                            o.satin_underlay = Underlay::Auto;
+                            o.fill_underlay = Underlay::Auto;
+                            o.split_width = None;
+                            o.short_stitches = None;
                             o.density = None;
                             o.stitch_len = None;
                             o.pull_comp = None;
@@ -3788,12 +4000,31 @@ impl App {
                     }
                 });
                 ui.horizontal(|ui| {
-                    for (target, l) in [(1.0, "1\""), (2.0, "2\""), (3.5, "3.5\" chest"), (4.5, "4.5\" cap")] {
+                    for (target, l) in [(1.0, "1\""), (2.0, "2\""), (3.5, "3.5\" chest")] {
                         if ui.small_button(l).clicked() && b.width() > 0.0 {
                             self.hard_checkpoint();
                             scale_layers(&mut self.layers, b.center(), target * 25.4 / b.width());
                             self.dirty = true;
                         }
+                    }
+                    // largest size that fits the cap front (adult 4 × 2.25 in,
+                    // youth 4 × 2 in), keeping proportions
+                    let (cw, ch) = self.recipe.cap_size.limit();
+                    let cap_lbl = match self.recipe.cap_size {
+                        settings::CapSize::Adult => "Fit cap",
+                        settings::CapSize::Youth => "Fit youth cap",
+                    };
+                    if ui
+                        .small_button(cap_lbl)
+                        .on_hover_text(format!("As big as fits a {} front", self.recipe.cap_size.label()))
+                        .clicked()
+                        && b.width() > 0.0
+                        && b.height() > 0.0
+                    {
+                        self.hard_checkpoint();
+                        let k = (cw / b.width()).min(ch / b.height());
+                        scale_layers(&mut self.layers, b.center(), k);
+                        self.dirty = true;
                     }
                 });
             }
@@ -3804,12 +4035,26 @@ impl App {
                 let before = self.profile;
                 ui.selectable_value(&mut self.profile, Profile::Flat, "Flat goods");
                 ui.selectable_value(&mut self.profile, Profile::Cap, "Cap (center-out)");
+                if self.profile == Profile::Cap {
+                    let before = self.recipe.cap_size;
+                    egui::ComboBox::from_id_salt("cap-size")
+                        .selected_text(self.recipe.cap_size.label())
+                        .show_ui(ui, |ui| {
+                            for c in [settings::CapSize::Adult, settings::CapSize::Youth] {
+                                ui.selectable_value(&mut self.recipe.cap_size, c, c.label());
+                            }
+                        });
+                    if self.recipe.cap_size != before {
+                        self.dirty = true;
+                    }
+                }
                 if self.profile != before {
                     self.fabric = self.profile.default_recipe().into();
                     self.recipe = {
-                        let w = self.recipe.weight;
+                        let (w, cs) = (self.recipe.weight, self.recipe.cap_size);
                         let mut r = settings::recipe(&self.fabric).unwrap();
                         r.weight = w;
+                        r.cap_size = cs;
                         r
                     };
                     self.dirty = true;
@@ -3825,9 +4070,10 @@ impl App {
                 });
                 if self.fabric != before {
                     self.recipe = {
-                        let w = self.recipe.weight;
+                        let (w, cs) = (self.recipe.weight, self.recipe.cap_size);
                         let mut r = settings::recipe(&self.fabric).unwrap();
                         r.weight = w;
+                        r.cap_size = cs;
                         r
                     };
                     self.dirty = true;
@@ -3895,9 +4141,10 @@ impl App {
                 }
                 if ui.small_button("Reset to fabric defaults").clicked() {
                     self.recipe = {
-                        let w = self.recipe.weight;
+                        let (w, cs) = (self.recipe.weight, self.recipe.cap_size);
                         let mut r = settings::recipe(&self.fabric).unwrap();
                         r.weight = w;
+                        r.cap_size = cs;
                         r
                     };
                     self.dirty = true;
@@ -4041,10 +4288,13 @@ impl App {
                     .show_value(false),
             );
             ui.separator();
-            ui.selectable_value(&mut self.view, View::ThreeD, "3D")
-                .on_hover_text("Shaded thread view");
-            ui.selectable_value(&mut self.view, View::Flat, "Flat")
-                .on_hover_text("Plain lines");
+            for v in View::ALL {
+                ui.selectable_value(&mut self.view, v, v.label()).on_hover_text(match v {
+                    View::Vector => "The artwork: shapes and text to draw and edit (1)",
+                    View::ThreeD => "Stitches as thread on fabric (2)",
+                    View::Flat => "Stitches as plain lines (3)",
+                });
+            }
             ui.toggle_value(&mut self.show_jumps, "Jumps");
             // garment colour the design is shown on (also used on the sheet)
             let cur = self.job.garment_rgb.unwrap_or(CANVAS);
@@ -4088,6 +4338,28 @@ impl App {
     fn canvas(&mut self, ui: &mut egui::Ui, now: f64) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
+        if self.view == View::Vector {
+            self.refresh_vector_texture(ui.ctx());
+        }
+        // view switcher floating at the top left of the canvas
+        if self.machine.is_none() || self.view != View::Vector {
+            egui::Area::new(egui::Id::new("view-pill"))
+                .fixed_pos(rect.left_top() + Vec2::new(10.0, 10.0))
+                .order(egui::Order::Foreground)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (k, v) in View::ALL.iter().enumerate() {
+                                if self.machine.is_some() && *v == View::Vector {
+                                    continue;
+                                }
+                                ui.selectable_value(&mut self.view, *v, v.label())
+                                    .on_hover_text(format!("Press {}", k + 1));
+                            }
+                        });
+                    });
+                });
+        }
         let g = self.job.garment_rgb.unwrap_or(CANVAS);
         let fabric = Color32::from_rgb(g[0], g[1], g[2]);
         painter.rect_filled(rect, 0.0, fabric);
@@ -4359,13 +4631,21 @@ impl App {
                 view,
                 show_jumps,
                 rect.expand(20.0),
+                if o.puff { 2.2 } else { 1.0 },
             ));
         };
         let hide_layer = match self.edit {
             Edit::Stitches(_) if editing => self.edit_layer(),
             _ => None,
         };
-        for o in &d.objects {
+        let vector_view = self.view == View::Vector && self.machine.is_none();
+        if vector_view {
+            if let Some(vt) = &self.vec_tex {
+                let r = Rect::from_two_pos(to_screen(vt.origin), to_screen(vt.origin.add(vt.size)));
+                painter.image(vt.tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            }
+        }
+        for o in d.objects.iter().filter(|_| !vector_view) {
             if moving.is_some() && moving_set.contains(&o.layer) {
                 continue;
             }
@@ -4380,6 +4660,7 @@ impl App {
             draw_obj(o, Pt::new(0.0, 0.0), &painter);
         }
         if let Some(m) = moving {
+            // while moving, the moved layers show as stitches in every view
             for o in d.objects.iter().filter(|o| moving_set.contains(&o.layer)) {
                 draw_obj(o, m, &painter);
             }
@@ -6007,6 +6288,11 @@ impl eframe::App for App {
                     }
                 }
             }
+            for v in View::ALL {
+                if plain && ctx.input(|i| i.key_pressed(v.key())) {
+                    self.view = v;
+                }
+            }
             if (self.tool.draws() || self.tool == Tool::Measure)
                 && ctx.input(|i| i.key_pressed(egui::Key::Escape))
             {
@@ -6213,6 +6499,7 @@ fn stitch_shapes(
     view: View,
     show_jumps: bool,
     clip: Rect,
+    relief: f32,
 ) -> Vec<EShape> {
     let col = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
     let w = (0.38 * zoom).max(1.0);
@@ -6268,14 +6555,14 @@ fn stitch_shapes(
                 }
             }
         }
-        View::ThreeD => {
+        View::ThreeD | View::Vector => {
             // Thread as it lies on fabric: each stitch is a rounded strand
             // that tapers and darkens where it dives into the needle holes,
             // casts a soft shadow, and catches the light by its angle (so
             // satin shows long glossy strands and tatami its woven,
             // brick-like texture from the staggered needle points).
             let light = Vec2::new(-0.45, -0.9).normalized(); // from the upper left
-            let shadow_off = Vec2::new(0.22, 0.38) * w;
+            let shadow_off = Vec2::new(0.22, 0.38) * w * relief;
             let detailed = w >= 2.2;
             let across: &[(f32, f32)] = if detailed {
                 // (position across the strand, base shading) — lit edge first
@@ -6284,9 +6571,14 @@ fn stitch_shapes(
                 &[(1.0, 0.02), (0.0, 0.0), (-1.0, -0.3)]
             };
             let mut mesh = egui::Mesh::default();
+            let px_per_mm = zoom / 1.0;
             for r in runs.iter().filter(|r| r.len() >= 2) {
-                for s in r.windows(2) {
-                    let (a, b) = (s[0], s[1]);
+                let unit = |i: usize, j: usize| -> Option<Vec2> {
+                    let v = r[j] - r[i];
+                    (v.length() > 0.2).then(|| v.normalized())
+                };
+                for si in 1..r.len() {
+                    let (a, b) = (r[si - 1], r[si]);
                     let v = b - a;
                     let len = v.length();
                     if len < 0.3
@@ -6297,6 +6589,15 @@ fn stitch_shapes(
                         continue;
                     }
                     let dir = v / len;
+                    // satin: neighbours run back the other way (zigzag), none
+                    // runs across (a fill row's turn); split satin pieces keep
+                    // one neighbour in line and get their own bevel each
+                    let prev = if si >= 2 { unit(si - 2, si - 1) } else { None };
+                    let next = if si + 1 < r.len() { unit(si, si + 1) } else { None };
+                    let dots: Vec<f32> = [prev, next].iter().flatten().map(|d| d.dot(dir)).collect();
+                    let satin = len / px_per_mm >= 0.7
+                        && dots.iter().any(|d| *d < -0.7)
+                        && dots.iter().all(|d| d.abs() > 0.5);
                     let mut n = Vec2::new(-dir.y, dir.x);
                     if n.dot(light) < 0.0 {
                         n = -n; // +n points toward the light
@@ -6318,7 +6619,28 @@ fn stitch_shapes(
                         (len - tl * 0.45, 0.88, -0.12),
                         (len, 0.62, -0.3),
                     ];
-                    let stations: &[(f32, f32, f32)] = if detailed { &st } else { &[(0.0, 0.6, -0.25), (len * 0.5, 1.0, 0.0), (len, 0.6, -0.25)] };
+                    // satin columns are rounded: a bevel along each stitch,
+                    // lit on the side facing the light, darker toward the
+                    // edges (puff: taller)
+                    let bevel_st: [(f32, f32, f32); 9];
+                    let stations: &[(f32, f32, f32)] = if detailed && satin {
+                        let dl = dir.dot(light);
+                        let bev = |t: f32| -> f32 {
+                            let u = (t / len).clamp(0.0, 1.0);
+                            let pi = std::f32::consts::PI;
+                            relief * (-0.2 * (pi * u).cos() * dl + 0.1 * ((pi * u).sin() - 0.6))
+                        };
+                        let tl2 = tl.min(len * 0.2);
+                        let ts = [0.0, tl2 * 0.45, tl2, len * 0.3, len * 0.5, len * 0.7, len - tl2, len - tl2 * 0.45, len];
+                        let wf = [0.62, 0.88, 1.0, 1.0, 1.0, 1.0, 1.0, 0.88, 0.62];
+                        let dk = [-0.3, -0.12, 0.0, 0.0, 0.0, 0.0, 0.0, -0.12, -0.3];
+                        bevel_st = std::array::from_fn(|k| (ts[k], wf[k], dk[k] + bev(ts[k])));
+                        &bevel_st
+                    } else if detailed {
+                        &st
+                    } else {
+                        &[(0.0, 0.6, -0.25), (len * 0.5, 1.0, 0.0), (len, 0.6, -0.25)]
+                    };
                     // soft shadow on the fabric under the strand
                     if detailed {
                         let base = mesh.vertices.len() as u32;

@@ -178,12 +178,113 @@ pub struct ShapeOpts {
     /// Thread weight for this layer (None = the design's weight, 40 wt by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<crate::thread::ThreadWeight>,
+
+    // ---- satin and fill specifics ----
+    /// Underlay under satin (Auto picks by width; Off = none).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub satin_underlay: Underlay,
+    /// Underlay under fills.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub fill_underlay: Underlay,
+    /// Longest satin stitch before it is split (mm); None = 8 mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_width: Option<f64>,
+    /// Short stitches on the inside of curves (None = on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_stitches: Option<bool>,
+    /// 3D puff: sewn over foam (satin only), with a stop to place the foam.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub puff: bool,
+    /// Foam thickness for puff (mm); None = 3 mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foam_mm: Option<f64>,
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+/// What sews under the top stitching to hold the fabric and give loft.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Underlay {
+    /// Chosen by stitch type, width and garment.
+    #[default]
+    Auto,
+    Off,
+    /// One run down the middle (narrow satin, small lettering).
+    CenterRun,
+    /// A run just inside the edges (crisp edges, stops the fabric creeping).
+    EdgeRun,
+    /// A zigzag inside the column (loft for wider satin).
+    Zigzag,
+    /// Edge run, then zigzag (wide satin, caps, raised look).
+    EdgeZigzag,
+    /// Two zigzag passes (very wide satin, thick fabric).
+    DoubleZigzag,
+    /// Sparse rows across the fill direction (standard fill underlay).
+    Tatami,
+    /// Edge run, then tatami rows (fills on caps, knits, fleece).
+    EdgeTatami,
+    /// Tatami rows both ways (heavy fabric, big fills).
+    DoubleTatami,
+}
+
+impl Underlay {
+    pub const SATIN: [Underlay; 7] = [
+        Underlay::Auto,
+        Underlay::CenterRun,
+        Underlay::EdgeRun,
+        Underlay::Zigzag,
+        Underlay::EdgeZigzag,
+        Underlay::DoubleZigzag,
+        Underlay::Off,
+    ];
+    pub const FILL: [Underlay; 6] = [
+        Underlay::Auto,
+        Underlay::Tatami,
+        Underlay::EdgeRun,
+        Underlay::EdgeTatami,
+        Underlay::DoubleTatami,
+        Underlay::Off,
+    ];
+    pub fn label(&self) -> &'static str {
+        match self {
+            Underlay::Auto => "Auto",
+            Underlay::Off => "None",
+            Underlay::CenterRun => "Center run",
+            Underlay::EdgeRun => "Edge run",
+            Underlay::Zigzag => "Zigzag",
+            Underlay::EdgeZigzag => "Edge run + zigzag",
+            Underlay::DoubleZigzag => "Double zigzag",
+            Underlay::Tatami => "Tatami (across)",
+            Underlay::EdgeTatami => "Edge run + tatami",
+            Underlay::DoubleTatami => "Double tatami",
+        }
+    }
+    pub fn hint(&self) -> &'static str {
+        match self {
+            Underlay::Auto => "Center run for narrow columns, zigzag for wide; edge run added on caps",
+            Underlay::Off => "No underlay (very small text on stretchy fabric only)",
+            Underlay::CenterRun => "Small lettering and narrow columns (under about 2 mm)",
+            Underlay::EdgeRun => "Crisp edges; holds the fabric at the outline",
+            Underlay::Zigzag => "Loft and support for columns 2–5 mm",
+            Underlay::EdgeZigzag => "Wide satin, caps and borders",
+            Underlay::DoubleZigzag => "Extra loft for very wide satin or thick fabric",
+            Underlay::Tatami => "Standard support under fills",
+            Underlay::EdgeTatami => "Fills on caps, knits and fleece",
+            Underlay::DoubleTatami => "Heavy fabric or very large fills",
+        }
+    }
 }
 
 impl ShapeOpts {
     /// Does this layer change any stitch setting from the fabric defaults?
     pub fn has_own_settings(&self) -> bool {
-        self.density.is_some()
+        self.satin_underlay != Underlay::Auto
+            || self.fill_underlay != Underlay::Auto
+            || self.split_width.is_some()
+            || self.short_stitches.is_some()
+            || self.density.is_some()
             || self.stitch_len.is_some()
             || self.pull_comp.is_some()
             || self.underlay_spacing.is_some()
@@ -530,6 +631,87 @@ pub fn load_text(
     load_text_with(&opt, text, &fam, rgb)
 }
 
+/// How lines of text line up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextAlign {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
+
+/// Spacing for text, in the font's units at 200 px size.
+#[derive(Clone, Debug)]
+pub struct TextLayout {
+    pub letter_px: f64,
+    pub word_px: f64,
+    pub line: f64,
+    pub kern_px: Vec<f64>,
+    pub align: TextAlign,
+}
+
+/// Text to artwork with letter, word and line spacing, per-letter kerning
+/// and alignment (the font engine lays it out, so it stays real text).
+pub fn load_text_laid_out(
+    opt: &usvg::Options,
+    text: &str,
+    fam: &str,
+    rgb: [u8; 3],
+    lay: &TextLayout,
+) -> Result<Artwork, String> {
+    let esc = |c: char| match c {
+        '&' => "&amp;".to_string(),
+        '<' => "&lt;".to_string(),
+        '>' => "&gt;".to_string(),
+        c => c.to_string(),
+    };
+    let fam_esc = fam.replace('"', "").replace('\'', "");
+    let (x, anchor) = match lay.align {
+        TextAlign::Left => (10.0, "start"),
+        TextAlign::Center => (3000.0, "middle"),
+        TextAlign::Right => (5990.0, "end"),
+    };
+    let mut idx = 0usize;
+    let mut lines = String::new();
+    let n_lines = text.lines().count().max(1);
+    for (i, l) in text.lines().enumerate() {
+        let chars: Vec<char> = l.chars().collect();
+        let dx: Vec<String> = chars
+            .iter()
+            .enumerate()
+            .map(|(k, _)| {
+                let v = if k == 0 { 0.0 } else { lay.kern_px.get(idx + k).copied().unwrap_or(0.0) };
+                format!("{v:.2}")
+            })
+            .collect();
+        idx += chars.len();
+        let body: String = if chars.is_empty() { " ".into() } else { chars.iter().map(|c| esc(*c)).collect() };
+        lines.push_str(&format!(
+            "<tspan x='{x}' y='{:.1}' dx='{}'>{}</tspan>",
+            300.0 + i as f64 * 240.0 * lay.line,
+            dx.join(" "),
+            body
+        ));
+    }
+    let svg = format!(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='6000' height='{:.0}'>\
+         <text xml:space='preserve' font-family=\"'{fam_esc}'\" font-size='200' text-anchor='{anchor}' \
+         letter-spacing='{:.2}' word-spacing='{:.2}' fill='#{:02x}{:02x}{:02x}'>{lines}</text></svg>",
+        400.0 + 240.0 * lay.line * n_lines as f64,
+        lay.letter_px,
+        lay.word_px,
+        rgb[0],
+        rgb[1],
+        rgb[2]
+    );
+    let mut art = load_svg_str(&svg, opt)?;
+    for s in &mut art.shapes {
+        s.label = text.lines().next().unwrap_or("Text").to_string();
+        s.group = 0;
+    }
+    Ok(art)
+}
+
 /// Text to artwork with an already-loaded font database (fast for the app).
 pub fn load_text_with(
     opt: &usvg::Options,
@@ -615,6 +797,12 @@ pub fn apply_id_tags(opts: &mut ShapeOpts, id: &str) {
     for w in crate::thread::ThreadWeight::ALL {
         if id.contains(&format!("sf-{}wt", w.number())) {
             opts.weight = Some(w);
+        }
+    }
+    if id.contains("sf-puff") {
+        opts.puff = true;
+        if opts.stitch == StitchChoice::Auto {
+            opts.stitch = StitchChoice::Satin;
         }
     }
     if id.contains("sf-no-underlay") {

@@ -3,7 +3,7 @@
 
 use crate::geom::*;
 use crate::fills::{self, Field};
-use crate::import::{Artwork, Cap, Corner, FillPattern, ShapeKind, ShapeOpts, StitchChoice};
+use crate::import::{Artwork, Cap, Corner, FillPattern, ShapeKind, ShapeOpts, StitchChoice, Underlay};
 use crate::settings::{Limits, Profile, Recipe};
 use crate::thread::{Thread, nearest};
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,9 @@ pub struct Planned {
     pub stop: Option<bool>,
     /// The layer's stitch choices (underlay, cut-out, widths, corners, caps).
     pub opts: ShapeOpts,
+    /// 3D puff: 0 = not puff, 1 = the contour sewn before the foam goes on,
+    /// 2 = the tack-down, satin and end caps sewn over the foam.
+    pub puff_stage: u8,
 }
 
 /// Overlap left under an upper layer's edge so no fabric shows (mm).
@@ -168,6 +171,7 @@ pub fn plan(
                 layer: o.layer,
                 stop: o.stop,
                 opts: o.clone(),
+                puff_stage: 0,
             };
         match &s.kind {
             ShapeKind::Area {
@@ -229,6 +233,7 @@ pub fn plan(
                     let mut satin_angle = pa + FRAC_PI_2;
                     let mut kind = StitchType::Fill;
                     let consider_satin = match o.stitch {
+                        _ if o.puff => true,
                         StitchChoice::Fill => false,
                         StitchChoice::Satin => true,
                         _ => thickness <= Limits::SATIN_THICKNESS,
@@ -253,7 +258,7 @@ pub fn plan(
                             }
                         }
                         satin_angle = best.1;
-                        if o.stitch == StitchChoice::Satin || best.2 <= Limits::SATIN_MAX * 1.25 {
+                        if o.stitch == StitchChoice::Satin || o.puff || best.2 <= Limits::SATIN_MAX * 1.25 {
                             kind = StitchType::Satin;
                         }
                     }
@@ -329,15 +334,54 @@ pub fn effective(r: &Recipe, o: &ShapeOpts) -> Recipe {
     if let Some(v) = o.underlay_inset {
         e.underlay_inset = v.clamp(0.0, 3.0);
     }
+    // 3D puff: satin packed about twice as tight so it covers and cuts the
+    // foam cleanly, with a little more pull compensation over the foam
+    if o.puff {
+        if o.density.is_none() {
+            e.satin_spacing = 0.2;
+        }
+        if o.pull_comp.is_none() {
+            e.pull_comp += 0.1;
+        }
+    }
     e
 }
 
 impl Planned {
+    /// Longest satin stitch before it is split (mm).
+    pub fn satin_max(&self) -> f64 {
+        // puff columns stay whole (a split would cut the foam open)
+        let default = if self.opts.puff { 12.0 } else { Limits::SATIN_MAX };
+        self.opts.split_width.unwrap_or(default).clamp(3.0, 12.5)
+    }
+    fn short_stitches(&self) -> bool {
+        self.opts.short_stitches.unwrap_or(true)
+    }
+    /// Satin underlay actually used for a column of this average width (mm).
+    fn satin_underlay(&self, width: f64, profile: Profile) -> Underlay {
+        if self.opts.no_underlay || self.puff_stage == 2 {
+            return Underlay::Off;
+        }
+        match self.opts.satin_underlay {
+            Underlay::Auto | Underlay::Tatami | Underlay::EdgeTatami | Underlay::DoubleTatami => {
+                if width <= 3.5 {
+                    Underlay::CenterRun
+                } else if profile == Profile::Cap {
+                    Underlay::EdgeZigzag
+                } else {
+                    Underlay::Zigzag
+                }
+            }
+            u => u,
+        }
+    }
     /// What the operator sheet and layer list call this object's stitching.
     pub fn stitch_label(&self) -> &'static str {
         match self.kind {
             StitchType::Fill => self.opts.fill.short(),
             // auto-angle satin areas follow each stroke (turning satin)
+            _ if self.puff_stage == 1 => "Puff contour",
+            _ if self.puff_stage == 2 => "3D puff satin",
             StitchType::Satin if self.opts.angle_deg.is_none() && self.knockouts.is_empty() => {
                 "Turning satin"
             }
@@ -347,21 +391,68 @@ impl Planned {
 }
 
 pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Needle> {
+    match (p.puff_stage, &p.shape) {
+        // before the foam: the outline, so the foam has a place and the
+        // fabric is held
+        (1, ShapeKind::Area { rings, rule }) => {
+            let mut out = Vec::new();
+            edge_run(&mut out, rings, *rule, 0.3, from);
+            out
+        }
+        (1, ShapeKind::Line { paths, .. }) => {
+            let mut out = Vec::new();
+            for path in paths {
+                push_section(&mut out, &resample(path, Limits::RUN_LEN), Limits::RUN_LEN);
+            }
+            out
+        }
+        // over the foam: tack it down at the outline, satin over it with no
+        // underlay, then cap the column ends
+        (2, ShapeKind::Area { rings, rule }) => {
+            let e = effective(r, &p.opts);
+            let mut out = Vec::new();
+            let cur = edge_run(&mut out, rings, *rule, 0.5, from);
+            let top = generate_top(p, r, profile, cur);
+            match top.first() {
+                Some(first) if !out.is_empty() => {
+                    start_in_shape(&mut out, rings, *rule, &[first.p], Limits::RUN_LEN, &|_| true);
+                    out.extend(top.into_iter().skip(1));
+                }
+                _ => out.extend(top),
+            }
+            puff_caps(&mut out, rings, *rule, e.satin_spacing);
+            out
+        }
+        _ => generate_top(p, r, profile, from),
+    }
+}
+
+fn generate_top(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Needle> {
     let r = &effective(r, &p.opts);
+    let smax = p.satin_max();
     let mut out = Vec::new();
     let pc = r.pull_comp + if profile == Profile::Cap { 0.05 } else { 0.0 };
     match (&p.shape, p.kind) {
         (ShapeKind::Area { rings, rule }, StitchType::Fill) => {
             let mut cur = from;
-            // Underlay: perpendicular sparse rows; caps get a second, parallel layer.
-            let mut layers = vec![p.angle + FRAC_PI_2];
-            if profile == Profile::Cap {
-                layers.push(p.angle);
-            }
-            if p.opts.no_underlay {
-                layers.clear();
-            }
+            // Underlay. Auto: rows across the fill; on caps an edge run
+            // first and a second, parallel layer of rows.
+            let across = p.angle + FRAC_PI_2;
+            let cap = profile == Profile::Cap;
+            let kind = if p.opts.no_underlay { Underlay::Off } else { p.opts.fill_underlay };
+            let (edge, layers): (bool, Vec<f64>) = match kind {
+                Underlay::Off => (false, vec![]),
+                Underlay::Tatami => (false, vec![across]),
+                Underlay::EdgeRun => (true, vec![]),
+                Underlay::EdgeTatami => (true, vec![across]),
+                Underlay::DoubleTatami => (false, vec![across, p.angle]),
+                _ if cap => (true, vec![across, p.angle]),
+                _ => (false, vec![across]),
+            };
             let inset = r.underlay_inset;
+            if edge {
+                cur = edge_run(&mut out, rings, *rule, inset.max(0.4), cur);
+            }
             for a in layers {
                 let rows = p.rows(rings, *rule, a, r.underlay_spacing, 2.0 * inset + 0.6);
                 // Underlay travel is always buried under the top stitching.
@@ -408,7 +499,7 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
         (ShapeKind::Area { rings, rule }, _)
             if p.opts.angle_deg.is_none() && p.knockouts.is_empty() && {
                 let pc = pc + p.opts.widen / 2.0;
-                turning_satin(&mut out, p, rings, *rule, r, pc, from)
+                turning_satin(&mut out, p, rings, *rule, r, pc, from, profile)
             } => {}
         (ShapeKind::Area { rings, rule }, _) => {
             out.clear();
@@ -506,8 +597,9 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
                     rows,
                     angle,
                     pc,
-                    r.satin_spacing,
+                    r,
                     cur,
+                    profile,
                 );
             }
         }
@@ -520,26 +612,29 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
                         let half = width / 2.0 + pc;
                         let closed = path.len() > 2 && path[0].dist(*path.last().unwrap()) < 0.05;
                         let ribs = column_ribs(&path, half, p.opts.corner, p.opts.cap, closed);
-                        if !p.opts.no_underlay {
-                            // centre run out, satin back over it
-                            push_section(
-                                &mut out,
-                                &resample(&path, Limits::RUN_LEN),
-                                Limits::RUN_LEN,
-                            );
+                        let kind = p.satin_underlay(width, profile);
+                        if kind != Underlay::Off {
+                            // underlay out, satin back over it
+                            satin_underlay_out(&mut out, kind, &path, &ribs, r, pc, true);
                             let back: Vec<(Pt, Pt)> = ribs.iter().rev().copied().collect();
-                            let zz = ribs_to_zigzag(&back, r.satin_spacing / 2.0);
+                            let mut zz = ribs_to_zigzag(&back, r.satin_spacing / 2.0);
+                            if p.short_stitches() {
+                                zz = short_stitches(&zz, r.satin_spacing);
+                            }
                             push_continue(
                                 &mut out,
-                                &split_long(&zz, Limits::SATIN_MAX),
-                                Limits::SATIN_MAX,
+                                &split_long(&zz, smax),
+                                smax,
                             );
                         } else {
-                            let zz = ribs_to_zigzag(&ribs, r.satin_spacing / 2.0);
+                            let mut zz = ribs_to_zigzag(&ribs, r.satin_spacing / 2.0);
+                            if p.short_stitches() {
+                                zz = short_stitches(&zz, r.satin_spacing);
+                            }
                             push_section(
                                 &mut out,
-                                &split_long(&zz, Limits::SATIN_MAX),
-                                Limits::SATIN_MAX,
+                                &split_long(&zz, smax),
+                                smax,
                             );
                         }
                     }
@@ -579,15 +674,15 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
                             if out.is_empty() || (p.opts.no_underlay && k + 1 == n) {
                                 push_section(
                                     &mut out,
-                                    &split_long(&sides, Limits::SATIN_MAX),
-                                    Limits::SATIN_MAX,
+                                    &split_long(&sides, smax),
+                                    smax,
                                 );
                                 continue;
                             }
                             push_continue(
                                 &mut out,
-                                &split_long(&sides, Limits::SATIN_MAX),
-                                Limits::SATIN_MAX,
+                                &split_long(&sides, smax),
+                                smax,
                             );
                         }
                     }
@@ -606,6 +701,197 @@ pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
         }
     }
     out
+}
+
+
+/// Edge run: a running stitch just inside every outline of a shape, nearest
+/// outline first. Returns where the needle ends.
+fn edge_run(out: &mut Vec<Needle>, rings: &[Ring], rule: FillRule, inset: f64, mut cur: Pt) -> Pt {
+    let inner = crate::vector::offset(rings, rule, -inset.max(0.1), true);
+    let mut left: Vec<Ring> = inner
+        .into_iter()
+        .filter(|r| r.len() >= 3 && r.windows(2).map(|w| w[0].dist(w[1])).sum::<f64>() > 1.0)
+        .collect();
+    while !left.is_empty() {
+        let (ri, vi) = left
+            .iter()
+            .enumerate()
+            .flat_map(|(ri, r)| r.iter().enumerate().map(move |(vi, q)| (ri, vi, q.dist(cur))))
+            .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+            .map(|(ri, vi, _)| (ri, vi))
+            .unwrap();
+        let mut ring = left.remove(ri);
+        ring.rotate_left(vi);
+        let first = ring[0];
+        ring.push(first);
+        let pts = resample(&ring, Limits::RUN_LEN);
+        start_in_shape(out, rings, rule, &pts, Limits::RUN_LEN, &|_| true);
+        cur = out.last().map(|n| n.p).unwrap_or(cur);
+    }
+    cur
+}
+
+/// Underlay along a satin column on the way out, ending at its far end so
+/// the satin can come back over it. `ribs` run edge to edge along `path`.
+#[allow(clippy::too_many_arguments)]
+fn satin_underlay_out(
+    out: &mut Vec<Needle>,
+    kind: Underlay,
+    path: &[Pt],
+    ribs: &[(Pt, Pt)],
+    r: &Recipe,
+    pc: f64,
+    first: bool,
+) {
+    let push = |out: &mut Vec<Needle>, pts: &[Pt], max: f64, first: bool| {
+        if pts.len() < 2 {
+            return;
+        }
+        if first {
+            push_section(out, pts, max);
+        } else {
+            push_continue(out, &pts[1..], max);
+        }
+    };
+    let inset_ribs = |inset: f64| -> Vec<(Pt, Pt)> {
+        ribs.iter()
+            .map(|(a, b)| {
+                let m = a.lerp(*b, 0.5);
+                let h = (a.dist(*b) / 2.0 - inset).max(0.15);
+                let d = a.sub(*b).norm();
+                (m.add(d.mul(h)), m.sub(d.mul(h)))
+            })
+            .collect()
+    };
+    let center = resample(path, Limits::RUN_LEN);
+    let edges = |out: &mut Vec<Needle>, first: bool| {
+        // out along one edge, back along the other
+        let e = inset_ribs((r.underlay_inset * 0.6 + pc).max(0.35));
+        let left: Vec<Pt> = e.iter().map(|x| x.0).collect();
+        let right: Vec<Pt> = e.iter().rev().map(|x| x.1).collect();
+        push(out, &resample(&left, Limits::RUN_LEN), Limits::RUN_LEN, first);
+        let right = resample(&right, Limits::RUN_LEN);
+        push_continue(out, &right, Limits::RUN_LEN);
+    };
+    let zig = |out: &mut Vec<Needle>, first: bool| {
+        let inner = inset_ribs(r.underlay_inset + pc);
+        let zz = ribs_to_zigzag(&inner, r.underlay_spacing.min(2.0) / 2.0);
+        push(out, &zz, Limits::SATIN_MAX, first);
+    };
+    match kind {
+        Underlay::EdgeRun => {
+            edges(out, first);
+            push_continue(out, &center, Limits::RUN_LEN);
+        }
+        Underlay::Zigzag => zig(out, first),
+        Underlay::EdgeZigzag => {
+            edges(out, first);
+            zig(out, false);
+        }
+        Underlay::DoubleZigzag => {
+            zig(out, first);
+            let back: Vec<(Pt, Pt)> = inset_ribs(r.underlay_inset + pc).into_iter().rev().map(|(a, b)| (b, a)).collect();
+            let zz = ribs_to_zigzag(&back, r.underlay_spacing.min(2.0) / 2.0 * 0.8);
+            push_continue(out, &zz, Limits::SATIN_MAX);
+            push_continue(out, &center, Limits::RUN_LEN);
+        }
+        // center run (also how the needle travels when there is no underlay)
+        _ => push(out, &center, Limits::RUN_LEN, first),
+    }
+}
+
+/// Short stitches: where a satin column curves, the inside edge crowds with
+/// needle holes. Every other stitch there stops short of the inside edge.
+/// `zz` alternates sides (even = one edge, odd = the other).
+fn short_stitches(zz: &[Pt], density: f64) -> Vec<Pt> {
+    let n = zz.len();
+    if n < 6 {
+        return zz.to_vec();
+    }
+    let mut out = zz.to_vec();
+    let mut flip = [false, false];
+    for i in 2..n - 2 {
+        let same = zz[i].dist(zz[i - 2]);
+        let other = zz[i - 1].dist(zz[i + 1]);
+        let side = i % 2;
+        if same < other * 0.55 && same < density * 0.8 {
+            flip[side] = !flip[side];
+            if flip[side] {
+                // pull this end 1/3 of the way across, toward the other edge
+                let across = zz[i - 1].lerp(zz[i + 1], 0.5);
+                out[i] = zz[i].lerp(across, 0.33);
+            }
+        } else {
+            flip[side] = false;
+        }
+    }
+    out
+}
+
+#[doc(hidden)]
+pub fn short_stitches_for_test(zz: &[Pt], density: f64) -> Vec<Pt> {
+    short_stitches(zz, density)
+}
+
+/// 3D puff end caps: at every free end of a column, a few tight stitches
+/// run along the column and slightly past its end, so the satin wraps and
+/// cuts the foam there instead of leaving it open.
+fn puff_caps(out: &mut Vec<Needle>, rings: &[Ring], rule: FillRule, density: f64) {
+    use crate::skeleton::skeleton;
+    let b = BBox::of(rings.iter().flatten());
+    let res = (b.width().max(b.height()) / 500.0).clamp(0.04, 0.12);
+    let field = Field::new(rings, rule, res);
+    let g = skeleton(&field);
+    for (n, node) in g.nodes.iter().enumerate() {
+        if g.degree(n) != 1 {
+            continue;
+        }
+        let Some(e) = g.edges.iter().find(|e| e.a == n || e.b == n) else { continue };
+        let pts: Vec<Pt> = if e.a == n { e.pts.clone() } else { e.pts.iter().rev().copied().collect() };
+        if pts.len() < 2 {
+            continue;
+        }
+        // direction into the column over its first ~1 mm
+        let mut k = 1;
+        while k + 1 < pts.len() && pts[k].dist(pts[0]) < 1.0 {
+            k += 1;
+        }
+        let into = pts[k].sub(pts[0]);
+        if into.len() < 1e-6 {
+            continue;
+        }
+        let into = into.norm();
+        let outw = into.mul(-1.0);
+        let nrm = Pt::new(-into.y, into.x);
+        let hw = field.at(*node).max(0.3);
+        // where the shape actually ends past the node
+        let reach = |c: Pt| -> f64 {
+            let mut x = 0.0;
+            while x < hw * 3.0 + 1.0 && field.at(c.add(outw.mul(x))) > 0.0 {
+                x += 0.05;
+            }
+            x
+        };
+        let span = hw * 1.15;
+        // satin across the end: alternate base and tip, density/2 apart
+        let steps = ((2.0 * span) / (density / 2.0)).ceil().max(4.0) as usize;
+        let mut cap: Vec<Pt> = Vec::new();
+        for j in 0..=steps {
+            let t = -span + 2.0 * span * j as f64 / steps as f64;
+            let c = node.add(nrm.mul(t));
+            if field.at(c) < -0.3 {
+                continue;
+            }
+            if j % 2 == 0 {
+                cap.push(c.sub(outw.mul(hw.min(1.2))));
+            } else {
+                cap.push(c.add(outw.mul(reach(c) + 0.3)));
+            }
+        }
+        if cap.len() >= 4 {
+            start_in_shape(out, rings, rule, &cap, Limits::SATIN_MAX, &|_| true);
+        }
+    }
 }
 
 /// Join the next piece of a shaped fill: a direct stitch when it is close,
@@ -716,7 +1002,9 @@ fn turning_satin(
     r: &Recipe,
     pc: f64,
     from: Pt,
+    profile: Profile,
 ) -> bool {
+    let smax = p.satin_max();
     use crate::skeleton::{Graph, skeleton};
     let b = BBox::of(rings.iter().flatten());
     let res = (b.width().max(b.height()) / 500.0).clamp(0.04, 0.12);
@@ -981,38 +1269,28 @@ fn turning_satin(
             .filter(|v| v.len() >= 2)
             .collect()
     };
-    let underlay = !p.opts.no_underlay;
     let step = r.satin_spacing / 2.0;
+    let shorten = p.short_stitches();
     let sew_back = |out: &mut Vec<Needle>, back: &[Vec<(Pt, Pt)>]| {
         for piece in back {
             if piece.len() < 2 {
                 continue;
             }
-            let zz = ribs_to_zigzag(piece, step);
-            push_continue(out, &split_long(&zz, Limits::SATIN_MAX), Limits::SATIN_MAX);
+            let mut zz = ribs_to_zigzag(piece, step);
+            if shorten {
+                zz = short_stitches(&zz, r.satin_spacing);
+            }
+            push_continue(out, &split_long(&zz, smax), smax);
         }
     };
-    // Out along a stroke: centre run (or a light zig-zag on wide strokes).
+    // Out along a stroke: its underlay (a centre run on narrow strokes,
+    // zig-zag or edge runs on wide ones), which is also how the needle
+    // travels to the far end, hidden under the satin.
     let run_out = |out: &mut Vec<Needle>, path: &[Pt], fwd: &[Vec<(Pt, Pt)>]| {
         let fwd: Vec<(Pt, Pt)> = fwd.iter().flatten().copied().collect();
-        let wide = fwd.iter().map(|(a, b)| a.dist(*b)).sum::<f64>() / fwd.len().max(1) as f64 > 3.5;
-        if underlay && wide {
-            let inset = r.underlay_inset + pc;
-            let inner: Vec<(Pt, Pt)> = fwd
-                .iter()
-                .map(|(a, b)| {
-                    let m = a.lerp(*b, 0.5);
-                    let h = (a.dist(*b) / 2.0 - inset).max(0.2);
-                    let d = a.sub(*b).norm();
-                    (m.add(d.mul(h)), m.sub(d.mul(h)))
-                })
-                .collect();
-            let zz = ribs_to_zigzag(&inner, r.underlay_spacing.min(2.0) / 2.0);
-            push_continue(out, &zz, Limits::SATIN_MAX);
-        } else {
-            let pts = resample(path, Limits::RUN_LEN);
-            push_continue(out, &pts[1..], Limits::RUN_LEN);
-        }
+        let width = fwd.iter().map(|(a, b)| a.dist(*b)).sum::<f64>() / fwd.len().max(1) as f64;
+        let kind = p.satin_underlay(width, profile);
+        satin_underlay_out(out, kind, path, &fwd, r, pc, false);
     };
     let mut edge_done = vec![false; g.edges.len()];
     let mut node_seen = vec![false; g.nodes.len()];
@@ -1347,9 +1625,12 @@ fn sew_satin(
     rows: Vec<Vec<Seg>>,
     angle: f64,
     pc: f64,
-    density: f64,
+    r: &Recipe,
     mut cur: Pt,
+    profile: Profile,
 ) -> Pt {
+    let density = r.satin_spacing;
+    let smax = p.satin_max();
     for (run, rev) in order_runs(group_runs(rows), angle, cur, &|x, y| {
         travel_ok(rings, rule, x, y, &|q| p.covered(q))
     }) {
@@ -1373,22 +1654,19 @@ fn sew_satin(
                 Pt::new(x, s.y).rot(angle)
             })
             .collect();
-        if segs.len() >= 6 && !p.opts.no_underlay {
-            start_in_shape(out, rings, rule, &center, Limits::RUN_LEN, &|_| true);
-            push_continue(
-                out,
-                &split_long(&sides, Limits::SATIN_MAX),
-                Limits::SATIN_MAX,
-            );
+        let sides = if p.short_stitches() { short_stitches(&sides, density) } else { sides };
+        let width = segs.iter().map(|s| s.len()).sum::<f64>() / segs.len().max(1) as f64;
+        let kind = p.satin_underlay(width, profile);
+        if segs.len() >= 6 && kind != Underlay::Off {
+            let ribs: Vec<(Pt, Pt)> = segs
+                .iter()
+                .map(|s| (Pt::new(s.x0, s.y).rot(angle), Pt::new(s.x1, s.y).rot(angle)))
+                .collect();
+            start_in_shape(out, rings, rule, &center[..1], Limits::RUN_LEN, &|_| true);
+            satin_underlay_out(out, kind, &center, &ribs, r, pc, false);
+            push_continue(out, &split_long(&sides, smax), smax);
         } else {
-            start_in_shape(
-                out,
-                rings,
-                rule,
-                &split_long(&sides, Limits::SATIN_MAX),
-                Limits::SATIN_MAX,
-                &|q| p.covered(q),
-            );
+            start_in_shape(out, rings, rule, &split_long(&sides, smax), smax, &|q| p.covered(q));
         }
         cur = out.last().map(|n| n.p).unwrap_or(cur);
     }
@@ -1735,7 +2013,7 @@ fn split_long(sides: &[Pt], max: f64) -> Vec<Pt> {
         let d = a.dist(b);
         if d > max {
             let n = (d / max).ceil() as usize;
-            let shift = [0.0, 0.3, -0.3][k % 3] / n as f64;
+            let shift = [0.0, 0.12, -0.12][k % 3] / n as f64;
             for j in 1..n {
                 out.push(a.lerp(b, (j as f64 / n as f64 + shift).clamp(0.05, 0.95)));
             }
