@@ -238,8 +238,11 @@ fn prune(g: &mut Graph, field: &Field) {
                     return true;
                 };
                 let _ = leaf;
+                // A corner spur runs from the junction's inscribed circle out
+                // to a corner: about 1.4× that circle's radius. Real strokes
+                // (an ascender, a short arm) reach further.
                 let r = field.at(nodes[hub]).max(0.2);
-                path_len(&e.pts) > r * 2.0 + 0.5
+                path_len(&e.pts) > r * 1.5 + 0.3
             });
             changed |= g.edges.len() != before;
         }
@@ -261,10 +264,16 @@ fn prune(g: &mut Graph, field: &Field) {
             let stub = |k: usize| {
                 let e = &g.edges[k];
                 let other = if e.a == n { e.b } else { e.a };
-                degs[other] == 1 && path_len(&e.pts) < r * 3.2 + 0.8
+                degs[other] == 1 && path_len(&e.pts) < r * 1.7 + 0.4
             };
             let stubs: Vec<usize> = ids.iter().copied().filter(|&k| stub(k)).collect();
-            if stubs.len() == 2 {
+            // ...and only when the third path is clearly the stroke itself
+            let longest_stub = stubs.iter().map(|&k| path_len(&g.edges[k].pts)).fold(0.0, f64::max);
+            let main_ok = ids
+                .iter()
+                .filter(|k| !stubs.contains(k))
+                .all(|&k| path_len(&g.edges[k].pts) > longest_stub * 2.0);
+            if stubs.len() == 2 && main_ok {
                 let (hi, lo) = (stubs[0].max(stubs[1]), stubs[0].min(stubs[1]));
                 g.edges.remove(hi);
                 g.edges.remove(lo);

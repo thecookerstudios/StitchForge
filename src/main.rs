@@ -77,6 +77,9 @@ enum Command {
         /// Shrink names wider than this many inches
         #[arg(long)]
         max_width_in: Option<f64>,
+        /// Quantity column (letter or header): a name with Qty 3 sews 3 times
+        #[arg(long)]
+        qty: Option<String>,
         /// Machine formats, comma separated
         #[arg(long, default_value = "dst")]
         formats: String,
@@ -199,6 +202,7 @@ fn main() {
             per_drop,
             name_layer,
             max_width_in,
+            qty,
             formats,
             out_dir,
         } => run_drops(
@@ -211,6 +215,7 @@ fn main() {
             per_drop,
             name_layer,
             max_width_in,
+            qty,
             &formats,
             &out_dir,
         ),
@@ -379,6 +384,7 @@ fn run_drops(
     per_drop: Option<usize>,
     name_layer: Option<String>,
     max_width_in: Option<f64>,
+    qty: Option<String>,
     formats: &str,
     out_dir: &std::path::Path,
 ) -> Result<(), String> {
@@ -386,19 +392,23 @@ fn run_drops(
     let mut p = stitchforge::project::Project::load(project)?;
     let table = drops::read_table(data)?;
     let headers = table.headers(true);
-    let mut cols = Vec::new();
-    for c in columns.split(',').map(|c| c.trim()) {
+    let find_col = |c: &str| -> Result<usize, String> {
         let by_letter = (0..table.width()).find(|i| drops::col_letter(*i).eq_ignore_ascii_case(c));
         let by_name = headers.iter().position(|h| {
             h.to_lowercase()
                 .starts_with(&format!("{} (", c.to_lowercase()))
         });
-        cols.push(by_letter.or(by_name).ok_or(format!(
+        by_letter.or(by_name).ok_or(format!(
             "no column '{c}' in {} (columns: {})",
             table.source,
             headers.join(", ")
-        ))?);
+        ))
+    };
+    let mut cols = Vec::new();
+    for c in columns.split(',').map(|c| c.trim()) {
+        cols.push(find_col(c)?);
     }
+    let qty_col = qty.as_deref().map(|q| find_col(q.trim())).transpose()?;
     let first_row_headers = cols.iter().all(|c| {
         table.raw[0]
             .get(*c)
@@ -434,6 +444,7 @@ fn run_drops(
         .map(|l| l.id)
         .collect();
     s.max_width_mm = max_width_in.map(|w| w * 25.4);
+    s.qty_column = qty_col;
     let fmts: Vec<stitchforge::formats::Format> = formats
         .split(',')
         .map(|f| {

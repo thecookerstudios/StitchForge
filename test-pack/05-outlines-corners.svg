@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="108mm" height="88mm" viewBox="0 0 108 88">
+<polyline id="zigzag-satin-3mm" points="6,14 18,4 30,14 42,4 54,14 66,4 78,14" fill="none" stroke="#1c2b4a" stroke-width="3" stroke-linejoin="miter"/>
+<path id="star-outline-2.5mm" d="M20.000,25.000 L23.233,33.550 L32.364,33.983 L25.231,39.700 L27.641,48.517 L20.000,43.500 L12.359,48.517 L14.769,39.700 L7.636,33.983 L16.767,33.550 Z" fill="none" stroke="#b8202c" stroke-width="2.5"/>
+<rect id="rounded-box-1.2mm" x="40" y="26" width="32" height="22" rx="5" fill="none" stroke="#2f7d4f" stroke-width="1.2"/>
+<path id="s-curve-4mm-open" d="M80,26 C96,26 96,40 88,44 C80,48 80,60 96,60" fill="none" stroke="#e0a526" stroke-width="4" stroke-linecap="round"/>
+<path id="thin-run-0.4mm" d="M6,62 L40,62 L40,70 L74,70" fill="none" stroke="#1c2b4a" stroke-width="0.4"/>
+<path id="triple-run-0.8mm" d="M6,76 C20,68 30,84 44,76 C58,68 64,84 74,76" fill="none" stroke="#6b3d1e" stroke-width="0.8"/>
+<path id="heart-outline-2mm" d="M90,82 C78,74 78,66 84,66 C87,66 90,69 90,71 C90,69 93,66 96,66 C102,66 102,74 90,82 Z" fill="none" stroke="#b8202c" stroke-width="2"/>
+</svg>

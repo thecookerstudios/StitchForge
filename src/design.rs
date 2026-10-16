@@ -102,8 +102,8 @@ pub struct Design {
 /// Sequence objects. Stacking order is respected wherever objects overlap
 /// (a lower layer always sews before what covers it); within that rule:
 /// Flat — keep the current colour as long as possible, then stack order.
-/// Cap  — closest to the vertical centre line first, bottom first, and stay
-///        on the current colour when objects are equally central.
+/// Cap  — stay on the current colour while it has work; within a colour,
+///        closest to the vertical centre line first, bottom first.
 pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox, keep_order: bool) -> Vec<usize> {
     let n = objs.len();
     if keep_order {
@@ -160,9 +160,11 @@ pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox, keep_order: b
                 let color_change = (Some(o.thread) != cur_thread) as i64;
                 match profile {
                     Profile::Flat => (0, color_change, o.stack as i64, 0),
+                    // each colour center-out from the bottom; change colour
+                    // only when that colour has nothing left that can sew
                     Profile::Cap => (
-                        center_bucket(&o.bbox),
                         color_change,
+                        center_bucket(&o.bbox),
                         -(o.bbox.max.y * 10.0) as i64,
                         o.stack as i64,
                     ),
@@ -377,11 +379,23 @@ pub fn build_with(
             Limits::SHORT_STITCH
         ));
     }
+    // one colour warning per layer, not per letter or piece
+    let mut warned = std::collections::HashSet::new();
     for i in &infos {
-        if i.color_match_delta_e > 10.0 {
+        if i.color_match_delta_e > 10.0 && warned.insert(i.layer) {
+            let name = objs
+                .iter()
+                .find(|o| o.layer == i.layer)
+                .map(|o| match o.label.rsplit_once(' ') {
+                    // "Name 3" is piece 3 of layer "Name"
+                    Some((head, n)) if n.chars().all(|c| c.is_ascii_digit()) => head.to_string(),
+                    _ => o.label.clone(),
+                })
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| i.label.clone());
             warnings.push(format!(
                 "{}: closest thread {} is a loose color match (ΔE {:.0}); check the chart",
-                i.label, i.thread_code, i.color_match_delta_e
+                name, i.thread_code, i.color_match_delta_e
             ));
         }
     }

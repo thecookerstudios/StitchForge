@@ -717,6 +717,13 @@ fn turning_satin(
     let res = (b.width().max(b.height()) / 500.0).clamp(0.04, 0.12);
     let field = Field::new(rings, rule, res);
     let g: Graph = skeleton(&field);
+    if std::env::var("SF_DEBUG_SKEL").is_ok() {
+        eprintln!("skeleton: {} nodes, {} edges", g.nodes.len(), g.edges.len());
+        for (i, e) in g.edges.iter().enumerate() {
+            let l: f64 = e.pts.windows(2).map(|w| w[0].dist(w[1])).sum();
+            eprintln!("  e{i}: {}({:.1},{:.1}) -> {}({:.1},{:.1}) len {l:.2}", e.a, g.nodes[e.a].x, g.nodes[e.a].y, e.b, g.nodes[e.b].x, g.nodes[e.b].y);
+        }
+    }
     let total: f64 = g
         .edges
         .iter()
@@ -1142,7 +1149,69 @@ fn turning_satin(
             None => break,
         }
     }
-    out.len() > begin + 2
+    if out.len() <= begin + 2 {
+        return false;
+    }
+    // Safety net: the satin must actually cover the shape. If a stroke was
+    // missed (an odd centre line), use the regular satin instead.
+    let cov = coverage(&out[begin..], &field, b);
+    if cov < 0.95 {
+        if std::env::var("SF_DEBUG_SKEL").is_ok() {
+            eprintln!("turning satin covered {:.0}% of {}; using regular satin", cov * 100.0, p.label);
+        }
+        return false;
+    }
+    true
+}
+
+/// Share of the shape (sampled every 0.4 mm, away from the very edge) that
+/// lies within reach of a sewn stitch.
+fn coverage(needles: &[Needle], field: &Field, b: BBox) -> f64 {
+    let cell = 1.0;
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<(Pt, Pt)>> = Default::default();
+    for w in needles.windows(2) {
+        if w[1].jump {
+            continue;
+        }
+        let (a, c) = (w[0].p, w[1].p);
+        let (x0, x1) = (a.x.min(c.x), a.x.max(c.x));
+        let (y0, y1) = (a.y.min(c.y), a.y.max(c.y));
+        for gx in (x0 / cell).floor() as i64..=(x1 / cell).floor() as i64 {
+            for gy in (y0 / cell).floor() as i64..=(y1 / cell).floor() as i64 {
+                grid.entry((gx, gy)).or_default().push((a, c));
+            }
+        }
+    }
+    let seg_dist = |q: Pt, a: Pt, c: Pt| -> f64 {
+        let d = c.sub(a);
+        let l2 = d.x * d.x + d.y * d.y;
+        let t = if l2 < 1e-12 { 0.0 } else { (((q.x - a.x) * d.x + (q.y - a.y) * d.y) / l2).clamp(0.0, 1.0) };
+        q.dist(a.add(d.mul(t)))
+    };
+    let (mut inside, mut hit) = (0usize, 0usize);
+    let step = 0.4;
+    let mut y = b.min.y;
+    while y <= b.max.y {
+        let mut x = b.min.x;
+        while x <= b.max.x {
+            let q = Pt::new(x, y);
+            if field.at(q) > 0.3 {
+                inside += 1;
+                let (gx, gy) = ((x / cell).floor() as i64, (y / cell).floor() as i64);
+                let near = (gx - 1..=gx + 1).any(|i| {
+                    (gy - 1..=gy + 1).any(|j| {
+                        grid.get(&(i, j))
+                            .map(|v| v.iter().any(|(a, c)| seg_dist(q, *a, *c) < 0.45))
+                            .unwrap_or(false)
+                    })
+                });
+                hit += near as usize;
+            }
+            x += step;
+        }
+        y += step;
+    }
+    if inside == 0 { 1.0 } else { hit as f64 / inside as f64 }
 }
 
 /// A traced ring smoothed (the grid leaves tiny steps) and cut into even
