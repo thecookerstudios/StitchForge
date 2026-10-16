@@ -1,0 +1,117 @@
+<title>StitchForge Web</title>
+<style>
+  /* One-screen app: the canvas fills the frame; a quiet loader until the app starts. */
+  :root {
+    --bg: #18191c;
+    --panel: #232428;
+    --fg: #e8e6e1;
+    --muted: #9a978f;
+    --accent: #2f7fd1;
+    --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color-scheme: dark;
+  }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font-ui); overflow: hidden; }
+  #app { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; outline: none; }
+  #loader {
+    position: fixed; inset: 0; display: grid; place-content: center; gap: 12px; text-align: center;
+    padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  #loader h1 { margin: 0; font-size: 1.6rem; font-weight: 600; letter-spacing: 0.01em; }
+  #loader p { margin: 0; color: var(--muted); max-width: 34ch; line-height: 1.45; }
+  #bar { width: min(260px, 70vw); height: 4px; border-radius: 2px; background: var(--panel); overflow: hidden; margin: 6px auto 0; }
+  #bar span { display: block; height: 100%; width: 35%; background: var(--accent); animation: slide 1.2s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+  @media (prefers-reduced-motion: reduce) { #bar span { animation: none; width: 100%; } }
+  #sheet { position: fixed; inset: 0; background: var(--bg); display: flex; flex-direction: column; z-index: 5; }
+  #sheet header {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding-block: calc(10px + env(safe-area-inset-top, 0px)) 10px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+    background: var(--panel); color: var(--fg);
+  }
+  #sheet button { font: inherit; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--muted); background: transparent; color: var(--fg); }
+  #sheet button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #sheet iframe { flex: 1; width: 100%; border: 0; background: #fff; }
+  #note { font-size: 0.85rem; color: var(--muted); }
+  #toast {
+    position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(48px + env(safe-area-inset-bottom, 0px));
+    max-width: calc(100vw - 32px); padding: 10px 16px; border-radius: 8px; z-index: 6;
+    background: var(--panel); color: var(--fg); box-shadow: 0 4px 16px rgb(0 0 0 / 0.35); font-size: 0.9rem;
+  }
+</style>
+
+<canvas id="app" tabindex="0"></canvas>
+<div id="loader">
+  <h1>StitchForge</h1>
+  <p>Loading the embroidery app (about 10 MB the first time)…</p>
+  <div id="bar"><span></span></div>
+</div>
+<div id="toast" role="status" hidden></div>
+<div id="sheet" hidden>
+  <header><span id="note">Operator sheet</span><button id="closeSheet" type="button">Close</button></header>
+  <iframe id="sheetFrame" title="Operator sheet"></iframe>
+</div>
+
+<script>
+  // Called by the app. Saving files from inside this hosted page is blocked,
+  // so exports open where possible and the operator sheet shows in-page.
+  // Files the viewer can save directly; machine formats (.dst, .pes, .exp, .jef…)
+  // and project files are wrapped in a .zip, which every viewer accepts.
+  const DIRECT = new Set("gif png jpg jpeg webp txt json md docx pptx csv html svg pdf xlsx zip".split(" "));
+  const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  function crc32(b) { let c = 0xffffffff; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+  function zipOne(name, data) {
+    const nm = new TextEncoder().encode(name), crc = crc32(data), n = data.length;
+    const loc = new DataView(new ArrayBuffer(30)), cen = new DataView(new ArrayBuffer(46)), end = new DataView(new ArrayBuffer(22));
+    loc.setUint32(0, 0x04034b50, true); loc.setUint16(4, 20, true); loc.setUint32(14, crc, true); loc.setUint32(18, n, true); loc.setUint32(22, n, true); loc.setUint16(26, nm.length, true);
+    cen.setUint32(0, 0x02014b50, true); cen.setUint16(4, 20, true); cen.setUint16(6, 20, true); cen.setUint32(16, crc, true); cen.setUint32(20, n, true); cen.setUint32(24, n, true); cen.setUint16(28, nm.length, true);
+    end.setUint32(0, 0x06054b50, true); end.setUint16(8, 1, true); end.setUint16(10, 1, true); end.setUint32(12, 46 + nm.length, true); end.setUint32(16, 30 + nm.length + n, true);
+    return new Blob([loc, nm, data, cen, nm, end]);
+  }
+  let toastTimer;
+  function toast(msg) {
+    const t = document.getElementById("toast"); t.textContent = msg; t.hidden = false;
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, 4000);
+  }
+  window.sfDownload = async function (name, bytes) {
+    const data = new Uint8Array(bytes);
+    const ext = (name.split(".").pop() || "").toLowerCase();
+    let filename = name, payload = new Blob([data]);
+    if (!DIRECT.has(ext)) { filename = name + ".zip"; payload = zipOne(name, data); }
+    let downloads = null;
+    try { downloads = window.claude && await window.claude.use("downloads"); } catch (e) {}
+    if (downloads) {
+      try { await downloads.save({ filename, data: payload }); toast("Saved " + filename); }
+      catch (e) { if (e && e.code !== "declined") toast("Couldn't save " + filename + (e && e.message ? ": " + e.message : "")); }
+      return;
+    }
+    try {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(payload); a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+    } catch (e) { toast("Saving files isn't available here"); }
+  };
+  window.sfShowHtml = function (html) {
+    document.getElementById("sheetFrame").srcdoc = html;
+    document.getElementById("sheet").hidden = false;
+  };
+  document.getElementById("closeSheet").addEventListener("click", function () {
+    document.getElementById("sheet").hidden = true;
+  });
+</script>
+<script type="module">
+  import init, { WebHandle } from "./stitchforge.js";
+  const loader = document.getElementById("loader");
+  try {
+    await init();
+    const handle = new WebHandle();
+    await handle.start(document.getElementById("app"));
+    loader.hidden = true;
+  } catch (e) {
+    console.error(e);
+    loader.querySelector("p").textContent = "StitchForge couldn't start in this browser: " + e;
+    loader.querySelector("#bar").hidden = true;
+  }
+</script>
