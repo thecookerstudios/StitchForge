@@ -156,6 +156,31 @@ impl Layer {
             .collect()
     }
 
+    /// Shapes in design mm with their editable paths moved too (for path
+    /// operations that turn several layers into one).
+    pub fn baked(&self) -> Vec<Shape> {
+        let mut out = self.transformed();
+        for (s, src) in out.iter_mut().zip(&self.shapes) {
+            s.curves = src
+                .curves
+                .iter()
+                .map(|c| crate::geom::VPath {
+                    nodes: c
+                        .nodes
+                        .iter()
+                        .map(|n| crate::geom::Node {
+                            p: self.tf(n.p),
+                            cin: self.tf(n.cin),
+                            cout: self.tf(n.cout),
+                        })
+                        .collect(),
+                    closed: c.closed,
+                })
+                .collect();
+        }
+        out
+    }
+
     pub fn bbox(&self) -> BBox {
         let mut b = BBox::empty();
         for s in &self.shapes {

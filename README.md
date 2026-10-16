@@ -1,4 +1,4 @@
-# StitchForge v0.7 — embroidery app
+# StitchForge v0.8 — embroidery app
 
 Vector art and any-font text in; machine-ready DST, a printable operator
 spec sheet, and a stitch preview out. Written in Rust, runs on Windows,
@@ -64,6 +64,30 @@ name so the operator runs it on one head at a time.
 
 Letter height means capital-letter height, so every name comes out the same
 size whatever its letters.
+
+**Drawing (v0.8).** The tool strip on the left draws new art right in
+StitchForge, so a logo can be built from scratch or added to:
+- **Select (V)**: click, Shift-click to select several, drag to move them.
+- **Nodes (N)**: edit anchors and curve handles of the selected shape.
+- **Stitches (M)**: edit needle points by hand.
+- **Pen (P)**: click for corners, drag for curves; click the first point to
+  close (filled shape), double-click or Enter to finish an open path (an
+  outline), Backspace removes the last point, Esc cancels.
+- **Rectangle (R)** with corner radius, **Ellipse (E)**, **Polygon / star (G)**
+  with any number of points, **Line (L)**: drag to draw, Shift to constrain;
+  a click alone makes a 20 mm shape.
+- **Text (T)**: click where the words go.
+- New shapes use the fill and outline colours and outline width shown on the
+  right while a drawing tool is active. Points snap to existing anchors, and
+  to a 1 mm grid when that box is ticked.
+
+**Path menu** (also on the right when layers are selected): **Union**,
+**Subtract** (lowest minus the rest), **Intersect**, **Exclude**, **Combine**,
+**Break apart**, **Outline to fill**, **Border…** (a satin outline or a backing
+fill grown around the selection or the whole design), **Flip**, and **Align /
+Spread** for several layers. Results come back as smooth Bézier paths with
+anchors only where the outline really turns. **File → Export artwork as
+SVG** saves the vector art for Inkscape, Illustrator or a customer proof.
 
 **Design objects (v0.7).** Every layer keeps two sides that stay in step:
 its *shape* (the vector paths, with their anchors and curve handles) and its

@@ -13,6 +13,8 @@ use stitchforge::drops::{self as drops_mod, Case, DropSetup, Join, Slot};
 use stitchforge::formats::{self, Format, MachineFile};
 use stitchforge::geom::{BBox, Node, Pt};
 use stitchforge::import::FillPattern;
+use stitchforge::vector::{self, BoolOp};
+use stitchforge::geom::{FillRule, VPath};
 use stitchforge::project::Embroidery;
 use stitchforge::stitch::Needle;
 use stitchforge::import::{self, Artwork, Shape, ShapeKind, ShapeOpts, StitchChoice};
@@ -75,6 +77,78 @@ enum Edit {
     Stitches(u64),
     /// Anchors and handles of a layer's paths (its vector representation).
     Shape(u64),
+}
+
+/// Canvas tools (left strip).
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Tool {
+    Select,
+    Nodes,
+    Stitches,
+    Pen,
+    Rect,
+    Ellipse,
+    Polygon,
+    Line,
+    Text,
+}
+
+impl Tool {
+    const ALL: [Tool; 9] = [
+        Tool::Select,
+        Tool::Nodes,
+        Tool::Stitches,
+        Tool::Pen,
+        Tool::Rect,
+        Tool::Ellipse,
+        Tool::Polygon,
+        Tool::Line,
+        Tool::Text,
+    ];
+    fn hint(&self) -> &'static str {
+        match self {
+            Tool::Select => "Select and move (V)\nShift-click to select several",
+            Tool::Nodes => "Edit shape points (N)\nDrag anchors and handles; double-click the outline to add one",
+            Tool::Stitches => "Edit stitch points (M)\nMove, add or delete needle points by hand",
+            Tool::Pen => "Pen (P)\nClick for corners, drag for curves. Click the first point to close, double-click or Enter to finish",
+            Tool::Rect => "Rectangle (R)\nDrag; Shift for a square. Corner radius in the panel",
+            Tool::Ellipse => "Ellipse (E)\nDrag; Shift for a circle",
+            Tool::Polygon => "Polygon and star (G)\nDrag from the centre; Shift snaps the angle",
+            Tool::Line => "Line (L)\nDrag; Shift snaps to 15°",
+            Tool::Text => "Text (T)\nClick where the words go",
+        }
+    }
+    fn key(&self) -> egui::Key {
+        match self {
+            Tool::Select => egui::Key::V,
+            Tool::Nodes => egui::Key::N,
+            Tool::Stitches => egui::Key::M,
+            Tool::Pen => egui::Key::P,
+            Tool::Rect => egui::Key::R,
+            Tool::Ellipse => egui::Key::E,
+            Tool::Polygon => egui::Key::G,
+            Tool::Line => egui::Key::L,
+            Tool::Text => egui::Key::T,
+        }
+    }
+    /// Tools that make new shapes on the canvas.
+    fn draws(&self) -> bool {
+        matches!(self, Tool::Pen | Tool::Rect | Tool::Ellipse | Tool::Polygon | Tool::Line | Tool::Text)
+    }
+}
+
+/// Look of the next shape drawn.
+#[derive(Clone)]
+struct DrawStyle {
+    fill_on: bool,
+    fill: [u8; 3],
+    stroke_on: bool,
+    stroke: [u8; 3],
+    stroke_w: f64,
+    corner: f64,
+    sides: usize,
+    star: bool,
+    inner: f64,
 }
 
 /// An anchor (part 0) or one of its handles (1 = in, 2 = out).
@@ -174,6 +248,20 @@ struct App {
 
     // editing a design object's stitches or shape on the canvas
     edit: Edit,
+    // drawing
+    tool: Tool,
+    multi: std::collections::BTreeSet<u64>,
+    style: DrawStyle,
+    pen: Vec<Node>,
+    pen_dragging: bool,
+    shape_drag: Option<(Pt, Pt)>,
+    snap: bool,
+    text_at: Option<Pt>,
+    show_border: bool,
+    border_dist: f64,
+    border_round: bool,
+    border_outline: bool,
+    border_width: f64,
     st_sel: std::collections::BTreeSet<usize>,
     node_sel: Option<NodeRef>,
     edit_drag: Option<EditDrag>,
@@ -247,6 +335,29 @@ impl App {
             drop_info: None,
             quiet_regen: false,
             edit: Edit::None,
+            tool: Tool::Select,
+            multi: Default::default(),
+            style: DrawStyle {
+                fill_on: true,
+                fill: [28, 43, 74],
+                stroke_on: false,
+                stroke: [224, 165, 38],
+                stroke_w: 2.0,
+                corner: 0.0,
+                sides: 5,
+                star: true,
+                inner: 0.45,
+            },
+            pen: Vec::new(),
+            pen_dragging: false,
+            shape_drag: None,
+            snap: false,
+            text_at: None,
+            show_border: false,
+            border_dist: 1.5,
+            border_round: true,
+            border_outline: true,
+            border_width: 2.5,
             st_sel: Default::default(),
             node_sel: None,
             edit_drag: None,
@@ -666,6 +777,9 @@ impl App {
                     Some(d) => Pt::new(d.bbox.center().x, d.bbox.max.y + spec.height_mm * 0.9),
                     None => self.view_center,
                 };
+                if let Some(at) = self.text_at.take() {
+                    l.offset = at;
+                }
                 l.text = Some(spec);
                 if self.layers.is_empty() {
                     self.design_name = l
@@ -1089,6 +1203,9 @@ impl App {
 
     fn end_edit(&mut self) {
         self.edit = Edit::None;
+        if matches!(self.tool, Tool::Nodes | Tool::Stitches) {
+            self.tool = Tool::Select;
+        }
         self.st_sel.clear();
         self.node_sel = None;
         self.edit_drag = None;
@@ -1602,6 +1719,17 @@ impl App {
                 if ui
                     .add_enabled(
                         mode_art && !self.layers.is_empty(),
+                        egui::Button::new("Export artwork as SVG…"),
+                    )
+                    .on_hover_text("The vector art (not stitches), for Inkscape, Illustrator or a customer proof")
+                    .clicked()
+                {
+                    ui.close();
+                    self.export_art_svg();
+                }
+                if ui
+                    .add_enabled(
+                        mode_art && !self.layers.is_empty(),
                         egui::Button::new("Add art…"),
                     )
                     .clicked()
@@ -1637,6 +1765,11 @@ impl App {
                     self.show_export = true;
                 }
             });
+            if mode_art && self.tab == Tab::Design {
+                ui.menu_button("Path", |ui| {
+                    self.path_tools(ui, true);
+                });
+            }
             if ui
                 .button("Open…")
                 .on_hover_text("Project, SVG art, or a DST/EXP/PES stitch file (Cmd/Ctrl+O)")
@@ -1818,7 +1951,7 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (li, l) in self.layers.iter().enumerate() {
                 let open = self.expanded.contains(&l.id);
-                let sel = self.selected == Some(l.id);
+                let sel = self.selected == Some(l.id) || self.multi.contains(&l.id);
                 let objs: Vec<&stitchforge::design::ObjectInfo> =
                     self.design.as_ref().map(|d| d.objects.iter().filter(|o| o.layer == li).collect()).unwrap_or_default();
                 let stitches: usize = objs.iter().map(|o| o.stitches).sum();
@@ -1894,11 +2027,24 @@ impl App {
             }
         }
         if let Some(id) = select {
-            self.selected = if self.selected == Some(id) {
-                None
+            if ui.input(|i| i.modifiers.shift) {
+                if self.multi.contains(&id) && self.multi.len() > 1 {
+                    self.multi.remove(&id);
+                    if self.selected == Some(id) {
+                        self.selected = self.multi.iter().next().copied();
+                    }
+                } else {
+                    self.multi.insert(id);
+                    self.selected = Some(id);
+                }
             } else {
-                Some(id)
-            };
+                self.selected = if self.selected == Some(id) && self.multi.len() <= 1 {
+                    None
+                } else {
+                    Some(id)
+                };
+                self.multi = self.selected.into_iter().collect();
+            }
         }
         if let Some(li) = toggle_vis {
             self.hard_checkpoint();
@@ -3114,6 +3260,21 @@ impl App {
                 ui.separator();
             } else {
                 self.edit_panel(ui);
+                if self.tool.draws() && self.machine.is_none() {
+                    self.draw_options(ui);
+                    ui.separator();
+                }
+                let n_sel = self.sel_layers().len();
+                if n_sel >= 2 && self.machine.is_none() {
+                    section(ui, &format!("{n_sel} layers selected"));
+                    self.path_tools(ui, false);
+                    ui.add_space(4.0);
+                    ui.separator();
+                } else if n_sel == 1 && self.machine.is_none() {
+                    section(ui, "Shape tools");
+                    self.path_tools(ui, false);
+                    ui.add_space(4.0);
+                }
                 self.layer_props(ui, now);
             }
             if self.selected.is_some() {
@@ -3370,34 +3531,10 @@ impl App {
         let fabric = Color32::from_rgb(242, 239, 232);
         painter.rect_filled(rect, 0.0, fabric);
 
-        let Some(d) = self.design.as_ref() else {
-            let c = rect.center();
-            let ink = Color32::from_rgb(70, 68, 64);
-            painter.text(
-                c - Vec2::new(0.0, 30.0),
-                egui::Align2::CENTER_CENTER,
-                "Drop an SVG here",
-                egui::FontId::proportional(26.0),
-                ink,
-            );
-            painter.text(
-                c + Vec2::new(0.0, 8.0),
-                egui::Align2::CENTER_CENTER,
-                "or use Open SVG…, Add text…, or Sample above",
-                egui::FontId::proportional(15.0),
-                Color32::from_rgb(120, 116, 108),
-            );
-            if let Some(e) = &self.error {
-                painter.text(
-                    c + Vec2::new(0.0, 44.0),
-                    egui::Align2::CENTER_CENTER,
-                    e,
-                    egui::FontId::proportional(14.0),
-                    Color32::from_rgb(200, 60, 50),
-                );
-            }
-            return;
-        };
+        // An empty design is a blank canvas to draw on.
+        let blank = Design::empty(self.profile, &self.recipe);
+        let empty_canvas = self.design.is_none();
+        let d = self.design.as_ref().unwrap_or(&blank);
 
         let b = d.bbox;
         if self.fit {
@@ -3434,16 +3571,24 @@ impl App {
                 .map(|l| l.id)
         };
         let editing = self.tab == Tab::Design && self.machine.is_none();
-        let object_edit = editing && self.edit_layer().is_some();
+        let drawing = editing && self.tool.draws();
+        if drawing {
+            self.draw_input(&resp, ui, &to_mm, &to_screen, zoom);
+        }
+        let object_edit = editing && !drawing && self.edit_layer().is_some();
         if object_edit {
             self.edit_input(&resp, ui, &to_mm, &to_screen, zoom);
         }
+        let object_edit = object_edit || drawing;
         let no_layers: Vec<Layer> = Vec::new();
         let hit_src: &[Layer] = if editing { &self.layers } else { &no_layers };
         if !object_edit && resp.drag_started() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let hit = hit_layer(pos, hit_src, zoom);
                 if hit.is_some() && (hit == self.selected || ui.input(|i| !i.modifiers.shift)) {
+                    if !hit.map(|h| self.multi.contains(&h)).unwrap_or(false) {
+                        self.multi = hit.into_iter().collect();
+                    }
                     self.selected = hit;
                     self.moving = Some(Pt::new(0.0, 0.0));
                 } else {
@@ -3466,9 +3611,12 @@ impl App {
             if let Some(m) = self.moving.take() {
                 if m.len() > 0.01 {
                     self.hard_checkpoint();
-                    if let Some(li) = self.sel_idx() {
+                    let mut moved: std::collections::BTreeSet<usize> = Default::default();
+                    for li in self.sel_layers() {
                         for j in self.linked(li) {
-                            self.layers[j].offset = self.layers[j].offset.add(m);
+                            if moved.insert(j) {
+                                self.layers[j].offset = self.layers[j].offset.add(m);
+                            }
                         }
                     }
                     self.dirty = true;
@@ -3477,7 +3625,32 @@ impl App {
         }
         if !object_edit && resp.clicked() && editing {
             if let Some(pos) = resp.interact_pointer_pos() {
-                self.selected = hit_layer(pos, &self.layers, zoom);
+                let hit = hit_layer(pos, &self.layers, zoom);
+                let shift = ui.input(|i| i.modifiers.shift);
+                match hit {
+                    Some(id) if shift => {
+                        if self.multi.contains(&id) && self.multi.len() > 1 {
+                            self.multi.remove(&id);
+                            if self.selected == Some(id) {
+                                self.selected = self.multi.iter().next().copied();
+                            }
+                        } else {
+                            self.multi.insert(id);
+                            self.selected = Some(id);
+                        }
+                    }
+                    _ => {
+                        self.selected = hit;
+                        self.multi = hit.into_iter().collect();
+                    }
+                }
+                if let (Some(li), Tool::Nodes | Tool::Stitches) = (self.sel_idx(), self.tool) {
+                    if self.tool == Tool::Nodes {
+                        self.start_shape_edit(li);
+                    } else {
+                        self.start_stitch_edit(li);
+                    }
+                }
             }
         }
         if !object_edit && resp.double_clicked() && self.selected.is_none() {
@@ -3515,7 +3688,7 @@ impl App {
         }
         let _ = now;
 
-        let d = self.design.as_ref().unwrap();
+        let d = self.design.as_ref().unwrap_or(&blank);
         let painter = painter.with_clip_rect(rect);
 
         // grid every 10 mm, and a slightly darker hoop-ish area around the design
@@ -3555,7 +3728,11 @@ impl App {
         } else {
             None
         };
-        let moving_set: Vec<usize> = sel_layer.map(|li| self.linked(li)).unwrap_or_default();
+        let moving_set: Vec<usize> = if editing {
+            self.sel_layers().into_iter().flat_map(|li| self.linked(li)).collect()
+        } else {
+            Vec::new()
+        };
         let view = self.view;
         let show_jumps = self.show_jumps;
         let draw_obj = |o: &stitchforge::design::ObjectInfo, shift: Pt, painter: &egui::Painter| {
@@ -3616,6 +3793,45 @@ impl App {
         // ---- the object being edited: its needle points or its anchors
         if editing {
             self.edit_overlay(&painter, &to_screen, zoom, ui);
+            self.draw_overlay(&painter, &to_screen, &to_mm, ui);
+            // the rest of a multi-selection
+            if self.edit == Edit::None {
+                let shift = moving.unwrap_or(Pt::new(0.0, 0.0));
+                for li in self.sel_layers() {
+                    if Some(self.layers[li].id) == self.selected {
+                        continue;
+                    }
+                    let lb = self.layers[li].bbox();
+                    if lb.is_valid() {
+                        let r = Rect::from_min_max(to_screen(lb.min.add(shift)), to_screen(lb.max.add(shift))).expand(5.0);
+                        for seg in EShape::dashed_line(
+                            &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()],
+                            Stroke::new(1.0_f32, Color32::from_rgb(90, 150, 240)),
+                            4.0,
+                            4.0,
+                        ) {
+                            painter.add(seg);
+                        }
+                    }
+                }
+            }
+        }
+        if empty_canvas && self.layers.is_empty() {
+            let c = rect.center();
+            painter.text(
+                c - Vec2::new(0.0, 14.0),
+                egui::Align2::CENTER_CENTER,
+                "Draw with the tools on the left",
+                egui::FontId::proportional(22.0),
+                Color32::from_rgb(90, 86, 80),
+            );
+            painter.text(
+                c + Vec2::new(0.0, 16.0),
+                egui::Align2::CENTER_CENTER,
+                "or drop an SVG here, Open…, Add text…",
+                egui::FontId::proportional(14.0),
+                Color32::from_rgb(130, 126, 118),
+            );
         }
 
         // ---- selection box and stitch-direction arrow
@@ -3685,6 +3901,7 @@ impl App {
         }
 
         // size callout
+        if !empty_canvas {
         painter.text(
             Pos2::new(
                 to_screen(Pt::new(b.center().x, b.max.y)).x,
@@ -3700,6 +3917,872 @@ impl App {
             egui::FontId::proportional(13.0),
             Color32::from_rgb(110, 106, 98),
         );
+        }
+    }
+
+    // ---------- drawing ----------
+
+    fn set_tool(&mut self, t: Tool) {
+        if t == self.tool && !matches!(t, Tool::Nodes | Tool::Stitches) {
+            return;
+        }
+        self.finish_pen(false);
+        self.shape_drag = None;
+        if self.edit != Edit::None {
+            self.end_edit();
+        }
+        self.tool = t;
+        match t {
+            Tool::Nodes | Tool::Stitches => match self.sel_idx() {
+                Some(li) if self.machine.is_none() => {
+                    if t == Tool::Nodes {
+                        self.start_shape_edit(li)
+                    } else {
+                        self.start_stitch_edit(li)
+                    }
+                }
+                _ => self.status = "Click a shape to edit its points".into(),
+            },
+            Tool::Pen => self.status = "Pen: click for corners, drag for curves; click the first point to close, double-click or Enter to finish, Esc to cancel".into(),
+            Tool::Text => self.status = "Text: click where the words go".into(),
+            Tool::Rect | Tool::Ellipse | Tool::Polygon | Tool::Line => {
+                self.status = "Drag on the canvas to draw; Shift constrains. Style is in the panel on the right".into()
+            }
+            Tool::Select => {}
+        }
+    }
+
+    /// Snap a point: to an existing anchor within reach, else the 1 mm grid
+    /// when snapping is on.
+    fn snap_pt(&self, p: Pt, to_screen: &dyn Fn(Pt) -> Pos2) -> Pt {
+        let sp = to_screen(p);
+        let mut best: Option<(f32, Pt)> = None;
+        for l in self.layers.iter().filter(|l| l.visible) {
+            for sh in &l.shapes {
+                for c in &sh.curves {
+                    for n in &c.nodes {
+                        let q = l.tf(n.p);
+                        let d = to_screen(q).distance(sp);
+                        if d < 7.0 && best.map(|b| d < b.0).unwrap_or(true) {
+                            best = Some((d, q));
+                        }
+                    }
+                }
+            }
+        }
+        for n in &self.pen {
+            let d = to_screen(n.p).distance(sp);
+            if d < 7.0 && best.map(|b| d < b.0).unwrap_or(true) {
+                best = Some((d, n.p));
+            }
+        }
+        match best {
+            Some((_, q)) => q,
+            None if self.snap => Pt::new(p.x.round(), p.y.round()),
+            None => p,
+        }
+    }
+
+    fn pen_add(&mut self, p: Pt, to_screen: &dyn Fn(Pt) -> Pos2) {
+        if self.pen.len() >= 2 && to_screen(self.pen[0].p).distance(to_screen(p)) < 8.0 {
+            self.finish_pen(true);
+            return;
+        }
+        if let Some(last) = self.pen.last() {
+            if last.p.dist(p) < 0.05 {
+                return;
+            }
+        }
+        self.pen.push(Node::corner(p));
+    }
+
+    fn finish_pen(&mut self, closed: bool) {
+        let mut nodes = std::mem::take(&mut self.pen);
+        nodes.dedup_by(|a, b| a.p.dist(b.p) < 0.2);
+        self.pen_dragging = false;
+        let enough = if closed { nodes.len() >= 3 } else { nodes.len() >= 2 };
+        if enough {
+            self.add_drawn(VPath { nodes, closed }, "Path");
+        }
+    }
+
+    /// The shape a drag makes with the current tool.
+    fn shape_from_drag(&self, a: Pt, b: Pt, shift: bool) -> Option<(VPath, &'static str)> {
+        let st = &self.style;
+        let (mut dx, mut dy) = (b.x - a.x, b.y - a.y);
+        Some(match self.tool {
+            Tool::Rect => {
+                if shift {
+                    let m = dx.abs().max(dy.abs());
+                    dx = m * dx.signum();
+                    dy = m * dy.signum();
+                }
+                (vector::rect(a.x, a.y, dx, dy, st.corner), "Rectangle")
+            }
+            Tool::Ellipse => {
+                if shift {
+                    let m = dx.abs().max(dy.abs());
+                    dx = m * dx.signum();
+                    dy = m * dy.signum();
+                }
+                (
+                    vector::ellipse(a.x + dx / 2.0, a.y + dy / 2.0, dx / 2.0, dy / 2.0),
+                    "Ellipse",
+                )
+            }
+            Tool::Polygon => {
+                let r = a.dist(b);
+                let mut rot = dy.atan2(dx).to_degrees() + 90.0;
+                if shift {
+                    rot = (rot / 15.0).round() * 15.0;
+                }
+                let inner = st.star.then_some(st.inner);
+                (
+                    vector::polygon(a.x, a.y, r, st.sides, inner, rot),
+                    if st.star { "Star" } else { "Polygon" },
+                )
+            }
+            Tool::Line => {
+                let mut b = b;
+                if shift {
+                    let len = a.dist(b);
+                    let ang = (dy.atan2(dx).to_degrees() / 15.0).round() * 15.0;
+                    let r = ang.to_radians();
+                    b = Pt::new(a.x + len * r.cos(), a.y + len * r.sin());
+                }
+                (vector::line(a, b), "Line")
+            }
+            _ => return None,
+        })
+    }
+
+    /// Turn a drawn path into a layer (fill) and/or an outline layer.
+    fn add_drawn(&mut self, v: VPath, kind: &str) {
+        self.hard_checkpoint();
+        let st = self.style.clone();
+        let count = self.layers.iter().filter(|l| l.name.starts_with(kind)).count() + 1;
+        let name = format!("{kind} {count}");
+        let fill = v.closed && st.fill_on;
+        let stroke = !v.closed || st.stroke_on || !fill;
+        let mut made: Vec<Layer> = Vec::new();
+        if fill {
+            let mut sh = Shape {
+                kind: ShapeKind::Area {
+                    rings: Vec::new(),
+                    rule: FillRule::EvenOdd,
+                },
+                rgb: st.fill,
+                label: name.clone(),
+                group: 0,
+                opts: ShapeOpts::default(),
+                curves: vec![v.clone()],
+            };
+            sh.reflatten();
+            let id = self.next_id;
+            self.next_id += 1;
+            made.push(Layer::new(id, name.clone(), vec![sh], false));
+        }
+        if stroke {
+            let mut sh = Shape {
+                kind: ShapeKind::Line {
+                    paths: Vec::new(),
+                    width: st.stroke_w,
+                },
+                rgb: st.stroke,
+                label: format!("{name} outline"),
+                group: 0,
+                opts: ShapeOpts::default(),
+                curves: vec![v],
+            };
+            sh.reflatten();
+            let id = self.next_id;
+            self.next_id += 1;
+            let label = if fill { format!("{name} outline") } else { name.clone() };
+            made.push(Layer::new(id, label, vec![sh], true));
+        }
+        if made.len() == 2 {
+            let link = self.next_id + 7_000_000;
+            let o = made[0].origin;
+            for l in &mut made {
+                l.link = Some(link);
+                l.origin = o;
+            }
+        }
+        if self.layers.is_empty() {
+            self.design_name = "drawing".into();
+        }
+        let first = made.first().map(|l| l.id);
+        self.layers.extend(made);
+        self.selected = first;
+        self.multi = first.into_iter().collect();
+        self.dirty = true;
+        self.status = format!("Added {name}");
+    }
+
+    /// Mouse input while a drawing tool is active.
+    fn draw_input(
+        &mut self,
+        resp: &egui::Response,
+        ui: &egui::Ui,
+        to_mm: &dyn Fn(Pos2) -> Pt,
+        to_screen: &dyn Fn(Pt) -> Pos2,
+        zoom: f32,
+    ) {
+        let shift = ui.input(|i| i.modifiers.shift);
+        let origin = ui.input(|i| i.pointer.press_origin());
+        let latest = ui.input(|i| i.pointer.latest_pos());
+        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+            let dlt = resp.drag_delta();
+            self.view_center = self
+                .view_center
+                .sub(Pt::new((dlt.x / zoom) as f64, (dlt.y / zoom) as f64));
+            return;
+        }
+        match self.tool {
+            Tool::Pen => {
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    if let Some(o) = origin {
+                        let p = self.snap_pt(to_mm(o), to_screen);
+                        let before = self.pen.len();
+                        self.pen_add(p, to_screen);
+                        self.pen_dragging = self.pen.len() > before;
+                    }
+                }
+                if self.pen_dragging && resp.dragged_by(egui::PointerButton::Primary) {
+                    if let (Some(l), Some(n)) = (latest, self.pen.last_mut()) {
+                        let q = to_mm(l);
+                        n.cout = q;
+                        n.cin = n.p.sub(q.sub(n.p));
+                    }
+                }
+                if resp.drag_stopped() {
+                    self.pen_dragging = false;
+                }
+                if resp.double_clicked() {
+                    self.finish_pen(false);
+                } else if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let p = self.snap_pt(to_mm(pos), to_screen);
+                        self.pen_add(p, to_screen);
+                    }
+                }
+            }
+            Tool::Rect | Tool::Ellipse | Tool::Polygon | Tool::Line => {
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    if let Some(o) = origin {
+                        let p = self.snap_pt(to_mm(o), to_screen);
+                        self.shape_drag = Some((p, p));
+                    }
+                }
+                if resp.dragged_by(egui::PointerButton::Primary) {
+                    if let (Some((a, _)), Some(l)) = (self.shape_drag, latest) {
+                        let b = self.snap_pt(to_mm(l), to_screen);
+                        self.shape_drag = Some((a, b));
+                    }
+                }
+                if resp.drag_stopped() {
+                    if let Some((a, b)) = self.shape_drag.take() {
+                        if a.dist(b) > 0.5 {
+                            if let Some((v, kind)) = self.shape_from_drag(a, b, shift) {
+                                self.add_drawn(v, kind);
+                            }
+                        }
+                    }
+                } else if resp.clicked() {
+                    // a click alone makes a 20 mm shape there
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let c = self.snap_pt(to_mm(pos), to_screen);
+                        let (a, b) = match self.tool {
+                            Tool::Polygon => (c, Pt::new(c.x, c.y - 10.0)),
+                            Tool::Line => (c, Pt::new(c.x + 20.0, c.y)),
+                            _ => (Pt::new(c.x - 10.0, c.y - 10.0), Pt::new(c.x + 10.0, c.y + 10.0)),
+                        };
+                        if let Some((v, kind)) = self.shape_from_drag(a, b, false) {
+                            self.add_drawn(v, kind);
+                        }
+                    }
+                }
+            }
+            Tool::Text => {
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        self.text_at = Some(to_mm(pos));
+                        self.show_text = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Preview of the path or shape being drawn.
+    fn draw_overlay(&self, painter: &egui::Painter, to_screen: &dyn Fn(Pt) -> Pos2, to_mm: &dyn Fn(Pos2) -> Pt, ui: &egui::Ui) {
+        let accent = Color32::from_rgb(30, 110, 230);
+        let preview = |v: &VPath| {
+            let pts: Vec<Pos2> = v.flatten().iter().map(|p| to_screen(*p)).collect();
+            if v.closed && self.style.fill_on && pts.len() >= 3 {
+                let c = self.style.fill;
+                painter.add(EShape::convex_polygon(Vec::new(), Color32::TRANSPARENT, Stroke::NONE));
+                let fill = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 70);
+                // fan from the first point is fine for a preview of simple shapes
+                for k in 1..pts.len().saturating_sub(1) {
+                    painter.add(EShape::convex_polygon(vec![pts[0], pts[k], pts[k + 1]], fill, Stroke::NONE));
+                }
+            }
+            painter.add(EShape::line(pts, Stroke::new(1.5_f32, accent)));
+        };
+        if let Some((a, b)) = self.shape_drag {
+            let shift = ui.input(|i| i.modifiers.shift);
+            if let Some((v, _)) = self.shape_from_drag(a, b, shift) {
+                preview(&v);
+            }
+        }
+        if !self.pen.is_empty() {
+            let mut nodes = self.pen.clone();
+            if !self.pen_dragging {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    nodes.push(Node::corner(to_mm(pos)));
+                }
+            }
+            let v = VPath { nodes, closed: false };
+            let pts: Vec<Pos2> = v.flatten().iter().map(|p| to_screen(*p)).collect();
+            painter.add(EShape::line(pts, Stroke::new(1.5_f32, accent)));
+            for (i, n) in self.pen.iter().enumerate() {
+                let p = to_screen(n.p);
+                if n.cout.dist(n.p) > 1e-6 {
+                    for h in [n.cin, n.cout] {
+                        let hp = to_screen(h);
+                        painter.line_segment([p, hp], Stroke::new(1.0_f32, accent));
+                        painter.circle_filled(hp, 3.5, Color32::WHITE);
+                        painter.circle_stroke(hp, 3.5, Stroke::new(1.2_f32, accent));
+                    }
+                }
+                let r = Rect::from_center_size(p, Vec2::splat(if i == 0 { 9.0 } else { 7.0 }));
+                painter.rect_filled(r, 1.0, if i == 0 { accent } else { Color32::WHITE });
+                painter.rect_stroke(r, 1.0, Stroke::new(1.2_f32, accent), egui::StrokeKind::Inside);
+            }
+        }
+    }
+
+    // ---------- path operations ----------
+
+    /// Selected layers (multi-select plus the main one), bottom of the stack first.
+    fn sel_layers(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..self.layers.len())
+            .filter(|&i| {
+                let id = self.layers[i].id;
+                self.multi.contains(&id) || self.selected == Some(id)
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A layer's area in design mm (outlines become the area their stroke covers).
+    fn layer_area(&self, li: usize) -> Vec<(Vec<stitchforge::geom::Ring>, FillRule)> {
+        let l = &self.layers[li];
+        let mut out = Vec::new();
+        for s in l.transformed() {
+            match s.kind {
+                ShapeKind::Area { rings, rule } => out.push((rings, rule)),
+                ShapeKind::Line { paths, width } => {
+                    let w = l.opts.column_width.unwrap_or(width) * (l.sx * l.sy).abs().sqrt();
+                    out.push((vector::stroke_area(&paths, w, true), FillRule::EvenOdd))
+                }
+            }
+        }
+        out
+    }
+
+    fn layer_color(&self, li: usize) -> [u8; 3] {
+        self.layer_thread(li)
+            .map(|t| t.rgb)
+            .unwrap_or_else(|| self.layers[li].shapes.first().map(|s| s.rgb).unwrap_or([60, 60, 60]))
+    }
+
+    /// A new filled layer from rings (design mm), styled like layer `like`.
+    fn area_layer(&mut self, rings: Vec<stitchforge::geom::Ring>, name: String, like: usize) -> Layer {
+        let mut sh = Shape {
+            kind: ShapeKind::Area {
+                rings: Vec::new(),
+                rule: FillRule::EvenOdd,
+            },
+            rgb: self.layer_color(like),
+            label: name.clone(),
+            group: 0,
+            opts: ShapeOpts::default(),
+            curves: vector::rings_to_curves(&rings),
+        };
+        sh.reflatten();
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut l = Layer::new(id, name, vec![sh], false);
+        l.custom = self.layers[like].custom.clone();
+        l.opts.thread = self.layers[like].opts.thread;
+        l
+    }
+
+    fn path_bool(&mut self, op: BoolOp) {
+        let idx = self.sel_layers();
+        if idx.len() < 2 {
+            self.error = Some(format!("{}: select two or more layers (Shift-click)", op.label()));
+            return;
+        }
+        let inputs: Vec<(Vec<stitchforge::geom::Ring>, FillRule)> = idx
+            .iter()
+            .map(|&li| {
+                let parts = self.layer_area(li);
+                // one input per layer: its own parts merged
+                let merged = vector::boolean(&parts, BoolOp::Union);
+                (merged, FillRule::EvenOdd)
+            })
+            .collect();
+        let rings = vector::boolean(&inputs, op);
+        if rings.is_empty() {
+            self.error = Some(format!("{} left nothing to keep", op.label()));
+            return;
+        }
+        self.hard_checkpoint();
+        let name = format!("{} ({})", self.layers[idx[0]].name, op.label().to_lowercase());
+        let l = self.area_layer(rings, name, idx[0]);
+        let id = l.id;
+        for &li in idx.iter().rev() {
+            self.layers.remove(li);
+        }
+        self.layers.insert(idx[0].min(self.layers.len()), l);
+        self.selected = Some(id);
+        self.multi = [id].into_iter().collect();
+        self.dirty = true;
+        self.status = format!("{} done", op.label());
+    }
+
+    fn combine(&mut self) {
+        let idx = self.sel_layers();
+        if idx.len() < 2 {
+            self.error = Some("Combine: select two or more layers (Shift-click)".into());
+            return;
+        }
+        self.hard_checkpoint();
+        let mut shapes = Vec::new();
+        for &li in &idx {
+            shapes.extend(self.layers[li].baked());
+        }
+        let any_area = shapes.iter().any(|s| matches!(s.kind, ShapeKind::Area { .. }));
+        let first = idx[0];
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut l = Layer::new(id, format!("{} (combined)", self.layers[first].name), shapes, !any_area);
+        l.custom = self.layers[first].custom.clone();
+        l.opts = self.layers[first].opts.clone();
+        for &li in idx.iter().rev() {
+            self.layers.remove(li);
+        }
+        self.layers.insert(first.min(self.layers.len()), l);
+        self.selected = Some(id);
+        self.multi = [id].into_iter().collect();
+        self.dirty = true;
+        self.status = "Combined into one layer".into();
+    }
+
+    fn break_apart(&mut self) {
+        let Some(li) = self.sel_idx() else { return };
+        let l = self.layers[li].clone();
+        let mut made: Vec<Layer> = Vec::new();
+        let mut k = 0;
+        for s in l.baked() {
+            match &s.kind {
+                ShapeKind::Area { rings, rule } => {
+                    for island in stitchforge::geom::split_islands(rings, *rule) {
+                        k += 1;
+                        let mut nl = self.area_layer(island, format!("{} {k}", l.name), li);
+                        nl.opts = l.opts.clone();
+                        made.push(nl);
+                    }
+                }
+                ShapeKind::Line { .. } => {
+                    for c in &s.curves {
+                        k += 1;
+                        let mut sh = s.clone();
+                        sh.curves = vec![c.clone()];
+                        sh.reflatten();
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        let mut nl = Layer::new(id, format!("{} {k}", l.name), vec![sh], true);
+                        nl.custom = l.custom.clone();
+                        nl.opts = l.opts.clone();
+                        made.push(nl);
+                    }
+                }
+            }
+        }
+        if made.len() < 2 {
+            self.status = "Nothing to break apart: it's already one piece".into();
+            return;
+        }
+        self.hard_checkpoint();
+        let n = made.len();
+        self.layers.remove(li);
+        self.multi = made.iter().map(|l| l.id).collect();
+        self.selected = made.first().map(|l| l.id);
+        for (j, nl) in made.into_iter().enumerate() {
+            self.layers.insert(li + j, nl);
+        }
+        self.dirty = true;
+        self.status = format!("Broke apart into {n} layers");
+    }
+
+    fn outline_stroke(&mut self) {
+        let idx: Vec<usize> = self
+            .sel_layers()
+            .into_iter()
+            .filter(|&li| self.layers[li].is_outline)
+            .collect();
+        if idx.is_empty() {
+            self.error = Some("Outline stroke: select an outline layer".into());
+            return;
+        }
+        self.hard_checkpoint();
+        for &li in idx.iter().rev() {
+            let area: Vec<(Vec<stitchforge::geom::Ring>, FillRule)> = self.layer_area(li);
+            let rings = vector::boolean(&area, BoolOp::Union);
+            let name = format!("{} (filled)", self.layers[li].name);
+            let mut nl = self.area_layer(rings, name, li);
+            nl.link = None;
+            self.layers[li] = nl;
+        }
+        self.selected = self.layers.get(idx[0]).map(|l| l.id);
+        self.dirty = true;
+        self.status = "Outline turned into a filled shape".into();
+    }
+
+    /// Border around the selection (or the whole design): grown by a distance,
+    /// as a satin outline on top or a backing fill underneath.
+    fn add_border(&mut self) {
+        let idx = {
+            let s = self.sel_layers();
+            if s.is_empty() {
+                (0..self.layers.len()).filter(|&i| self.layers[i].visible).collect()
+            } else {
+                s
+            }
+        };
+        if idx.is_empty() {
+            return;
+        }
+        let parts: Vec<(Vec<stitchforge::geom::Ring>, FillRule)> =
+            idx.iter().flat_map(|&li| self.layer_area(li)).collect();
+        // a border follows the outside only: holes are filled first
+        let merged = stitchforge::geom::outer_rings(&vector::boolean(&parts, BoolOp::Union));
+        let grown = vector::offset(&merged, FillRule::EvenOdd, self.border_dist, self.border_round);
+        let grown = stitchforge::geom::outer_rings(&grown);
+        if grown.is_empty() {
+            self.error = Some("Border: nothing to go around".into());
+            return;
+        }
+        self.hard_checkpoint();
+        let id = self.next_id;
+        self.next_id += 1;
+        let curves = vector::rings_to_curves(&grown);
+        if self.border_outline {
+            // only the outside edge(s): a satin outline sewn last
+            let mut sh = Shape {
+                kind: ShapeKind::Line {
+                    paths: Vec::new(),
+                    width: self.border_width,
+                },
+                rgb: self.style.stroke,
+                label: "Border".into(),
+                group: 0,
+                opts: ShapeOpts::default(),
+                curves,
+            };
+            sh.reflatten();
+            let l = Layer::new(id, "Border".into(), vec![sh], true);
+            self.layers.push(l);
+        } else {
+            let mut sh = Shape {
+                kind: ShapeKind::Area {
+                    rings: Vec::new(),
+                    rule: FillRule::EvenOdd,
+                },
+                rgb: self.style.fill,
+                label: "Backing".into(),
+                group: 0,
+                opts: ShapeOpts {
+                    keep_under: true,
+                    ..ShapeOpts::default()
+                },
+                curves,
+            };
+            sh.reflatten();
+            let mut l = Layer::new(id, "Backing".into(), vec![sh], false);
+            l.opts.keep_under = true;
+            self.layers.insert(0, l);
+        }
+        self.selected = Some(id);
+        self.multi = [id].into_iter().collect();
+        self.show_border = false;
+        self.dirty = true;
+        self.status = "Border added".into();
+    }
+
+    fn flip(&mut self, horizontal: bool) {
+        let idx = self.sel_layers();
+        if idx.is_empty() {
+            return;
+        }
+        self.hard_checkpoint();
+        // flip the whole selection as one: mirror each layer about the
+        // selection's centre
+        let mut b = BBox::empty();
+        for &li in &idx {
+            let lb = self.layers[li].bbox();
+            b.add(lb.min);
+            b.add(lb.max);
+        }
+        let c = b.center();
+        for &li in &idx {
+            let l = &mut self.layers[li];
+            let lc = l.center();
+            if horizontal {
+                l.sx = -l.sx;
+                l.rotation = -l.rotation;
+                l.offset.x += 2.0 * (c.x - lc.x);
+            } else {
+                l.sy = -l.sy;
+                l.rotation = -l.rotation;
+                l.offset.y += 2.0 * (c.y - lc.y);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Align the selection: 0 left, 1 centre, 2 right, 3 top, 4 middle, 5 bottom,
+    /// 6 spread evenly across, 7 spread evenly down.
+    fn align(&mut self, how: u8) {
+        let idx = self.sel_layers();
+        if idx.len() < 2 {
+            return;
+        }
+        self.hard_checkpoint();
+        let mut b = BBox::empty();
+        let boxes: Vec<BBox> = idx.iter().map(|&li| self.layers[li].bbox()).collect();
+        for lb in &boxes {
+            b.add(lb.min);
+            b.add(lb.max);
+        }
+        let mut order: Vec<usize> = (0..idx.len()).collect();
+        if how == 6 {
+            order.sort_by(|&i, &j| boxes[i].center().x.partial_cmp(&boxes[j].center().x).unwrap());
+        } else if how == 7 {
+            order.sort_by(|&i, &j| boxes[i].center().y.partial_cmp(&boxes[j].center().y).unwrap());
+        }
+        let n = idx.len();
+        for (rank, &k) in order.iter().enumerate() {
+            let lb = boxes[k];
+            let t = if n > 1 { rank as f64 / (n - 1) as f64 } else { 0.0 };
+            let d = match how {
+                0 => Pt::new(b.min.x - lb.min.x, 0.0),
+                1 => Pt::new(b.center().x - lb.center().x, 0.0),
+                2 => Pt::new(b.max.x - lb.max.x, 0.0),
+                3 => Pt::new(0.0, b.min.y - lb.min.y),
+                4 => Pt::new(0.0, b.center().y - lb.center().y),
+                5 => Pt::new(0.0, b.max.y - lb.max.y),
+                6 => {
+                    let lo = boxes[order[0]].center().x;
+                    let hi = boxes[order[n - 1]].center().x;
+                    Pt::new(lo + (hi - lo) * t - lb.center().x, 0.0)
+                }
+                _ => {
+                    let lo = boxes[order[0]].center().y;
+                    let hi = boxes[order[n - 1]].center().y;
+                    Pt::new(0.0, lo + (hi - lo) * t - lb.center().y)
+                }
+            };
+            let li = idx[k];
+            self.layers[li].offset = self.layers[li].offset.add(d);
+        }
+        self.dirty = true;
+    }
+
+    fn export_art_svg(&mut self) {
+        let svg = stitchforge::project::art_svg(&self.layers, &self.chart);
+        let name = format!("{}-art.svg", self.design_name);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut dlg = rfd::FileDialog::new()
+                .set_title("Save the artwork as SVG")
+                .add_filter("SVG", &["svg"])
+                .set_file_name(&name);
+            if let Some(d) = &self.last_dir {
+                dlg = dlg.set_directory(d);
+            }
+            if let Some(p) = dlg.save_file() {
+                match std::fs::write(&p, svg) {
+                    Ok(()) => self.status = format!("Saved the artwork to {}", p.display()),
+                    Err(e) => self.error = Some(format!("Couldn't save: {e}")),
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            web::download(&name, svg.into_bytes());
+        }
+    }
+
+    /// Path operations, alignment and border, for the menu and the panel.
+    fn path_tools(&mut self, ui: &mut egui::Ui, in_menu: bool) {
+        let n = self.sel_layers().len();
+        let mut go: Option<u8> = None;
+        let b = |ui: &mut egui::Ui, on: bool, label: &str, tip: &str| -> bool {
+            ui.add_enabled(on, egui::Button::new(label)).on_hover_text(tip).clicked()
+        };
+        let wrap = |ui: &mut egui::Ui, f: &mut dyn FnMut(&mut egui::Ui)| {
+            if in_menu {
+                f(ui)
+            } else {
+                ui.horizontal_wrapped(|ui| f(ui));
+            }
+        };
+        wrap(ui, &mut |ui| {
+            if b(ui, n >= 2, "Union", "Merge the selected shapes into one") { go = Some(0); }
+            if b(ui, n >= 2, "Subtract", "Cut the upper shapes out of the lowest one") { go = Some(1); }
+            if b(ui, n >= 2, "Intersect", "Keep only where they all overlap") { go = Some(2); }
+            if b(ui, n >= 2, "Exclude", "Keep where exactly one covers") { go = Some(3); }
+        });
+        if in_menu { ui.separator(); }
+        wrap(ui, &mut |ui| {
+            if b(ui, n >= 2, "Combine", "Put the selected shapes in one layer") { go = Some(4); }
+            if b(ui, n == 1, "Break apart", "Split a layer into its separate pieces") { go = Some(5); }
+            if b(ui, n >= 1, "Outline to fill", "Turn an outline into the filled shape it covers") { go = Some(6); }
+            if b(ui, true, "Border…", "Add a border around the selection (or the whole design)") { go = Some(7); }
+        });
+        if in_menu { ui.separator(); }
+        wrap(ui, &mut |ui| {
+            if b(ui, n >= 1, "Flip ↔", "Mirror left to right") { go = Some(8); }
+            if b(ui, n >= 1, "Flip ↕", "Mirror top to bottom") { go = Some(9); }
+        });
+        if !in_menu && n >= 2 {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Align").weak());
+                for (k, lbl, tip) in [
+                    (10u8, "Left", "Align left edges"),
+                    (11, "Center", "Align centres across"),
+                    (12, "Right", "Align right edges"),
+                    (13, "Top", "Align top edges"),
+                    (14, "Middle", "Align centres down"),
+                    (15, "Bottom", "Align bottom edges"),
+                ] {
+                    if b(ui, true, lbl, tip) { go = Some(k); }
+                }
+                if b(ui, n >= 3, "Spread ↔", "Even spacing across") { go = Some(16); }
+                if b(ui, n >= 3, "Spread ↕", "Even spacing down") { go = Some(17); }
+            });
+        }
+        if let Some(k) = go {
+            if in_menu {
+                ui.close();
+            }
+            match k {
+                0 => self.path_bool(BoolOp::Union),
+                1 => self.path_bool(BoolOp::Subtract),
+                2 => self.path_bool(BoolOp::Intersect),
+                3 => self.path_bool(BoolOp::Exclude),
+                4 => self.combine(),
+                5 => self.break_apart(),
+                6 => self.outline_stroke(),
+                7 => self.show_border = true,
+                8 => self.flip(true),
+                9 => self.flip(false),
+                10..=17 => self.align(k - 10),
+                _ => {}
+            }
+        }
+    }
+
+    /// Style of new shapes (shown while a drawing tool is active).
+    fn draw_options(&mut self, ui: &mut egui::Ui) {
+        section(ui, "New shapes");
+        let st = &mut self.style;
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut st.fill_on, "Fill");
+            ui.color_edit_button_srgb(&mut st.fill);
+            ui.add_space(8.0);
+            ui.checkbox(&mut st.stroke_on, "Outline");
+            ui.color_edit_button_srgb(&mut st.stroke);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Outline width");
+            ui.add(egui::DragValue::new(&mut st.stroke_w).speed(0.05).range(0.2..=10.0).suffix(" mm").max_decimals(2));
+            ui.label(RichText::new("≥ 1.2 mm sews as satin").weak().small());
+        });
+        match self.tool {
+            Tool::Rect => {
+                ui.horizontal(|ui| {
+                    ui.label("Corner radius");
+                    ui.add(egui::DragValue::new(&mut st.corner).speed(0.1).range(0.0..=50.0).suffix(" mm").max_decimals(1));
+                });
+            }
+            Tool::Polygon => {
+                ui.horizontal(|ui| {
+                    ui.label("Points");
+                    ui.add(egui::DragValue::new(&mut st.sides).range(3..=24));
+                    ui.checkbox(&mut st.star, "Star");
+                    if st.star {
+                        ui.label("Inner");
+                        ui.add(egui::DragValue::new(&mut st.inner).speed(0.01).range(0.1..=0.9).max_decimals(2));
+                    }
+                });
+            }
+            _ => {}
+        }
+        ui.checkbox(&mut self.snap, "Snap to the 1 mm grid")
+            .on_hover_text("Points always snap to existing anchors nearby");
+        ui.label(RichText::new("Open paths and outline-only shapes become outlines; closed shapes with Fill become filled layers.").weak().small());
+        ui.add_space(4.0);
+    }
+
+    /// Border settings window.
+    fn border_window(&mut self, ctx: &egui::Context) {
+        if !self.show_border {
+            return;
+        }
+        let mut open = true;
+        let mut go = false;
+        egui::Window::new("Add a border")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let n = self.sel_layers().len();
+                ui.label(if n == 0 {
+                    "Around the whole design".to_string()
+                } else {
+                    format!("Around the {n} selected layer(s)")
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Distance out");
+                    ui.add(egui::DragValue::new(&mut self.border_dist).speed(0.1).range(-10.0..=30.0).suffix(" mm").max_decimals(1));
+                });
+                ui.checkbox(&mut self.border_round, "Rounded corners");
+                ui.radio_value(&mut self.border_outline, true, "Satin outline (sewn last, on top)");
+                ui.radio_value(&mut self.border_outline, false, "Backing shape (fill, sewn first, underneath)");
+                if self.border_outline {
+                    ui.horizontal(|ui| {
+                        ui.label("Satin width");
+                        ui.add(egui::DragValue::new(&mut self.border_width).speed(0.05).range(0.6..=8.0).suffix(" mm").max_decimals(1));
+                    });
+                }
+                if ui.button(RichText::new("Add border").strong()).clicked() {
+                    go = true;
+                }
+            });
+        if go {
+            self.add_border();
+        }
+        if !open {
+            self.show_border = false;
+        }
     }
 
     /// Mouse input while editing a design object's stitches or shape.
@@ -4031,6 +5114,36 @@ impl App {
         }
     }
 
+    /// The tool strip down the left edge.
+    fn tool_strip(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        let mut pick: Option<Tool> = None;
+        for t in Tool::ALL {
+            if matches!(t, Tool::Pen) {
+                ui.add_space(6.0);
+            }
+            let on = self.tool == t;
+            let (r, resp) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
+            let v = ui.visuals();
+            let bg = if on {
+                v.selection.bg_fill
+            } else if resp.hovered() {
+                v.widgets.hovered.bg_fill
+            } else {
+                Color32::TRANSPARENT
+            };
+            ui.painter().rect_filled(r, 6.0, bg);
+            let ink = if on { Color32::WHITE } else { v.text_color() };
+            tool_icon(ui.painter(), r.shrink(9.0), t, ink);
+            if resp.on_hover_text(t.hint()).clicked() {
+                pick = Some(t);
+            }
+        }
+        if let Some(t) = pick {
+            self.set_tool(t);
+        }
+    }
+
     fn text_window(&mut self, ctx: &egui::Context) {
         if !self.show_text {
             return;
@@ -4165,6 +5278,33 @@ impl eframe::App for App {
         // shortcuts (ignored while typing in a field)
         let typing = ctx.wants_keyboard_input();
         let edit_used = !typing && self.edit != Edit::None && self.edit_keys(ctx);
+        let mut pen_used = false;
+        if !typing && !self.pen.is_empty() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                self.finish_pen(false);
+                pen_used = true;
+            } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.pen.clear();
+                pen_used = true;
+            } else if ctx.input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete)) {
+                self.pen.pop();
+                pen_used = true;
+            }
+        }
+        let edit_used = edit_used || pen_used;
+        if !typing && !edit_used && self.machine.is_none() && self.tab == Tab::Design {
+            let plain = ctx.input(|i| !i.modifiers.command && !i.modifiers.alt);
+            if plain {
+                for t in Tool::ALL {
+                    if ctx.input(|i| i.key_pressed(t.key())) && !(t == Tool::Text && self.show_text) {
+                        self.set_tool(t);
+                    }
+                }
+            }
+            if self.tool.draws() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.set_tool(Tool::Select);
+            }
+        }
         let (cmd, shift) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
         let pressed = |k: egui::Key| ctx.input(|i| i.key_pressed(k));
         if cmd && pressed(egui::Key::O) {
@@ -4231,6 +5371,16 @@ impl eframe::App for App {
             }
         }
 
+        // multi-select always holds the main selection
+        {
+            let ids: std::collections::HashSet<u64> = self.layers.iter().map(|l| l.id).collect();
+            self.multi.retain(|id| ids.contains(id));
+            match self.selected {
+                Some(sid) if !self.multi.contains(&sid) => self.multi = [sid].into_iter().collect(),
+                None => self.multi.clear(),
+                _ => {}
+            }
+        }
         // editing ends if the object is no longer the selected one
         if self.edit != Edit::None {
             let still = self
@@ -4292,6 +5442,12 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
+        if self.machine.is_none() && self.tab == Tab::Design {
+            egui::SidePanel::left("tools")
+                .resizable(false)
+                .exact_width(48.0)
+                .show(ctx, |ui| self.tool_strip(ui));
+        }
         egui::SidePanel::left("layers")
             .resizable(true)
             .default_width(320.0)
@@ -4326,6 +5482,7 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| self.canvas(ui, now));
         self.text_window(ctx);
+        self.border_window(ctx);
         self.export_window(ctx);
         self.confirm_window(ctx);
     }
@@ -4531,6 +5688,71 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
     }
     let p = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
     Some([p(0)?, p(2)?, p(4)?])
+}
+
+/// Small line icons for the tool strip, drawn in the box `r`.
+fn tool_icon(p: &egui::Painter, r: Rect, t: Tool, ink: Color32) {
+    let s = Stroke::new(1.6_f32, ink);
+    let at = |x: f32, y: f32| Pos2::new(r.left() + x * r.width(), r.top() + y * r.height());
+    match t {
+        Tool::Select => {
+            p.add(EShape::convex_polygon(
+                vec![at(0.2, 0.0), at(0.85, 0.55), at(0.5, 0.6), at(0.3, 0.95)],
+                ink,
+                Stroke::NONE,
+            ));
+        }
+        Tool::Nodes => {
+            p.add(EShape::QuadraticBezier(egui::epaint::QuadraticBezierShape::from_points_stroke(
+                [at(0.05, 0.85), at(0.5, -0.1), at(0.95, 0.85)],
+                false,
+                Color32::TRANSPARENT,
+                s,
+            )));
+            for q in [at(0.05, 0.85), at(0.95, 0.85)] {
+                p.rect_filled(Rect::from_center_size(q, Vec2::splat(6.0)), 1.0, ink);
+            }
+            p.rect_stroke(Rect::from_center_size(at(0.5, 0.38), Vec2::splat(6.0)), 1.0, s, egui::StrokeKind::Inside);
+        }
+        Tool::Stitches => {
+            let pts = [at(0.05, 0.2), at(0.3, 0.8), at(0.5, 0.2), at(0.7, 0.8), at(0.95, 0.2)];
+            p.add(EShape::line(pts.to_vec(), s));
+            for q in pts {
+                p.circle_filled(q, 2.2, ink);
+            }
+        }
+        Tool::Pen => {
+            p.add(EShape::convex_polygon(
+                vec![at(0.5, 0.0), at(0.85, 0.45), at(0.62, 0.95), at(0.38, 0.95), at(0.15, 0.45)],
+                Color32::TRANSPARENT,
+                s,
+            ));
+            p.line_segment([at(0.5, 0.15), at(0.5, 0.6)], s);
+            p.circle_filled(at(0.5, 0.62), 2.0, ink);
+        }
+        Tool::Rect => {
+            p.rect_stroke(Rect::from_min_max(at(0.05, 0.15), at(0.95, 0.85)), 2.0, s, egui::StrokeKind::Inside);
+        }
+        Tool::Ellipse => {
+            p.add(EShape::ellipse_stroke(at(0.5, 0.5), Vec2::new(r.width() * 0.47, r.height() * 0.36), s));
+        }
+        Tool::Polygon => {
+            let mut v = Vec::new();
+            for i in 0..10 {
+                let a = std::f32::consts::TAU * i as f32 / 10.0 - std::f32::consts::FRAC_PI_2;
+                let rr = if i % 2 == 0 { 0.5 } else { 0.22 };
+                v.push(at(0.5 + rr * a.cos(), 0.53 + rr * a.sin()));
+            }
+            v.push(v[0]);
+            p.add(EShape::line(v, s));
+        }
+        Tool::Line => {
+            p.line_segment([at(0.05, 0.95), at(0.95, 0.05)], s);
+        }
+        Tool::Text => {
+            p.text(at(0.5, 0.5), egui::Align2::CENTER_CENTER, "T", egui::FontId::proportional(r.height() * 1.15), ink);
+        }
+    }
 }
 
 /// A stitch setting a layer can set for itself; blank means the fabric's.

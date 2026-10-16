@@ -830,3 +830,331 @@ pub fn simplify(pts: &[Pt], tol: f64) -> Vec<Pt> {
         .map(|(p, _)| *p)
         .collect()
 }
+
+/// Is point `p` inside the closed ring `r` (even-odd)?
+pub fn in_ring(r: &[Pt], p: Pt) -> bool {
+    let mut inside = false;
+    let n = r.len();
+    for i in 0..n {
+        let (a, b) = (r[i], r[(i + 1) % n]);
+        if (a.y > p.y) != (b.y > p.y) {
+            let x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
+            if x > p.x {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// The outer outlines only (holes dropped): rings not inside another ring.
+pub fn outer_rings(rings: &[Ring]) -> Vec<Ring> {
+    rings
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| {
+            let Some(&p) = r.first() else { return false };
+            let depth = rings
+                .iter()
+                .enumerate()
+                .filter(|(j, o)| j != i && o.len() >= 3 && in_ring(o, p))
+                .count();
+            depth % 2 == 0
+        })
+        .map(|(_, r)| r.clone())
+        .collect()
+}
+
+// ---------------------------------------------------------------- curve fitting
+
+fn bez_at(b: &[Pt; 4], t: f64) -> Pt {
+    cubic_at(b[0], b[1], b[2], b[3], t)
+}
+
+fn bez_d1(b: &[Pt; 4], t: f64) -> Pt {
+    let mt = 1.0 - t;
+    b[1].sub(b[0])
+        .mul(3.0 * mt * mt)
+        .add(b[2].sub(b[1]).mul(6.0 * mt * t))
+        .add(b[3].sub(b[2]).mul(3.0 * t * t))
+}
+
+fn bez_d2(b: &[Pt; 4], t: f64) -> Pt {
+    let mt = 1.0 - t;
+    b[2].sub(b[1].mul(2.0)).add(b[0])
+        .mul(6.0 * mt)
+        .add(b[3].sub(b[2].mul(2.0)).add(b[1]).mul(6.0 * t))
+}
+
+fn dot(a: Pt, b: Pt) -> f64 {
+    a.x * b.x + a.y * b.y
+}
+
+/// Least-squares cubic through `pts` with fixed end tangents (`t1` leaving
+/// the start, `t2` pointing back from the end).
+fn fit_one(pts: &[Pt], u: &[f64], t1: Pt, t2: Pt) -> [Pt; 4] {
+    let (p0, pn) = (pts[0], *pts.last().unwrap());
+    let (mut c00, mut c01, mut c11, mut x0, mut x1) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for (p, &t) in pts.iter().zip(u) {
+        let mt = 1.0 - t;
+        let (b0, b1, b2, b3) = (mt * mt * mt, 3.0 * t * mt * mt, 3.0 * t * t * mt, t * t * t);
+        let (a1, a2) = (t1.mul(b1), t2.mul(b2));
+        c00 += dot(a1, a1);
+        c01 += dot(a1, a2);
+        c11 += dot(a2, a2);
+        let tmp = p.sub(p0.mul(b0 + b1).add(pn.mul(b2 + b3)));
+        x0 += dot(a1, tmp);
+        x1 += dot(a2, tmp);
+    }
+    let det = c00 * c11 - c01 * c01;
+    let seg = p0.dist(pn);
+    let (mut al, mut ar) = if det.abs() > 1e-12 {
+        ((x0 * c11 - x1 * c01) / det, (c00 * x1 - c01 * x0) / det)
+    } else {
+        (seg / 3.0, seg / 3.0)
+    };
+    if al < seg * 1e-6 || ar < seg * 1e-6 || al > seg * 3.0 || ar > seg * 3.0 {
+        al = seg / 3.0;
+        ar = seg / 3.0;
+    }
+    [p0, p0.add(t1.mul(al)), pn.add(t2.mul(ar)), pn]
+}
+
+fn fit_rec(pts: &[Pt], t1: Pt, t2: Pt, tol: f64, out: &mut Vec<[Pt; 4]>, depth: usize) {
+    let n = pts.len();
+    if n == 2 {
+        let d = pts[0].dist(pts[1]) / 3.0;
+        out.push([pts[0], pts[0].add(t1.mul(d)), pts[1].add(t2.mul(d)), pts[1]]);
+        return;
+    }
+    // chord-length parameters
+    let mut u = vec![0.0; n];
+    for i in 1..n {
+        u[i] = u[i - 1] + pts[i].dist(pts[i - 1]);
+    }
+    let total = u[n - 1].max(1e-12);
+    u.iter_mut().for_each(|x| *x /= total);
+    let mut bez = fit_one(pts, &u, t1, t2);
+    let err = |b: &[Pt; 4], u: &[f64]| -> (f64, usize) {
+        let mut m = (0.0, n / 2);
+        for i in 1..n - 1 {
+            let d = bez_at(b, u[i]).dist(pts[i]);
+            if d > m.0 {
+                m = (d, i);
+            }
+        }
+        m
+    };
+    let (mut e, mut split) = err(&bez, &u);
+    if e <= tol {
+        out.push(bez);
+        return;
+    }
+    if e < tol * 6.0 {
+        for _ in 0..6 {
+            for i in 0..n {
+                let q = bez_at(&bez, u[i]).sub(pts[i]);
+                let d1 = bez_d1(&bez, u[i]);
+                let d2 = bez_d2(&bez, u[i]);
+                let den = dot(d1, d1) + dot(q, d2);
+                if den.abs() > 1e-12 {
+                    u[i] = (u[i] - dot(q, d1) / den).clamp(0.0, 1.0);
+                }
+            }
+            bez = fit_one(pts, &u, t1, t2);
+            (e, split) = err(&bez, &u);
+            if e <= tol {
+                out.push(bez);
+                return;
+            }
+        }
+    }
+    if depth > 40 {
+        out.push(bez);
+        return;
+    }
+    let split = split.clamp(1, n - 2);
+    let tc = pts[split - 1].sub(pts[split + 1]);
+    let tc = if tc.len() < 1e-12 { t2 } else { tc.norm() };
+    fit_rec(&pts[..=split], t1, tc, tol, out, depth + 1);
+    fit_rec(&pts[split..], tc.mul(-1.0), t2, tol, out, depth + 1);
+}
+
+/// Smooth Bézier path through a dense polyline: anchors at real corners,
+/// curves fitted (within `tol` mm) everywhere else. Turns traced or
+/// computed outlines (booleans, offsets, text) into paths with few anchors.
+pub fn fit_path(points: &[Pt], closed: bool, tol: f64) -> VPath {
+    let mut src = points.to_vec();
+    src.dedup_by(|a, b| a.dist(*b) < 1e-6);
+    if closed && src.len() > 1 && src[0].dist(*src.last().unwrap()) < 1e-6 {
+        src.pop();
+    }
+    if src.len() < 3 {
+        return VPath::from_polyline(&src, closed, tol);
+    }
+    // even spacing so corner tests see the same scale everywhere
+    let mut ring = src.clone();
+    if closed {
+        ring.push(src[0]);
+    }
+    let mut pts = resample(&ring, 0.15);
+    if closed {
+        pts.pop();
+        while pts.len() > 3 && pts[0].dist(*pts.last().unwrap()) < 0.075 {
+            pts.pop();
+        }
+        // start the loop on its straightest stretch, so a corner never sits
+        // on the seam and gets counted twice
+        let m = pts.len();
+        if m > 8 {
+            let straight = |i: usize| -> f64 {
+                let (a, b, c) = (pts[(i + m - 3) % m], pts[i], pts[(i + 3) % m]);
+                let (u, v) = (b.sub(a), c.sub(b));
+                if u.len() < 1e-9 || v.len() < 1e-9 {
+                    return 0.0;
+                }
+                dot(u.norm(), v.norm())
+            };
+            let best = (0..m)
+                .max_by(|&i, &j| straight(i).partial_cmp(&straight(j)).unwrap())
+                .unwrap_or(0);
+            pts.rotate_left(best);
+        }
+    }
+    let n = pts.len();
+    if n < 4 {
+        return VPath::from_polyline(&src, closed, tol);
+    }
+    let at = |i: isize| -> Pt {
+        if closed {
+            pts[i.rem_euclid(n as isize) as usize]
+        } else {
+            pts[i.clamp(0, n as isize - 1) as usize]
+        }
+    };
+    // corners: direction changes of more than ~35° over ±0.45 mm
+    let k = 3isize;
+    let turn = |i: usize| -> f64 {
+        let i = i as isize;
+        if !closed && (i < k || i >= n as isize - k) {
+            return 0.0;
+        }
+        let a = at(i).sub(at(i - k));
+        let b = at(i + k).sub(at(i));
+        if a.len() < 1e-9 || b.len() < 1e-9 {
+            return 0.0;
+        }
+        dot(a.norm(), b.norm()).clamp(-1.0, 1.0).acos()
+    };
+    let turns: Vec<f64> = (0..n).map(turn).collect();
+    let mut corners: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if turns[i] > 35f64.to_radians() {
+            let mut j = i;
+            let mut best = i;
+            while j < n && turns[j] > 35f64.to_radians() {
+                if turns[j] > turns[best] {
+                    best = j;
+                }
+                j += 1;
+            }
+            corners.push(best);
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    // break points: corners (sharp) plus the open ends, or for a smooth
+    // closed loop, two opposite points (smooth joins)
+    let mut breaks: Vec<(usize, bool)> = corners.iter().map(|&c| (c, true)).collect();
+    if !closed {
+        breaks.retain(|b| b.0 > 0 && b.0 < n - 1);
+        breaks.insert(0, (0, true));
+        breaks.push((n - 1, true));
+    } else if breaks.is_empty() {
+        breaks = vec![(0, false), (n / 2, false)];
+    } else if breaks.len() == 1 {
+        let c = breaks[0].0;
+        breaks.push(((c + n / 2) % n, false));
+        breaks.sort();
+    }
+    let tangent_out = |i: usize, sharp: bool| -> Pt {
+        let i = i as isize;
+        let d = if sharp { at(i + 2).sub(at(i)) } else { at(i + 1).sub(at(i - 1)) };
+        if d.len() < 1e-12 { Pt::new(1.0, 0.0) } else { d.norm() }
+    };
+    let tangent_in = |i: usize, sharp: bool| -> Pt {
+        let ii = i as isize;
+        let d = if sharp { at(ii - 2).sub(at(ii)) } else { at(ii - 1).sub(at(ii + 1)) };
+        if d.len() < 1e-12 { Pt::new(-1.0, 0.0) } else { d.norm() }
+    };
+    let mut nodes: Vec<Node> = Vec::new();
+    let runs = if closed { breaks.len() } else { breaks.len() - 1 };
+    for r in 0..runs {
+        let (s, s_sharp) = breaks[r];
+        let (e, e_sharp) = breaks[(r + 1) % breaks.len()];
+        let seg: Vec<Pt> = if e > s {
+            pts[s..=e].to_vec()
+        } else {
+            pts[s..].iter().chain(pts[..=e].iter()).copied().collect()
+        };
+        if seg.len() < 2 {
+            continue;
+        }
+        let mut bez = Vec::new();
+        fit_rec(&seg, tangent_out(s, s_sharp), tangent_in(e, e_sharp), tol, &mut bez, 0);
+        for (bi, b) in bez.iter().enumerate() {
+            if bi == 0 {
+                if let Some(last) = nodes.last_mut().filter(|l| l.p.dist(b[0]) < 1e-9) {
+                    last.cout = b[1];
+                } else {
+                    nodes.push(Node { p: b[0], cin: b[0], cout: b[1] });
+                }
+            } else {
+                nodes.last_mut().unwrap().cout = b[1];
+            }
+            nodes.push(Node { p: b[3], cin: b[2], cout: b[3] });
+        }
+    }
+    if closed && nodes.len() > 1 && nodes[0].p.dist(nodes.last().unwrap().p) < 1e-9 {
+        let last = nodes.pop().unwrap();
+        nodes[0].cin = last.cin;
+    }
+    VPath { nodes, closed }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn circle_fits_with_few_anchors() {
+        let ring: Vec<Pt> = (0..360)
+            .map(|k| {
+                let a = (k as f64).to_radians();
+                Pt::new(20.0 * a.cos(), 20.0 * a.sin())
+            })
+            .collect();
+        let v = fit_path(&ring, true, 0.05);
+        assert!(v.nodes.len() <= 8, "{} anchors", v.nodes.len());
+        // stays on the circle
+        for p in v.flatten() {
+            assert!((p.len() - 20.0).abs() < 0.12, "{}", p.len());
+        }
+    }
+
+    #[test]
+    fn square_keeps_its_corners() {
+        let sq = vec![Pt::new(0.0, 0.0), Pt::new(10.0, 0.0), Pt::new(10.0, 10.0), Pt::new(0.0, 10.0)];
+        let v = fit_path(&sq, true, 0.05);
+        assert_eq!(v.nodes.len(), 4, "{:?}", v.nodes.iter().map(|n| n.p).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn outer_rings_drop_holes() {
+        let outer = vec![Pt::new(0.0, 0.0), Pt::new(10.0, 0.0), Pt::new(10.0, 10.0), Pt::new(0.0, 10.0)];
+        let hole = vec![Pt::new(3.0, 3.0), Pt::new(7.0, 3.0), Pt::new(7.0, 7.0), Pt::new(3.0, 7.0)];
+        assert_eq!(outer_rings(&[outer, hole]).len(), 1);
+    }
+}

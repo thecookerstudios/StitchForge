@@ -244,13 +244,13 @@ impl Shape {
         self.curves = match &self.kind {
             ShapeKind::Area { rings, .. } => rings
                 .iter()
-                .map(|r| VPath::from_polyline(r, true, 0.03))
+                .map(|r| crate::geom::fit_path(r, true, 0.03))
                 .collect(),
             ShapeKind::Line { paths, .. } => paths
                 .iter()
                 .map(|p| {
                     let closed = p.len() > 2 && p[0].dist(*p.last().unwrap()) < 1e-6;
-                    VPath::from_polyline(p, closed, 0.03)
+                    crate::geom::fit_path(p, closed, 0.03)
                 })
                 .collect(),
         };

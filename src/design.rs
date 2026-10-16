@@ -99,6 +99,27 @@ pub struct Design {
     pub layer_needles: std::collections::BTreeMap<usize, Vec<Needle>>,
 }
 
+impl Design {
+    /// An empty design (a blank canvas to draw on).
+    pub fn empty(profile: Profile, recipe: &Recipe) -> Design {
+        let mut bbox = BBox::empty();
+        bbox.add(Pt::new(-50.0, -50.0));
+        bbox.add(Pt::new(50.0, 50.0));
+        Design {
+            name: "design".into(),
+            profile,
+            recipe: recipe.clone(),
+            cmds: Vec::new(),
+            stops: Vec::new(),
+            objects: Vec::new(),
+            stats: Stats::default(),
+            bbox,
+            warnings: Vec::new(),
+            layer_needles: Default::default(),
+        }
+    }
+}
+
 /// Sequence objects. Stacking order is respected wherever objects overlap
 /// (a lower layer always sews before what covers it); within that rule:
 /// Flat — keep the current colour as long as possible, then stack order.

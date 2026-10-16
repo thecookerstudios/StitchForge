@@ -219,7 +219,7 @@ pub fn stroke_area(paths: &[Vec<Pt>], width: f64, round: bool) -> Vec<Ring> {
 pub fn rings_to_curves(rings: &[Ring]) -> Vec<VPath> {
     rings
         .iter()
-        .map(|r| VPath::from_polyline(r, true, 0.02))
+        .map(|r| crate::geom::fit_path(r, true, 0.04))
         .filter(|v| v.nodes.len() >= 3)
         .collect()
 }
