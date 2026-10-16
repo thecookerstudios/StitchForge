@@ -1,6 +1,7 @@
-# StitchForge v0.8 — embroidery app
+# StitchForge v0.9 — embroidery app
 
-Vector art and any-font text in; machine-ready DST, a printable operator
+Vector art, PDFs, pictures (PNG/JPG, even mockup photos) and any-font text
+in; machine-ready DST, a printable operator
 spec sheet, and a stitch preview out. Written in Rust, runs on Windows,
 macOS and Linux from the same code.
 
@@ -28,9 +29,49 @@ this folder for next time. If Windows SmartScreen warns about the .bat, click
 ### In the app
 
 **Files.** File menu or the top bar:
-- **Open…** (Cmd/Ctrl+O) opens a StitchForge project (`.sfg`), SVG artwork,
-  or a machine file (DST, EXP, PES). Dropping a file on the window works too
-  (an SVG dropped onto an open design is added as new layers).
+- **Open…** (Cmd/Ctrl+O) opens a StitchForge project (`.sfg`), artwork (SVG,
+  PDF, AI), a picture (PNG, JPG, BMP, GIF, WebP, TIFF) or a machine file (DST,
+  EXP, PES). Dropping a file on the window works too (art or a picture
+  dropped onto an open design is added as new layers).
+- **Vector PDF / AI files** open straight into layers: fills, strokes, CMYK
+  and spot colours (Pantone names become the layer names). A page-sized
+  background is left out; live text, gradients and embedded pictures are
+  listed under "Check before running". A PDF that only holds a picture goes
+  to the trace window.
+
+**Trace a picture** (open a PNG/JPG, or File → Trace a picture…). Instead of
+tracing by hand, StitchForge builds the logo for you:
+- finds the background (and on a **mockup photo**, the garment too) and crops
+  to the logo; drag on the picture to set your own crop;
+- picks the real thread colours from the flat areas, so blurry edges and JPEG
+  noise don't add extra colours; matches each to the thread chart;
+- cleans up specks and slivers too small to sew, snaps circles to true
+  circles and straight-edged shapes (bars, stars, block letters) to sharp
+  polygons, and fits smooth curves everywhere else;
+- stacks colours the way a digitizer would: big fills underneath and running
+  under the colours on top (no gaps), outlines on top; letter insides and
+  other background-coloured holes are left open;
+- each color becomes a layer (pieces that sit apart, like an emblem and a
+  line of text, become separate layers) that you can edit like any art.
+
+Set the width it will sew at, the number of colours (automatic or up to 12)
+and Clean / Balanced / Fine detail; the result updates as you change them.
+Click a colour chip to leave it out, or to stitch a background-coloured area
+(white text that should be stitched on a dark shirt).
+
+**Thread weights.** 40 wt is the default. Pick the design's weight next to
+Fabric, or give any layer its own (Weight, under its thread): 60 wt for small
+lettering, 30 wt for fast coverage, 12 wt for a bold look. Spacing scales with
+the weight, a weight change gets its own stop and needle, and "Check before
+running" says when strokes are too thin for the weight (and which weight would
+work). **Weight guide** compares them side by side: needle size, spacing,
+narrowest satin, smallest letters. The operator sheet and stops CSV list each
+stop's weight, needle size and thread use; Production shows thread per piece
+and pieces per cone.
+
+**Measure (D).** Drag across a column, letter stroke or gap: shows mm and
+inches and which thread weights it suits as a satin column and as a letter
+height. Shift snaps to 15°.
 - **Save** (Cmd/Ctrl+S) / **Save As** (Shift+Cmd/Ctrl+S) keep your layers,
   edits, threads, settings and job info in a `.sfg` file. The file name and a
   • (unsaved changes) show in the window title. New, Open and quitting ask
@@ -185,6 +226,13 @@ stitchforge drops team.sfg --data roster.xlsx --columns "First Name,Last Name" \
 # What's in any DST/EXP/PES
 stitchforge inspect design.pes
 
+# A picture, mockup photo or PDF to stitches (auto-traced)
+stitchforge convert logo.png --width-in 3.5
+stitchforge convert mockup.jpg --width-in 4 --weight 60
+
+# Just the tracing: layered SVG plus a preview with the anchor points marked
+stitchforge trace logo.jpg --width-in 3.5 --colors 4 --detail clean -o logo.svg
+
 # Any installed font, no embroidery-font format
 stitchforge text "Sunny Hill" --font Poppins --height-mm 20 --color "#1b2d5c"
 stitchforge text "Team Name" --font-file MyFont.otf --profile cap
@@ -206,13 +254,19 @@ Each design writes to `out/`:
 Add `--json` to print the summary instead of text, so an agent can drive it.
 
 Options: `--profile flat|cap|both`, `--fabric pique|tshirt|fleece|twill|cap|towel`,
+`--weight 12|30|40|60` (thread weight, default 40),
 `--width-mm/--height-mm/--width-in/--height-in`, `--threads chart.csv`
 (columns `code,name,r,g,b`; file name becomes the brand).
 
 ## What the engine does
 
-- **Vector to stitch:** SVG from Illustrator, Inkscape, CorelDRAW, Affinity.
-  Curves, transforms, groups, both fill rules, gradients (first colour), text.
+- **Vector to stitch:** SVG from Illustrator, Inkscape, CorelDRAW, Affinity;
+  PDF and PDF-compatible AI files. Curves, transforms, groups, both fill
+  rules, gradients (first colour), text.
+- **Pictures to stitch:** PNG/JPG/mockup photos auto-traced into stacked,
+  stitch-ready colour layers (see Trace a picture).
+- **Thread weights:** 40 wt default; 12/30/60 wt scale spacing, size limits,
+  needle size and thread-use estimates.
 - **Stitch type by width:** narrow shapes become satin, wide become tatami
   fill, strokes become satin columns, triple runs or runs.
 - **Lettering:** each letter is its own object; satin angle chosen per
@@ -239,6 +293,8 @@ Options: `--profile flat|cap|both`, `--fabric pique|tshirt|fleece|twill|cap|towe
 
 - Stitch on real fabric and tune recipes — that is Gate 1 in the spec.
 - Satin that turns smoothly along curves (now: up to two angles per letter).
-- PES/EXP/JEF and other formats; editable native file; raster tracing.
+- JEF and other formats.
+- Tracing: gradients and photos with shading (now: flat colours only),
+  reading text in a picture and offering it as editable lettering.
 - Desktop UI (Tauri), MCP server for AI agents, job/production database.
 - Brand thread charts (load your shop's CSV for now).

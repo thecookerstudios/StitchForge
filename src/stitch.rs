@@ -308,6 +308,11 @@ pub fn plan(
 /// The fabric's stitch settings with this layer's own changes applied.
 pub fn effective(r: &Recipe, o: &ShapeOpts) -> Recipe {
     let mut e = r.clone();
+    // recipes are tuned for 40 wt: finer thread sews closer, heavier wider
+    let w = o.weight.unwrap_or(r.weight);
+    let k = w.spacing_factor();
+    e.fill_spacing *= k;
+    e.satin_spacing *= k;
     if let Some(v) = o.density {
         e.fill_spacing = v.clamp(0.15, 3.0);
         e.satin_spacing = v.clamp(0.15, 3.0);

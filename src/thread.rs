@@ -46,6 +46,118 @@ const GENERIC: &[(&str, &str, [u8; 3])] = &[
     ("SF-063", "Copper", [180, 100, 50]),
 ];
 
+/// Thread weight (wt): the higher the number, the finer the thread. Stitch
+/// recipes are tuned for 40 wt; other weights scale spacing, limits and
+/// needle size from there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ThreadWeight {
+    W12,
+    W30,
+    #[default]
+    W40,
+    W60,
+}
+
+impl ThreadWeight {
+    pub const ALL: [ThreadWeight; 4] = [Self::W12, Self::W30, Self::W40, Self::W60];
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::W12 => "12 wt",
+            Self::W30 => "30 wt",
+            Self::W40 => "40 wt",
+            Self::W60 => "60 wt",
+        }
+    }
+    pub fn number(&self) -> u32 {
+        match self {
+            Self::W12 => 12,
+            Self::W30 => 30,
+            Self::W40 => 40,
+            Self::W60 => 60,
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().trim_end_matches("wt").trim() {
+            "12" => Some(Self::W12),
+            "30" => Some(Self::W30),
+            "40" => Some(Self::W40),
+            "60" => Some(Self::W60),
+            _ => None,
+        }
+    }
+    /// What it is typically used for.
+    pub fn use_for(&self) -> &'static str {
+        match self {
+            Self::W12 => "bold, hand-stitched look; big simple shapes",
+            Self::W30 => "fast coverage on large fills and jacket backs",
+            Self::W40 => "standard for almost everything",
+            Self::W60 => "small lettering and fine detail",
+        }
+    }
+    /// Apparent width of one strand lying on fabric (mm), for the preview.
+    pub fn strand_mm(&self) -> f64 {
+        match self {
+            Self::W12 => 0.62,
+            Self::W30 => 0.40,
+            Self::W40 => 0.33,
+            Self::W60 => 0.24,
+        }
+    }
+    /// Stitch spacing relative to 40 wt (thinner thread sews closer rows).
+    pub fn spacing_factor(&self) -> f64 {
+        match self {
+            Self::W12 => 1.9,
+            Self::W30 => 1.2,
+            Self::W40 => 1.0,
+            Self::W60 => 0.75,
+        }
+    }
+    /// Recommended needle size (metric/US).
+    pub fn needle(&self) -> &'static str {
+        match self {
+            Self::W12 => "100/16",
+            Self::W30 => "90/14",
+            Self::W40 => "75/11",
+            Self::W60 => "65/9",
+        }
+    }
+    /// Narrowest satin column that still covers and holds (mm).
+    pub fn min_column(&self) -> f64 {
+        match self {
+            Self::W12 => 2.5,
+            Self::W30 => 1.3,
+            Self::W40 => 1.0,
+            Self::W60 => 0.7,
+        }
+    }
+    /// Smallest capital-letter height that reads cleanly (mm).
+    pub fn min_text_height(&self) -> f64 {
+        match self {
+            Self::W12 => 15.0,
+            Self::W30 => 6.5,
+            Self::W40 => 5.0,
+            Self::W60 => 3.5,
+        }
+    }
+    /// Thread per standard cone (m), for usage estimates.
+    pub fn cone_m(&self) -> f64 {
+        match self {
+            Self::W12 => 1000.0,
+            Self::W30 => 2500.0,
+            Self::W40 => 5000.0,
+            Self::W60 => 5000.0,
+        }
+    }
+}
+
+/// Estimated thread use for a run of stitches: top (needle) thread and
+/// bobbin, in metres. Top thread follows the stitch path plus what each
+/// penetration pulls down into the fabric; bobbin is roughly a third.
+pub fn usage_m(path_mm: f64, stitches: usize) -> (f64, f64) {
+    let top = (path_mm * 1.10 + stitches as f64 * 0.75) / 1000.0;
+    (top, top * 0.35)
+}
+
 pub fn generic_chart() -> Vec<Thread> {
     GENERIC
         .iter()
@@ -113,6 +225,35 @@ fn lab(rgb: [u8; 3]) -> [f64; 3] {
     [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
 }
 
+/// CIELAB of an sRGB colour.
+pub fn lab_of(rgb: [u8; 3]) -> [f64; 3] {
+    lab(rgb)
+}
+
+/// sRGB of a CIELAB colour (clamped to the displayable range).
+pub fn rgb_of_lab(l: [f64; 3]) -> [u8; 3] {
+    let fy = (l[0] + 16.0) / 116.0;
+    let fx = fy + l[1] / 500.0;
+    let fz = fy - l[2] / 200.0;
+    let inv = |t: f64| {
+        if t.powi(3) > 0.008856 {
+            t.powi(3)
+        } else {
+            (t - 16.0 / 116.0) / 7.787
+        }
+    };
+    let (x, y, z) = (inv(fx) * 0.95047, inv(fy), inv(fz) * 1.08883);
+    let r = 3.2406 * x - 1.5372 * y - 0.4986 * z;
+    let g = -0.9689 * x + 1.8758 * y + 0.0415 * z;
+    let b = 0.0557 * x - 0.2040 * y + 1.0570 * z;
+    let enc = |c: f64| {
+        let c = c.clamp(0.0, 1.0);
+        let v = if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+        (v * 255.0).round() as u8
+    };
+    [enc(r), enc(g), enc(b)]
+}
+
 /// Perceptual colour difference (CIE76 ΔE).
 pub fn delta_e(a: [u8; 3], b: [u8; 3]) -> f64 {
     let (p, q) = (lab(a), lab(b));
@@ -131,6 +272,14 @@ pub fn nearest(chart: &[Thread], rgb: [u8; 3]) -> (usize, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn weights() {
+        assert_eq!(ThreadWeight::default(), ThreadWeight::W40);
+        assert_eq!(ThreadWeight::parse("60wt"), Some(ThreadWeight::W60));
+        assert!(ThreadWeight::W60.spacing_factor() < 1.0);
+        let (t, b) = usage_m(10_000.0, 2000);
+        assert!(t > 10.0 && b < t);
+    }
     #[test]
     fn matches_navy_not_black() {
         let chart = generic_chart();

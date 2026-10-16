@@ -4,7 +4,7 @@ use crate::geom::{BBox, Pt};
 use crate::import::Artwork;
 use crate::settings::{Limits, Profile, Recipe};
 use crate::stitch::{Needle, Planned, StitchType, generate, plan};
-use crate::thread::Thread;
+use crate::thread::{Thread, ThreadWeight};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
@@ -20,9 +20,14 @@ pub enum Cmd {
 #[derive(Clone, Debug, Serialize)]
 pub struct Stop {
     pub thread: Thread,
+    /// Thread weight loaded on this needle (40 wt unless changed).
+    pub weight: ThreadWeight,
     pub needle: usize,
     pub stitches: usize,
     pub objects: Vec<String>,
+    /// Estimated top thread and bobbin used by this stop (m).
+    pub top_m: f64,
+    pub bobbin_m: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -31,6 +36,7 @@ pub struct ObjectInfo {
     pub label: String,
     pub stitch_type: &'static str,
     pub thread_code: String,
+    pub weight: ThreadWeight,
     pub color_match_delta_e: f64,
     pub stitches: usize,
     pub trims: usize,
@@ -80,6 +86,9 @@ pub struct Stats {
     pub run_minutes: f64,
     pub short_stitches: usize,
     pub longest_stitch_mm: f64,
+    /// Estimated thread use for one piece (m): top thread and bobbin.
+    pub top_m: f64,
+    pub bobbin_m: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -172,13 +181,13 @@ pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox, keep_order: b
     };
     let mut done = vec![false; n];
     let mut order = Vec::with_capacity(n);
-    let mut cur_thread: Option<usize> = None;
+    let mut cur_thread: Option<(usize, Option<ThreadWeight>)> = None;
     for _ in 0..n {
         let pick = (0..n)
             .filter(|&i| !done[i] && preds[i] == 0)
             .min_by_key(|&i| {
                 let o = &objs[i];
-                let color_change = (Some(o.thread) != cur_thread) as i64;
+                let color_change = (Some((o.thread, o.opts.weight)) != cur_thread) as i64;
                 match profile {
                     Profile::Flat => (0, color_change, o.stack as i64, 0),
                     // each colour center-out from the bottom; change colour
@@ -193,7 +202,7 @@ pub fn sequence(objs: &[Planned], profile: Profile, design: &BBox, keep_order: b
             })
             .expect("stacking constraints are acyclic");
         done[pick] = true;
-        cur_thread = Some(objs[pick].thread);
+        cur_thread = Some((objs[pick].thread, objs[pick].opts.weight));
         for &s in &succ[pick] {
             preds[s] -= 1;
         }
@@ -222,6 +231,10 @@ pub fn build_with(
 ) -> Result<Design, String> {
     let mut warnings = art.warnings.clone();
     let mut objs = plan(art, chart, profile, &mut warnings);
+    // every object knows its thread weight (the design's unless the layer says)
+    for o in objs.iter_mut() {
+        o.opts.weight = Some(o.opts.weight.unwrap_or(recipe.weight));
+    }
     // Hand-edited layers sew their own stitches: one object per layer.
     if !art.fixed.is_empty() {
         let mut seen = std::collections::HashSet::new();
@@ -241,12 +254,15 @@ pub fn build_with(
     let mut cmds = Vec::new();
     let mut stops: Vec<Stop> = Vec::new();
     let mut infos = Vec::new();
-    let mut needles_for_thread: Vec<usize> = Vec::new();
+    let mut needles_for_thread: Vec<(usize, ThreadWeight)> = Vec::new();
     let mut cur: Option<Pt> = None;
-    let mut cur_thread: Option<usize> = None;
+    let mut cur_thread: Option<(usize, ThreadWeight)> = None;
     let mut last_dir = Pt::new(1.0, 0.0);
     let mut last_layer: Option<usize> = None;
     let mut layer_needles: std::collections::BTreeMap<usize, Vec<Needle>> = Default::default();
+    // thinnest satin stroke per layer, for one weight warning per layer
+    let mut thin: std::collections::BTreeMap<usize, (String, ThreadWeight, f64)> =
+        Default::default();
 
     for (seq, &oi) in order.iter().enumerate() {
         let o = &objs[oi];
@@ -270,7 +286,8 @@ pub fn build_with(
         // Colour stop before this object?
         let layer_start = last_layer != Some(o.layer);
         last_layer = Some(o.layer);
-        let differs = cur_thread != Some(o.thread);
+        let wt = o.opts.weight.unwrap_or(recipe.weight);
+        let differs = cur_thread != Some((o.thread, wt));
         let new_stop = if cur_thread.is_none() {
             true
         } else if layer_start && o.stop.is_some() {
@@ -288,29 +305,40 @@ pub fn build_with(
                 tie_off(&mut cmds, cur, last_dir);
                 cmds.push(Cmd::Trim);
             }
-            let needle = match needles_for_thread.iter().position(|&t| t == o.thread) {
+            let needle = match needles_for_thread.iter().position(|&t| t == (o.thread, wt)) {
                 Some(i) => i + 1,
                 None => {
-                    needles_for_thread.push(o.thread);
+                    needles_for_thread.push((o.thread, wt));
                     needles_for_thread.len()
                 }
             };
             cmds.push(Cmd::Color(stops.len()));
             stops.push(Stop {
                 thread: chart[o.thread].clone(),
+                weight: wt,
                 needle,
                 stitches: 0,
                 objects: Vec::new(),
+                top_m: 0.0,
+                bobbin_m: 0.0,
             });
-            cur_thread = Some(o.thread);
+            cur_thread = Some((o.thread, wt));
             starts_stop = true;
         } else if differs && layer_start {
-            warnings.push(format!(
-                "{}: no stop before it, so it sews in {} instead of {}",
-                o.label,
-                chart[cur_thread.unwrap()].name,
-                chart[o.thread].name
-            ));
+            let (ct, cw) = cur_thread.unwrap();
+            if ct != o.thread {
+                warnings.push(format!(
+                    "{}: no stop before it, so it sews in {} instead of {}",
+                    o.label, chart[ct].name, chart[o.thread].name
+                ));
+            } else {
+                warnings.push(format!(
+                    "{}: no stop before it, so it sews in {} instead of {}",
+                    o.label,
+                    cw.label(),
+                    wt.label()
+                ));
+            }
         }
         let stop = stops.last_mut().unwrap();
         stop.objects.push(o.label.clone());
@@ -357,6 +385,7 @@ pub fn build_with(
             label: o.label.clone(),
             stitch_type: o.stitch_label(),
             thread_code: chart[o.thread].code.clone(),
+            weight: wt,
             color_match_delta_e: (o.color_error * 10.0).round() / 10.0,
             stitches: added,
             trims: cmds.iter().filter(|c| matches!(c, Cmd::Trim)).count() - trims_before,
@@ -370,18 +399,43 @@ pub fn build_with(
             },
             wanted_thread: o.thread,
         });
-        if o.kind == StitchType::Satin && o.bbox.width().min(o.bbox.height()) < 1.0 {
-            warnings.push(format!(
-                "{}: very narrow column (under 1 mm), may not hold",
-                o.label
-            ));
+        if o.kind == StitchType::Satin {
+            let narrow = match &o.shape {
+                crate::import::ShapeKind::Area { rings, rule } => {
+                    // typical stroke width of a lettering or satin area
+                    2.0 * crate::geom::rings_area(rings, *rule)
+                        / crate::geom::rings_perimeter(rings).max(1e-9)
+                }
+                _ => o.bbox.width().min(o.bbox.height()),
+            };
+            if narrow < wt.min_column() - 0.05 {
+                let e = thin.entry(o.layer).or_insert((piece_name(&o.label), wt, narrow));
+                e.2 = e.2.min(narrow);
+            }
         }
     }
     tie_off(&mut cmds, cur, last_dir);
     cmds.push(Cmd::Trim);
     cmds.push(Cmd::End);
 
-    let stats = compute_stats(&cmds, &bbox, profile);
+    for (name, wt, narrow) in thin.values() {
+        let finer = ThreadWeight::ALL
+            .iter()
+            .filter(|w| w.min_column() <= *narrow + 0.05 && **w != *wt)
+            .max_by(|a, b| a.min_column().partial_cmp(&b.min_column()).unwrap());
+        let tip = match finer {
+            Some(f) if f.number() > wt.number() => format!(" — try {}", f.label()),
+            _ => " — enlarge it or use a run stitch".into(),
+        };
+        warnings.push(format!(
+            "{name}: strokes as thin as {:.1} mm; {} needs {:.1} mm{tip}",
+            narrow,
+            wt.label(),
+            wt.min_column()
+        ));
+    }
+    let mut stats = compute_stats(&cmds, &bbox, profile);
+    thread_usage(&cmds, &mut stops, &mut stats);
     let (fw, fh) = profile.frame_limit();
     if bbox.width() > fw || bbox.height() > fh {
         warnings.push(format!(
@@ -407,11 +461,7 @@ pub fn build_with(
             let name = objs
                 .iter()
                 .find(|o| o.layer == i.layer)
-                .map(|o| match o.label.rsplit_once(' ') {
-                    // "Name 3" is piece 3 of layer "Name"
-                    Some((head, n)) if n.chars().all(|c| c.is_ascii_digit()) => head.to_string(),
-                    _ => o.label.clone(),
-                })
+                .map(|o| piece_name(&o.label))
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| i.label.clone());
             warnings.push(format!(
@@ -432,6 +482,16 @@ pub fn build_with(
         warnings,
         layer_needles,
     })
+}
+
+/// "Name 3" is piece 3 of layer "Name".
+fn piece_name(label: &str) -> String {
+    match label.rsplit_once(' ') {
+        Some((head, n)) if !head.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+            head.to_string()
+        }
+        _ => label.to_string(),
+    }
 }
 
 fn tie_off(cmds: &mut Vec<Cmd>, cur: Option<Pt>, dir: Pt) {
@@ -485,6 +545,7 @@ pub fn from_machine(
                 label: format!("Stop {}", i + 1),
                 stitch_type: "Stitches",
                 thread_code: st.thread.code.clone(),
+                weight: st.weight,
                 color_match_delta_e: 0.0,
                 stitches: count,
                 trims,
@@ -514,9 +575,12 @@ pub fn from_machine(
                 };
                 stops.push(Stop {
                     thread: t,
+                    weight: recipe.weight,
                     needle,
                     stitches: 0,
                     objects: vec![format!("Stop {}", k + 1)],
+                    top_m: 0.0,
+                    bobbin_m: 0.0,
                 });
                 start = i;
                 count = 0;
@@ -528,7 +592,8 @@ pub fn from_machine(
         }
     }
     close(&mut stops, &mut objects, cmds.len(), count, trims, start);
-    let stats = compute_stats(&cmds, &bbox, profile);
+    let mut stats = compute_stats(&cmds, &bbox, profile);
+    thread_usage(&cmds, &mut stops, &mut stats);
     Ok(Design {
         name: name.into(),
         profile,
@@ -541,6 +606,43 @@ pub fn from_machine(
         warnings: Vec::new(),
         layer_needles: Default::default(),
     })
+}
+
+/// Fill in each stop's estimated thread use and the design total.
+pub fn thread_usage(cmds: &[Cmd], stops: &mut [Stop], stats: &mut Stats) {
+    let mut path = vec![0.0f64; stops.len()];
+    let mut count = vec![0usize; stops.len()];
+    let mut stop: Option<usize> = None;
+    let mut prev: Option<Pt> = None;
+    for c in cmds {
+        match *c {
+            Cmd::Color(i) => {
+                stop = Some(i);
+                prev = None;
+            }
+            Cmd::Jump(p) => prev = Some(p),
+            Cmd::Trim => prev = None,
+            Cmd::Stitch(p) => {
+                if let Some(i) = stop.filter(|&i| i < path.len()) {
+                    if let Some(q) = prev {
+                        path[i] += q.dist(p);
+                    }
+                    count[i] += 1;
+                }
+                prev = Some(p);
+            }
+            Cmd::End => {}
+        }
+    }
+    stats.top_m = 0.0;
+    stats.bobbin_m = 0.0;
+    for (i, st) in stops.iter_mut().enumerate() {
+        let (t, b) = crate::thread::usage_m(path[i], count[i]);
+        st.top_m = t;
+        st.bobbin_m = b;
+        stats.top_m += t;
+        stats.bobbin_m += b;
+    }
 }
 
 fn compute_stats(cmds: &[Cmd], bbox: &BBox, profile: Profile) -> Stats {

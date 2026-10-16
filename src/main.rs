@@ -21,9 +21,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Convert an SVG file (from Illustrator, Inkscape, CorelDRAW, Affinity...) to stitches
+    /// Convert artwork to stitches: SVG, PDF/AI, or a picture (PNG/JPG, auto-traced)
     Convert {
-        /// Input SVG file
+        /// Input file (SVG, PDF, AI, PNG, JPG…)
         input: PathBuf,
         #[command(flatten)]
         out: OutputArgs,
@@ -86,6 +86,28 @@ enum Command {
         #[arg(long, short, default_value = "out")]
         out_dir: PathBuf,
     },
+    /// Auto-trace a picture (PNG/JPG, mockup photo, or PDF) into layered vector art (SVG)
+    Trace {
+        input: PathBuf,
+        /// Width the logo will sew at, inches
+        #[arg(long, default_value_t = 4.0)]
+        width_in: f64,
+        /// Most thread colours (0 = automatic)
+        #[arg(long, default_value_t = 0)]
+        colors: usize,
+        /// clean, balanced or fine
+        #[arg(long, default_value = "balanced")]
+        detail: String,
+        /// auto, logo or mockup
+        #[arg(long, default_value = "auto")]
+        source: String,
+        /// Keep the background colour instead of removing it
+        #[arg(long)]
+        keep_background: bool,
+        /// Output SVG (a preview PNG is written next to it)
+        #[arg(long, short)]
+        out: PathBuf,
+    },
     /// List installed font families
     Fonts,
     /// Read a DST file and report what is in it
@@ -100,6 +122,9 @@ struct OutputArgs {
     /// Fabric recipe: pique, tshirt, fleece, twill, cap, towel (default depends on profile)
     #[arg(long)]
     fabric: Option<String>,
+    /// Thread weight: 12, 30, 40 (default) or 60
+    #[arg(long, default_value = "40")]
+    weight: String,
     /// Final design width in mm (keeps proportions)
     #[arg(long)]
     width_mm: Option<f64>,
@@ -150,8 +175,8 @@ fn main() {
     let result = match cli.cmd {
         Command::Convert { input, out } => {
             let name = out.name.clone().unwrap_or_else(|| stem(&input));
-            import::load_svg_file(&input.to_string_lossy(), None)
-                .and_then(|art| produce(art, &name, &out))
+            let w = out.width_mm.or(out.width_in.map(|v| v * 25.4));
+            import::load_file(&input.to_string_lossy(), w).and_then(|art| produce(art, &name, &out))
         }
         Command::Text {
             text,
@@ -219,6 +244,15 @@ fn main() {
             &formats,
             &out_dir,
         ),
+        Command::Trace {
+            input,
+            width_in,
+            colors,
+            detail,
+            source,
+            keep_background,
+            out,
+        } => run_trace(&input, width_in, colors, &detail, &source, keep_background, &out),
         Command::Fonts => {
             for f in import::list_fonts() {
                 println!("{f}");
@@ -231,6 +265,97 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+fn run_trace(
+    input: &std::path::Path,
+    width_in: f64,
+    colors: usize,
+    detail: &str,
+    source: &str,
+    keep_background: bool,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    use stitchforge::trace::{self, Detail, Source, TraceOptions};
+    let bytes = std::fs::read(input).map_err(|e| format!("cannot read {}: {e}", input.display()))?;
+    let lower = input.to_string_lossy().to_lowercase();
+    let pic = if lower.ends_with(".pdf") || lower.ends_with(".ai") {
+        stitchforge::pdf::read(&bytes)?
+            .picture
+            .ok_or("this PDF has vector art; open it directly instead of tracing")?
+    } else {
+        trace::Raster::decode(&bytes)?
+    };
+    let o = TraceOptions {
+        width_mm: width_in * 25.4,
+        max_colors: colors,
+        detail: match detail {
+            "clean" => Detail::Clean,
+            "fine" => Detail::Fine,
+            _ => Detail::Balanced,
+        },
+        source: match source {
+            "logo" => Source::Logo,
+            "mockup" => Source::Mockup,
+            _ => Source::Auto,
+        },
+        remove_background: !keep_background,
+        ..Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    let t = trace::trace(&pic, &o)?;
+    let svg = t.to_svg();
+    std::fs::write(out, &svg).map_err(|e| e.to_string())?;
+    println!(
+        "{}: {:.2}\" × {:.2}\" · {} colors · traced in {:.2}s{}",
+        out.display(),
+        width_in,
+        t.height_mm() / 25.4,
+        t.layers.len(),
+        t0.elapsed().as_secs_f64(),
+        if t.mockup { " · mockup (garment removed)" } else { "" }
+    );
+    for l in &t.layers {
+        let nodes: usize = l.paths.iter().map(|p| p.nodes.len()).sum();
+        println!(
+            "  {} #{:02x}{:02x}{:02x}{} · {} paths, {} points",
+            l.name,
+            l.rgb[0],
+            l.rgb[1],
+            l.rgb[2],
+            if t.palette[l.color].like_background { " (same as background)" } else { "" },
+            l.paths.len(),
+            nodes
+        );
+    }
+    for n in &t.notes {
+        println!("  ! {n}");
+    }
+    // preview with the anchor points marked
+    let mut marked = svg.trim_end().trim_end_matches("</svg>").to_string();
+    for l in &t.layers {
+        for p in &l.paths {
+            for nd in &p.nodes {
+                marked.push_str(&format!(
+                    "<circle cx='{:.2}' cy='{:.2}' r='0.25' fill='{}'/>",
+                    nd.p.x,
+                    nd.p.y,
+                    if nd.is_smooth() { "#00b050" } else { "#ff2080" }
+                ));
+            }
+        }
+    }
+    marked.push_str("</svg>");
+    let tree = usvg::Tree::from_str(&marked, &usvg::Options::default()).map_err(|e| e.to_string())?;
+    let k = 8.0 * 25.4 / 96.0; // 8 px per mm
+    let (pw, ph) = ((tree.size().width() * k).ceil() as u32, (tree.size().height() * k).ceil() as u32);
+    let mut pix = resvg::tiny_skia::Pixmap::new(pw.max(1), ph.max(1)).ok_or("preview too large")?;
+    pix.fill(resvg::tiny_skia::Color::from_rgba8(255, 255, 255, 255));
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(k, k), &mut pix.as_mut());
+    let png = out.with_extension("preview.png");
+    pix.save_png(&png).map_err(|e| e.to_string())?;
+    println!("  -> {}", png.display());
+    Ok(())
 }
 
 fn produce(mut art: import::Artwork, name: &str, o: &OutputArgs) -> Result<(), String> {
@@ -255,10 +380,12 @@ fn produce(mut art: import::Artwork, name: &str, o: &OutputArgs) -> Result<(), S
             .fabric
             .clone()
             .unwrap_or_else(|| profile.default_recipe().into());
-        let recipe = settings::recipe(&fabric).ok_or(format!(
+        let mut recipe = settings::recipe(&fabric).ok_or(format!(
             "unknown fabric '{fabric}' (use {})",
             settings::RECIPES.join(", ")
         ))?;
+        recipe.weight = stitchforge::thread::ThreadWeight::parse(&o.weight)
+            .ok_or(format!("unknown thread weight '{}' (use 12, 30, 40 or 60)", o.weight))?;
         let base = if o.profile == "both" {
             format!(
                 "{name}-{}",
@@ -322,12 +449,14 @@ fn print_human(d: &design::Design, base: &str, dir: &std::path::Path) {
     );
     for (i, st) in d.stops.iter().enumerate() {
         println!(
-            "  stop {} · needle {} · {} {} · {} stitches",
+            "  stop {} · needle {} · {} {} · {} · {} stitches · ~{:.0} m thread",
             i + 1,
             st.needle,
             st.thread.code,
             st.thread.name,
-            st.stitches
+            st.weight.label(),
+            st.stitches,
+            st.top_m
         );
     }
     for w in &d.warnings {

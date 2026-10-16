@@ -175,6 +175,9 @@ pub struct ShapeOpts {
     pub underlay_inset: Option<f64>,
     /// Tatami needle pattern repeats every N rows (2 = half offset, 3 = thirds…).
     pub stagger: Option<u8>,
+    /// Thread weight for this layer (None = the design's weight, 40 wt by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<crate::thread::ThreadWeight>,
 }
 
 impl ShapeOpts {
@@ -448,6 +451,61 @@ pub fn load_svg_file(path: &str, font_file: Option<&str>) -> Result<Artwork, Str
     load_svg_str(&data, &opt)
 }
 
+/// Open any supported artwork: SVG, a picture (PNG/JPG… auto-traced) or a
+/// PDF/AI file (its vector paths, or its picture traced). `width_mm` is the
+/// size the art will sew at, which tells the tracer how much detail to keep.
+pub fn load_file(path: &str, width_mm: Option<f64>) -> Result<Artwork, String> {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".svg") {
+        return load_svg_file(path, None);
+    }
+    let bytes = crate::vfs::read(std::path::Path::new(path)).map_err(|e| format!("cannot read {path}: {e}"))?;
+    load_bytes(&lower, &bytes, width_mm)
+}
+
+/// As `load_file`, from bytes already read (`name` gives the file type).
+pub fn load_bytes(name: &str, bytes: &[u8], width_mm: Option<f64>) -> Result<Artwork, String> {
+    let (opt, _) = font_options(None)?;
+    let lower = name.to_lowercase();
+    if lower.ends_with(".pdf") || lower.ends_with(".ai") || bytes.starts_with(b"%PDF") {
+        let pdf = crate::pdf::read(bytes)?;
+        if let Some(svg) = pdf.svg {
+            let mut art = load_svg_str(&svg, &opt)?;
+            art.warnings.extend(pdf.notes);
+            return Ok(art);
+        }
+        if let Some(pic) = pdf.picture {
+            let o = crate::trace::TraceOptions {
+                width_mm: width_mm.unwrap_or(101.6),
+                ..Default::default()
+            };
+            let t = crate::trace::trace(&pic, &o)?;
+            let mut art = load_svg_str(&t.to_svg(), &opt)?;
+            art.warnings.extend(pdf.notes);
+            art.warnings.push("The PDF holds a picture, not vector art: it was auto-traced".into());
+            art.warnings.extend(t.notes);
+            return Ok(art);
+        }
+        return Err("no vector art or picture found in the PDF".into());
+    }
+    if crate::trace::is_raster(&lower) || image_magic(bytes) {
+        let o = crate::trace::TraceOptions {
+            width_mm: width_mm.unwrap_or(101.6),
+            ..Default::default()
+        };
+        let (svg, notes) = crate::trace::trace_bytes_to_svg(bytes, &o)?;
+        let mut art = load_svg_str(&svg, &opt)?;
+        art.warnings.extend(notes);
+        return Ok(art);
+    }
+    let text = String::from_utf8_lossy(bytes);
+    load_svg_str(&text, &opt)
+}
+
+fn image_magic(b: &[u8]) -> bool {
+    b.starts_with(&[0x89, b'P', b'N', b'G']) || b.starts_with(&[0xff, 0xd8]) || b.starts_with(b"GIF8") || b.starts_with(b"BM")
+}
+
 /// Build artwork from a line of text in any font.
 pub fn load_text(
     text: &str,
@@ -552,6 +610,11 @@ pub fn apply_id_tags(opts: &mut ShapeOpts, id: &str) {
             if opts.stitch == StitchChoice::Auto {
                 opts.stitch = StitchChoice::Fill;
             }
+        }
+    }
+    for w in crate::thread::ThreadWeight::ALL {
+        if id.contains(&format!("sf-{}wt", w.number())) {
+            opts.weight = Some(w);
         }
     }
     if id.contains("sf-no-underlay") {

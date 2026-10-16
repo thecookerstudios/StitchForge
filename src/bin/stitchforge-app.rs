@@ -17,6 +17,7 @@ use stitchforge::vector::{self, BoolOp};
 use stitchforge::geom::{FillRule, VPath};
 use stitchforge::project::Embroidery;
 use stitchforge::stitch::Needle;
+use stitchforge::trace;
 use stitchforge::import::{self, Artwork, Shape, ShapeKind, ShapeOpts, StitchChoice};
 use stitchforge::import::{Cap, Corner};
 use stitchforge::project::{Layer, Project, TextSpec};
@@ -91,10 +92,11 @@ enum Tool {
     Polygon,
     Line,
     Text,
+    Measure,
 }
 
 impl Tool {
-    const ALL: [Tool; 9] = [
+    const ALL: [Tool; 10] = [
         Tool::Select,
         Tool::Nodes,
         Tool::Stitches,
@@ -104,6 +106,7 @@ impl Tool {
         Tool::Polygon,
         Tool::Line,
         Tool::Text,
+        Tool::Measure,
     ];
     fn hint(&self) -> &'static str {
         match self {
@@ -116,6 +119,7 @@ impl Tool {
             Tool::Polygon => "Polygon and star (G)\nDrag from the centre; Shift snaps the angle",
             Tool::Line => "Line (L)\nDrag; Shift snaps to 15°",
             Tool::Text => "Text (T)\nClick where the words go",
+            Tool::Measure => "Measure (D)\nDrag across a column or gap to see its size and which thread weights it suits",
         }
     }
     fn key(&self) -> egui::Key {
@@ -129,6 +133,7 @@ impl Tool {
             Tool::Polygon => egui::Key::G,
             Tool::Line => egui::Key::L,
             Tool::Text => egui::Key::T,
+            Tool::Measure => egui::Key::D,
         }
     }
     /// Tools that make new shapes on the canvas.
@@ -258,6 +263,11 @@ struct App {
     snap: bool,
     text_at: Option<Pt>,
     show_border: bool,
+    show_weights: bool,
+    measure: Option<(Pt, Pt)>,
+    trace_dlg: Option<TraceDlg>,
+    /// Notes about the opened file (live text in a PDF, garment removed…).
+    file_notes: Vec<String>,
     border_dist: f64,
     border_round: bool,
     border_outline: bool,
@@ -354,6 +364,10 @@ impl App {
             snap: false,
             text_at: None,
             show_border: false,
+            show_weights: false,
+            measure: None,
+            trace_dlg: None,
+            file_notes: Vec::new(),
             border_dist: 1.5,
             border_round: true,
             border_outline: true,
@@ -376,7 +390,12 @@ impl App {
                 "--cap" => {
                     self.profile = Profile::Cap;
                     self.fabric = "cap".into();
-                    self.recipe = settings::recipe("cap").unwrap();
+                    self.recipe = {
+                        let w = self.recipe.weight;
+                        let mut r = settings::recipe("cap").unwrap();
+                        r.weight = w;
+                        r
+                    };
                 }
                 "--pro" => self.pro = true,
                 "--flat-view" => self.view = View::Flat,
@@ -617,6 +636,397 @@ impl App {
 
     // ---------- loading ----------
 
+    /// PDF/AI files and pictures: vector PDFs open like SVG; pictures (and
+    /// PDFs that only hold a picture) go to the trace window.
+    fn open_art_file(&mut self, path: PathBuf, add: bool) {
+        self.last_dir = path.parent().map(|p| p.to_path_buf());
+        let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("design".into());
+        let lower = path.to_string_lossy().to_lowercase();
+        let bytes = match stitchforge::vfs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.error = Some(format!("Couldn't read {}: {e}", path.display()));
+                return;
+            }
+        };
+        if lower.ends_with(".pdf") || lower.ends_with(".ai") || bytes.starts_with(b"%PDF") {
+            match stitchforge::pdf::read(&bytes) {
+                Ok(art) => {
+                    if let Some(svg) = art.svg {
+                        if !add {
+                            self.machine = None;
+                            self.project_path = None;
+                        }
+                        self.open_svg_data(&svg, &name, add);
+                        if !add {
+                            self.clean_after_regen = true;
+                        }
+                        self.status = format!("Opened the vector art in {name}");
+                        self.file_notes = art.notes;
+                    } else if let Some(pic) = art.picture {
+                        self.start_trace(pic, name, add, art.notes);
+                    } else {
+                        self.error = Some("No vector art or picture found in that PDF".into());
+                    }
+                }
+                Err(e) => self.error = Some(e),
+            }
+            return;
+        }
+        match trace::Raster::decode(&bytes) {
+            Ok(r) => self.start_trace(r, name, add, Vec::new()),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn start_trace(&mut self, src: trace::Raster, name: String, add: bool, notes: Vec<String>) {
+        let mut opts = trace::TraceOptions::default();
+        // a sensible first size: left chest for flats, front for caps
+        let width_in = match self.profile {
+            Profile::Cap => 4.0,
+            Profile::Flat => 3.5,
+        };
+        opts.width_mm = width_in * 25.4;
+        self.trace_dlg = Some(TraceDlg {
+            name,
+            add,
+            src,
+            opts,
+            width_in,
+            result: None,
+            changed_at: -1.0,
+            src_tex: None,
+            out_tex: None,
+            drag: None,
+            notes,
+        });
+    }
+
+    /// The trace window: picture on the left (drag to crop), the traced
+    /// logo on the right, settings and colours below.
+    fn trace_window(&mut self, ctx: &egui::Context) {
+        let Some(dlg) = &mut self.trace_dlg else { return };
+        let now = ctx.input(|i| i.time);
+        // trace when settings have been still for a moment
+        if dlg.result.is_none() || (dlg.changed_at >= 0.0 && now - dlg.changed_at > 0.35) {
+            dlg.changed_at = -1.0;
+            let r = trace::trace(&dlg.src, &dlg.opts);
+            dlg.out_tex = match &r {
+                Ok(t) => {
+                    let svg = t.to_svg();
+                    render_svg(&svg, 520).map(|(w, h, px)| {
+                        ctx.load_texture("trace-out", egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR)
+                    })
+                }
+                Err(_) => None,
+            };
+            dlg.result = Some(r);
+        } else if dlg.changed_at >= 0.0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+        if dlg.src_tex.is_none() {
+            let k = (520.0 / dlg.src.w.max(dlg.src.h) as f64).min(1.0);
+            let (w, h) = (((dlg.src.w as f64 * k) as usize).max(1), ((dlg.src.h as f64 * k) as usize).max(1));
+            let mut px = Vec::with_capacity(w * h * 4);
+            for y in 0..h {
+                for x in 0..w {
+                    let sx = ((x as f64 / k) as u32).min(dlg.src.w - 1);
+                    let sy = ((y as f64 / k) as u32).min(dlg.src.h - 1);
+                    px.extend_from_slice(&dlg.src.px[(sy * dlg.src.w + sx) as usize]);
+                }
+            }
+            dlg.src_tex = Some(ctx.load_texture("trace-src", egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR));
+        }
+        let mut open = true;
+        let mut go = false;
+        let mut changed = false;
+        let mut reset_colors = false;
+        egui::Window::new("Trace picture")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(900.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("StitchForge finds the logo, its colours and its shapes, and builds stitch-ready layers. Drag on the picture to crop.").weak());
+                ui.add_space(4.0);
+                let box_sz = Vec2::new(420.0, 300.0);
+                ui.horizontal(|ui| {
+                    // ---- source with crop
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Picture").strong());
+                        let tex = dlg.src_tex.as_ref().unwrap();
+                        let ts = tex.size_vec2();
+                        let k = (box_sz.x / ts.x).min(box_sz.y / ts.y);
+                        let (r, resp) = ui.allocate_exact_size(box_sz, Sense::drag());
+                        let img = Rect::from_center_size(r.center(), ts * k);
+                        let p = ui.painter_at(r);
+                        checker(&p, r);
+                        p.image(tex.id(), img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                        let (sw, sh) = (dlg.src.w as f32, dlg.src.h as f32);
+                        let to_img = |q: Pos2| -> (f32, f32) {
+                            (((q.x - img.left()) / img.width() * sw).clamp(0.0, sw), ((q.y - img.top()) / img.height() * sh).clamp(0.0, sh))
+                        };
+                        if resp.drag_started() {
+                            dlg.drag = resp.interact_pointer_pos().map(|q| (q, q));
+                        }
+                        if resp.dragged() {
+                            if let (Some(d), Some(q)) = (&mut dlg.drag, resp.interact_pointer_pos()) {
+                                d.1 = q;
+                            }
+                        }
+                        if resp.drag_stopped() {
+                            if let Some((a, b)) = dlg.drag.take() {
+                                let (ax, ay) = to_img(a);
+                                let (bx, by) = to_img(b);
+                                let (x0, y0, x1, y1) = (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by));
+                                if x1 - x0 > 8.0 && y1 - y0 > 8.0 {
+                                    dlg.opts.crop = Some([x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]);
+                                    reset_colors = true;
+                                    changed = true;
+                                }
+                            }
+                        }
+                        // the crop in use
+                        let crop = dlg
+                            .drag
+                            .map(|(a, b)| Rect::from_two_pos(a, b))
+                            .or_else(|| {
+                                let c = match &dlg.result {
+                                    Some(Ok(t)) => t.crop,
+                                    _ => dlg.opts.crop?,
+                                };
+                                Some(Rect::from_min_size(
+                                    Pos2::new(img.left() + c[0] as f32 / sw * img.width(), img.top() + c[1] as f32 / sh * img.height()),
+                                    Vec2::new(c[2] as f32 / sw * img.width(), c[3] as f32 / sh * img.height()),
+                                ))
+                            });
+                        if let Some(c) = crop {
+                            let shade = Color32::from_black_alpha(90);
+                            for rr in [
+                                Rect::from_min_max(img.min, Pos2::new(img.right(), c.top())),
+                                Rect::from_min_max(Pos2::new(img.left(), c.bottom()), img.max),
+                                Rect::from_min_max(Pos2::new(img.left(), c.top()), Pos2::new(c.left(), c.bottom())),
+                                Rect::from_min_max(Pos2::new(c.right(), c.top()), Pos2::new(img.right(), c.bottom())),
+                            ] {
+                                if rr.is_positive() {
+                                    p.rect_filled(rr, 0.0, shade);
+                                }
+                            }
+                            p.rect_stroke(c, 0.0, Stroke::new(1.5_f32, Color32::from_rgb(214, 60, 120)), egui::StrokeKind::Outside);
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{} × {} px", dlg.src.w, dlg.src.h)).weak().small());
+                            if dlg.opts.crop.is_some() && ui.small_button("Auto crop").clicked() {
+                                dlg.opts.crop = None;
+                                reset_colors = true;
+                                changed = true;
+                            }
+                        });
+                    });
+                    // ---- result
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Traced, ready to stitch").strong());
+                        let (r, _) = ui.allocate_exact_size(box_sz, Sense::hover());
+                        let p = ui.painter_at(r);
+                        p.rect_filled(r, 4.0, Color32::from_rgb(242, 239, 232));
+                        match (&dlg.result, &dlg.out_tex) {
+                            (Some(Ok(_)), Some(tex)) => {
+                                let ts = tex.size_vec2();
+                                let k = (box_sz.x / ts.x).min(box_sz.y / ts.y) * 0.95;
+                                p.image(tex.id(), Rect::from_center_size(r.center(), ts * k), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                            }
+                            (Some(Err(e)), _) => {
+                                p.text(r.center(), egui::Align2::CENTER_CENTER, e, egui::FontId::proportional(13.0), Color32::from_rgb(170, 40, 40));
+                            }
+                            _ => {
+                                p.text(r.center(), egui::Align2::CENTER_CENTER, "Tracing…", egui::FontId::proportional(14.0), Color32::GRAY);
+                            }
+                        }
+                        if let Some(Ok(t)) = &dlg.result {
+                            let pts: usize = t.layers.iter().flat_map(|l| l.paths.iter()).map(|p| p.nodes.len()).sum();
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:.2} × {:.2} in · {} colors · {} shapes · {} points{}",
+                                    t.w as f64 * t.mm_per_px / 25.4,
+                                    t.height_mm() / 25.4,
+                                    t.layers.len(),
+                                    t.layers.iter().map(|l| l.paths.len()).sum::<usize>(),
+                                    pts,
+                                    if t.mockup { " · garment removed" } else { "" }
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                        }
+                    });
+                });
+                ui.separator();
+                egui::Grid::new("trace-opts").num_columns(4).spacing([14.0, 6.0]).show(ui, |ui| {
+                    ui.label("Width");
+                    if ui.add(egui::DragValue::new(&mut dlg.width_in).speed(0.05).range(0.5..=16.0).suffix(" in").max_decimals(2)).changed() {
+                        dlg.opts.width_mm = dlg.width_in * 25.4;
+                        changed = true;
+                    }
+                    ui.label("Colors");
+                    let shown = if dlg.opts.max_colors == 0 { "Automatic".to_string() } else { format!("Up to {}", dlg.opts.max_colors) };
+                    egui::ComboBox::from_id_salt("trace-colors").selected_text(shown).show_ui(ui, |ui| {
+                        for n in [0usize, 1, 2, 3, 4, 5, 6, 8, 10, 12] {
+                            let label = if n == 0 { "Automatic".to_string() } else { format!("Up to {n}") };
+                            if ui.selectable_value(&mut dlg.opts.max_colors, n, label).changed() {
+                                reset_colors = true;
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Detail");
+                    ui.horizontal(|ui| {
+                        for d in trace::Detail::ALL {
+                            if ui.selectable_value(&mut dlg.opts.detail, d, d.label()).changed() {
+                                reset_colors = true;
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.label("Picture");
+                    egui::ComboBox::from_id_salt("trace-src").selected_text(dlg.opts.source.label()).show_ui(ui, |ui| {
+                        for s in trace::Source::ALL {
+                            if ui.selectable_value(&mut dlg.opts.source, s, s.label()).changed() {
+                                reset_colors = true;
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("");
+                    if ui.checkbox(&mut dlg.opts.remove_background, "Remove background").on_hover_text("The colour around the logo (and on a mockup, the garment) isn't stitched").changed() {
+                        reset_colors = true;
+                        changed = true;
+                    }
+                    ui.label("");
+                    if ui.checkbox(&mut dlg.opts.overlap, "Colors run under each other").on_hover_text("Lower colours extend under the ones on top so no fabric shows between them").changed() {
+                        changed = true;
+                    }
+                    ui.end_row();
+                });
+                if let Some(Ok(t)) = &dlg.result {
+                    section(ui, "Thread colors (click to switch on or off)");
+                    let mut toggle: Option<(usize, bool)> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, c) in t.palette.iter().enumerate() {
+                            if c.share <= 0.0 && !c.dropped {
+                                continue;
+                            }
+                            let on = !c.dropped && t.layers.iter().any(|l| l.color == i);
+                            let chart = &self.chart;
+                            let th = &chart[thread::nearest(chart, c.rgb).0];
+                            let text = format!(
+                                "{} {}{}",
+                                th.code,
+                                th.name,
+                                if c.like_background { " · background color" } else { "" }
+                            );
+                            let (rr, resp) = ui.allocate_exact_size(Vec2::new(200.0, 30.0), Sense::click());
+                            let p = ui.painter();
+                            p.rect_filled(rr, 5.0, if on { ui.visuals().widgets.inactive.bg_fill } else { Color32::TRANSPARENT });
+                            p.rect_stroke(rr, 5.0, Stroke::new(1.0_f32, ui.visuals().widgets.inactive.bg_stroke.color), egui::StrokeKind::Inside);
+                            let sw = Rect::from_min_size(rr.min + Vec2::new(6.0, 6.0), Vec2::splat(18.0));
+                            p.rect_filled(sw, 3.0, Color32::from_rgb(c.rgb[0], c.rgb[1], c.rgb[2]));
+                            if !on {
+                                p.line_segment([sw.left_bottom(), sw.right_top()], Stroke::new(2.0_f32, Color32::from_rgb(200, 40, 40)));
+                            }
+                            p.text(
+                                Pos2::new(sw.right() + 6.0, rr.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                text,
+                                egui::FontId::proportional(12.0),
+                                if on { ui.visuals().text_color() } else { ui.visuals().weak_text_color() },
+                            );
+                            let tip = if c.like_background {
+                                "Same colour as the background: where it's background showing through (letter insides, around the logo) it isn't stitched. Click to stitch it everywhere (e.g. for a dark garment)."
+                            } else {
+                                "Click to leave this colour out"
+                            };
+                            if resp.on_hover_text(tip).clicked() {
+                                toggle = Some((i, on));
+                            }
+                        }
+                    });
+                    if let Some((i, on)) = toggle {
+                        let o = &mut dlg.opts;
+                        if on {
+                            o.keep.retain(|k| *k != i);
+                            if !o.drop.contains(&i) {
+                                o.drop.push(i);
+                            }
+                        } else {
+                            o.drop.retain(|k| *k != i);
+                            if t.palette[i].like_background && !o.keep.contains(&i) {
+                                o.keep.push(i);
+                            }
+                        }
+                        changed = true;
+                    }
+                    for n in t.notes.iter().chain(dlg.notes.iter()) {
+                        ui.label(RichText::new(format!("• {n}")).color(Color32::from_rgb(170, 110, 20)));
+                    }
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let ok = matches!(dlg.result, Some(Ok(_)));
+                    if ui.add_enabled(ok, egui::Button::new(RichText::new(if dlg.add { "Add to design" } else { "Use this" }).strong())).clicked() {
+                        go = true;
+                    }
+                    ui.label(RichText::new("Each color becomes a layer you can still edit, restitch or recolor.").weak().small());
+                });
+            });
+        if reset_colors {
+            dlg.opts.drop.clear();
+            dlg.opts.keep.clear();
+        }
+        if changed {
+            dlg.changed_at = now;
+            ctx.request_repaint();
+        }
+        if go {
+            let dlg = self.trace_dlg.take().unwrap();
+            if let Some(Ok(t)) = dlg.result {
+                let svg = t.to_svg();
+                if !dlg.add {
+                    self.machine = None;
+                    self.project_path = None;
+                }
+                let before = self.layers.len();
+                self.open_svg_data(&svg, &dlg.name, dlg.add);
+                // exactly the width asked for (the trace keeps a little margin)
+                let start = if dlg.add { before } else { 0 };
+                let mut b = BBox::empty();
+                for l in &self.layers[start..] {
+                    let lb = l.bbox();
+                    b.add(lb.min);
+                    b.add(lb.max);
+                }
+                if b.is_valid() && b.width() > 1.0 {
+                    let k = dlg.width_in * 25.4 / b.width();
+                    scale_layers(&mut self.layers[start..], b.center(), k);
+                    self.dirty = true;
+                }
+                // traced colours keep the exact traced shade in the name
+                if !dlg.add {
+                    self.clean_after_regen = true;
+                    self.sequence_tip();
+                }
+                let n = self.layers.len() - if dlg.add { before } else { 0 };
+                self.file_notes = t.notes.iter().chain(dlg.notes.iter()).cloned().collect();
+                self.status = format!("Traced {} into {n} color layers — check them, then adjust stitches as usual", dlg.name);
+            }
+            return;
+        }
+        if !open {
+            self.trace_dlg = None;
+        }
+    }
+
     fn open_svg_path(&mut self, path: PathBuf, add: bool) {
         match stitchforge::vfs::read_to_string(&path) {
             Ok(data) => {
@@ -667,6 +1077,7 @@ impl App {
             self.layers.extend(new_layers);
         } else {
             self.layers = new_layers;
+            self.file_notes.clear();
             self.design_name = name.to_string();
             self.selected = None;
             self.fit = true;
@@ -1055,6 +1466,7 @@ impl App {
     }
 
     fn apply_project(&mut self, p: Project, path: Option<PathBuf>) {
+        self.file_notes.clear();
         self.next_id = p.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
         self.layers = p.layers;
         self.design_name = p.name;
@@ -1376,6 +1788,7 @@ impl App {
         self.tab = Tab::Design;
         self.modified = false;
         self.status = "New design".into();
+        self.file_notes.clear();
     }
 
     fn open_dialog(&mut self) {
@@ -1383,9 +1796,13 @@ impl App {
             Want::Open,
             "Open",
             &[
-                ("Everything StitchForge opens", &["sfg", "json", "svg", "dst", "exp", "pes"]),
+                (
+                    "Everything StitchForge opens",
+                    &["sfg", "json", "svg", "pdf", "ai", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "dst", "exp", "pes"],
+                ),
                 ("StitchForge project", &["sfg", "json"]),
-                ("SVG artwork", &["svg"]),
+                ("Artwork (SVG, PDF, AI)", &["svg", "pdf", "ai"]),
+                ("Pictures and mockups (auto-traced)", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"]),
                 ("Stitch files", &["dst", "exp", "pes"]),
             ],
             self.last_dir.as_ref(),
@@ -1396,7 +1813,13 @@ impl App {
     fn handle_picked(&mut self, want: Want, p: PathBuf) {
         match want {
             Want::Open => self.open_any(p),
-            Want::AddSvg => self.open_svg_path(p, true),
+            Want::AddSvg => {
+                if p.extension().map(|e| e.eq_ignore_ascii_case("svg")).unwrap_or(false) {
+                    self.open_svg_path(p, true)
+                } else {
+                    self.open_art_file(p, true)
+                }
+            }
             Want::Names => self.load_names_path(p),
             Want::Chart => match thread::load_chart_csv(&p.to_string_lossy()) {
                 Ok(c) => {
@@ -1447,6 +1870,7 @@ impl App {
                 self.sequence_tip();
             }
             "dst" | "exp" | "pes" => self.open_machine(path),
+            e if ART_EXT.contains(&e) => self.open_art_file(path, false),
             _ => self.error = Some(format!("StitchForge can't open .{ext} files")),
         }
     }
@@ -1640,10 +2064,15 @@ impl App {
     }
 
     fn pick_svg(&mut self, add: bool) {
+        let filters: &[(&str, &[&str])] = &[
+            ("Artwork and pictures", ART_EXT),
+            ("Vector art (SVG, PDF, AI)", &["svg", "pdf", "ai"]),
+            ("Pictures and mockups (auto-traced)", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"]),
+        ];
         if add {
-            pick(Want::AddSvg, "Add art", &[("SVG artwork", &["svg"])], self.last_dir.as_ref());
+            pick(Want::AddSvg, "Add art", filters, self.last_dir.as_ref());
         } else {
-            pick(Want::Open, "Open SVG", &[("SVG artwork", &["svg"])], self.last_dir.as_ref());
+            pick(Want::Open, "Open artwork", filters, self.last_dir.as_ref());
         }
     }
 
@@ -1690,7 +2119,7 @@ impl App {
                     ui.close();
                     self.guard(Pending::New, &ctx);
                 }
-                if ui.button("Open…  (project, SVG, DST/EXP/PES)").clicked() {
+                if ui.button("Open…  (project, art, picture, DST/EXP/PES)").clicked() {
                     ui.close();
                     self.guard(Pending::Open, &ctx);
                 }
@@ -1736,6 +2165,19 @@ impl App {
                 {
                     ui.close();
                     self.pick_svg(true);
+                }
+                if ui
+                    .add_enabled(mode_art, egui::Button::new("Trace a picture…"))
+                    .on_hover_text("PNG, JPG, a mockup photo or a PDF: turned into stitch-ready layers automatically")
+                    .clicked()
+                {
+                    ui.close();
+                    pick(
+                        if self.layers.is_empty() { Want::Open } else { Want::AddSvg },
+                        "Trace a picture",
+                        &[("Pictures, mockups, PDF", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "pdf", "ai"])],
+                        self.last_dir.as_ref(),
+                    );
                 }
                 if ui
                     .add_enabled(mode_art, egui::Button::new("Add text…"))
@@ -2080,6 +2522,8 @@ impl App {
         let mut changed = false;
         let mut text_changed = false;
         let mut action: Option<&str> = None;
+        let design_wt = self.recipe.weight;
+        let mut open_guide = false;
 
         section(ui, "Selected layer");
         {
@@ -2371,6 +2815,32 @@ impl App {
                     }
                 });
             }
+
+            ui.horizontal(|ui| {
+                ui.label("Weight");
+                let cur = l.opts.weight;
+                let design = format!("Design ({})", design_wt.label());
+                egui::ComboBox::from_id_salt("layer-weight")
+                    .selected_text(cur.map(|w| w.label().to_string()).unwrap_or(design.clone()))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(cur.is_none(), design).clicked() {
+                            l.opts.weight = None;
+                            changed = true;
+                        }
+                        for w in thread::ThreadWeight::ALL {
+                            if ui
+                                .selectable_label(cur == Some(w), format!("{} — {}", w.label(), w.use_for()))
+                                .clicked()
+                            {
+                                l.opts.weight = Some(w);
+                                changed = true;
+                            }
+                        }
+                    });
+                if ui.small_button("?").on_hover_text("Thread weight guide").clicked() {
+                    open_guide = true;
+                }
+            });
 
             section(ui, "Stitching");
             ui.horizontal(|ui| {
@@ -2671,6 +3141,9 @@ impl App {
         }
         if text_changed {
             self.refresh_text(li);
+        }
+        if open_guide {
+            self.show_weights = true;
         }
         if let Some(a) = action {
             self.layer_action(a, li);
@@ -3322,7 +3795,12 @@ impl App {
                 ui.selectable_value(&mut self.profile, Profile::Cap, "Cap (center-out)");
                 if self.profile != before {
                     self.fabric = self.profile.default_recipe().into();
-                    self.recipe = settings::recipe(&self.fabric).unwrap();
+                    self.recipe = {
+                        let w = self.recipe.weight;
+                        let mut r = settings::recipe(&self.fabric).unwrap();
+                        r.weight = w;
+                        r
+                    };
                     self.dirty = true;
                 }
             });
@@ -3335,8 +3813,33 @@ impl App {
                     }
                 });
                 if self.fabric != before {
-                    self.recipe = settings::recipe(&self.fabric).unwrap();
+                    self.recipe = {
+                        let w = self.recipe.weight;
+                        let mut r = settings::recipe(&self.fabric).unwrap();
+                        r.weight = w;
+                        r
+                    };
                     self.dirty = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Thread");
+                let before = self.recipe.weight;
+                egui::ComboBox::from_id_salt("design-weight")
+                    .selected_text(self.recipe.weight.label())
+                    .show_ui(ui, |ui| {
+                        for w in thread::ThreadWeight::ALL {
+                            ui.selectable_value(&mut self.recipe.weight, w, format!("{} — {}", w.label(), w.use_for()));
+                        }
+                    })
+                    .response
+                    .on_hover_text("Default thread weight for the design; any layer can use its own. Density, needle size and the size checks follow it.");
+                if self.recipe.weight != before {
+                    self.dirty = true;
+                }
+                ui.label(RichText::new(format!("needle {}", self.recipe.weight.needle())).weak().small());
+                if ui.small_button("Weight guide").clicked() {
+                    self.show_weights = true;
                 }
             });
 
@@ -3380,7 +3883,12 @@ impl App {
                     self.dirty = true;
                 }
                 if ui.small_button("Reset to fabric defaults").clicked() {
-                    self.recipe = settings::recipe(&self.fabric).unwrap();
+                    self.recipe = {
+                        let w = self.recipe.weight;
+                        let mut r = settings::recipe(&self.fabric).unwrap();
+                        r.weight = w;
+                        r
+                    };
                     self.dirty = true;
                 }
                 ui.horizontal(|ui| {
@@ -3401,6 +3909,18 @@ impl App {
                     kv(ui, "Stops", &d.stops.len().to_string());
                     kv(ui, "Trims", &s.trims.to_string());
                     kv(ui, "Est. run time", &format!("{:.1} min", s.run_minutes));
+                    kv(ui, "Thread (each)", &format!("{:.0} m top · {:.0} m bobbin", s.top_m, s.bobbin_m));
+                    if let Some(st) = d.stops.iter().max_by(|a, b| a.top_m.partial_cmp(&b.top_m).unwrap()) {
+                        if st.top_m > 0.1 {
+                            kv(ui, "Per cone", &format!(
+                                "~{} pieces ({} {}, {:.0} m cone)",
+                                group((st.weight.cone_m() / st.top_m).floor() as usize),
+                                st.thread.code,
+                                st.weight.label(),
+                                st.weight.cone_m()
+                            ));
+                        }
+                    }
                     kv(ui, "Backing", &d.recipe.backing);
                     kv(ui, "Topping", &d.recipe.topping);
                 });
@@ -3411,15 +3931,19 @@ impl App {
                         swatch(ui, st.thread.rgb);
                         ui.label(format!("{} · needle {}", i + 1, st.needle));
                         ui.label(RichText::new(format!("{} {}", st.thread.code, st.thread.name)).strong());
+                        if st.weight != thread::ThreadWeight::W40 {
+                            ui.label(RichText::new(st.weight.label()).color(Color32::from_rgb(214, 60, 120)))
+                                .on_hover_text(format!("Load {} on this needle (needle size {})", st.weight.label(), st.weight.needle()));
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(RichText::new(group(st.stitches)).weak());
                         });
                     });
                 }
 
-                if !d.warnings.is_empty() {
+                if !d.warnings.is_empty() || !self.file_notes.is_empty() {
                     section(ui, "Check before running");
-                    for w in &d.warnings {
+                    for w in self.file_notes.iter().chain(d.warnings.iter()) {
                         ui.label(RichText::new(format!("⚠ {w}")).color(Color32::from_rgb(196, 130, 20)));
                     }
                 }
@@ -3579,7 +4103,28 @@ impl App {
         if object_edit {
             self.edit_input(&resp, ui, &to_mm, &to_screen, zoom);
         }
-        let object_edit = object_edit || drawing;
+        let measuring = self.tool == Tool::Measure;
+        if measuring {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let mut p = to_mm(pos);
+                if resp.drag_started() {
+                    self.measure = Some((p, p));
+                } else if resp.dragged() {
+                    if let Some((a, _)) = self.measure {
+                        if ui.input(|i| i.modifiers.shift) {
+                            // snap to 15° steps
+                            let d = p.sub(a);
+                            let step = std::f64::consts::PI / 12.0;
+                            let ang = (d.y.atan2(d.x) / step).round() * step;
+                            let len = d.len();
+                            p = Pt::new(a.x + len * ang.cos(), a.y + len * ang.sin());
+                        }
+                        self.measure = Some((a, p));
+                    }
+                }
+            }
+        }
+        let object_edit = object_edit || drawing || measuring;
         let no_layers: Vec<Layer> = Vec::new();
         let hit_src: &[Layer] = if editing { &self.layers } else { &no_layers };
         if !object_edit && resp.drag_started() {
@@ -3742,13 +4287,15 @@ impl App {
             }
             let to = |p: Pt| to_screen(p.add(shift));
             let rgb = d.stops[o.stop].thread.rgb;
+            // strands drawn as wide as the thread weight lays them
+            let wk = (d.stops[o.stop].weight.strand_mm() / 0.33) as f32;
             painter.extend(stitch_shapes(
                 d,
                 a,
                 z.min(end),
                 rgb,
                 &to,
-                zoom,
+                zoom * wk,
                 view,
                 show_jumps,
                 rect.expand(20.0),
@@ -3790,6 +4337,9 @@ impl App {
             }
         }
 
+        if let Some((a, b)) = self.measure {
+            measure_overlay(&painter, to_screen(a), to_screen(b), a.dist(b), ui.visuals().dark_mode);
+        }
         // ---- the object being edited: its needle points or its anchors
         if editing {
             self.edit_overlay(&painter, &to_screen, zoom, ui);
@@ -3948,7 +4498,13 @@ impl App {
             Tool::Rect | Tool::Ellipse | Tool::Polygon | Tool::Line => {
                 self.status = "Drag on the canvas to draw; Shift constrains. Style is in the panel on the right".into()
             }
+            Tool::Measure => {
+                self.status = "Measure: drag across a column, letter stroke or gap".into()
+            }
             Tool::Select => {}
+        }
+        if t != Tool::Measure {
+            self.measure = None;
         }
     }
 
@@ -4743,6 +5299,94 @@ impl App {
     }
 
     /// Border settings window.
+    /// Side-by-side guide to thread weights: what each is for, its limits, and
+    /// a true-scale swatch of a satin column sewn in it.
+    fn weights_window(&mut self, ctx: &egui::Context) {
+        if !self.show_weights {
+            return;
+        }
+        let mut open = true;
+        let thin = self.thinnest_strokes();
+        egui::Window::new("Thread weights")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Higher number = finer thread. Stitch settings are tuned for 40 wt and scale for the others.").weak());
+                ui.add_space(4.0);
+                egui::Grid::new("wt-grid").num_columns(7).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
+                    for h in ["", "Swatch (8×)", "Needle", "Spacing", "Narrowest satin", "Smallest letters", "Best for"] {
+                        ui.label(RichText::new(h).strong());
+                    }
+                    ui.end_row();
+                    for w in thread::ThreadWeight::ALL.iter().rev() {
+                        let r = if *w == self.recipe.weight {
+                            RichText::new(format!("{} (design)", w.label())).strong()
+                        } else {
+                            RichText::new(w.label())
+                        };
+                        ui.label(r);
+                        weight_swatch(ui, *w, self.recipe.satin_spacing * w.spacing_factor());
+                        ui.label(w.needle());
+                        ui.label(format!("{:.2} mm", self.recipe.satin_spacing * w.spacing_factor()));
+                        ui.label(format!("{:.1} mm", w.min_column()));
+                        ui.label(format!("{:.1} mm ({:.2} in)", w.min_text_height(), w.min_text_height() / 25.4));
+                        ui.label(w.use_for());
+                        ui.end_row();
+                    }
+                });
+                if !thin.is_empty() {
+                    section(ui, "This design");
+                    for (name, wt, mm) in thin.iter().take(8) {
+                        let ok: Vec<&str> = thread::ThreadWeight::ALL
+                            .iter()
+                            .rev()
+                            .filter(|w| *mm >= w.min_column() - 0.05)
+                            .map(|w| w.label())
+                            .collect();
+                        ui.label(format!(
+                            "{name}: thinnest stroke {:.1} mm on {} — {}",
+                            mm,
+                            wt.label(),
+                            if ok.is_empty() { "too thin for any weight; enlarge it".to_string() } else { format!("works with {}", ok.join(", ")) }
+                        ));
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("Tip: the Measure tool (D) shows which weights suit any column, stroke or letter you drag across.").weak().small());
+            });
+        if !open {
+            self.show_weights = false;
+        }
+    }
+
+    /// Thinnest satin stroke per layer from the last build: (layer name, its weight, mm).
+    fn thinnest_strokes(&self) -> Vec<(String, thread::ThreadWeight, f64)> {
+        let Some(d) = &self.design else { return Vec::new() };
+        let mut out = Vec::new();
+        for (li, l) in self.layers.iter().enumerate() {
+            if !d.objects.iter().any(|o| o.layer == li && o.stitch_type.ends_with("atin")) {
+                continue;
+            }
+            let mut best = f64::MAX;
+            let k = (l.sx * l.sy).abs().sqrt();
+            for sh in &l.shapes {
+                if let import::ShapeKind::Area { rings, rule } = &sh.kind {
+                    let a = stitchforge::geom::rings_area(rings, *rule) * k * k;
+                    let per = stitchforge::geom::rings_perimeter(rings) * k;
+                    if per > 0.0 && a > 0.5 {
+                        best = best.min(2.0 * a / per);
+                    }
+                }
+            }
+            if best < f64::MAX {
+                out.push((l.name.clone(), l.opts.weight.unwrap_or(self.recipe.weight), best));
+            }
+        }
+        out.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        out
+    }
+
     fn border_window(&mut self, ctx: &egui::Context) {
         if !self.show_border {
             return;
@@ -5271,6 +5915,8 @@ impl eframe::App for App {
                 .unwrap_or_default();
             if ext == "svg" && !self.layers.is_empty() && self.machine.is_none() {
                 self.open_svg_path(p, true);
+            } else if ART_EXT.contains(&ext.as_str()) && !self.layers.is_empty() && self.machine.is_none() {
+                self.open_art_file(p, true);
             } else {
                 self.guard(Pending::OpenPath(p), ctx);
             }
@@ -5301,7 +5947,9 @@ impl eframe::App for App {
                     }
                 }
             }
-            if self.tool.draws() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if (self.tool.draws() || self.tool == Tool::Measure)
+                && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            {
                 self.set_tool(Tool::Select);
             }
         }
@@ -5483,6 +6131,8 @@ impl eframe::App for App {
             .show(ctx, |ui| self.canvas(ui, now));
         self.text_window(ctx);
         self.border_window(ctx);
+        self.weights_window(ctx);
+        self.trace_window(ctx);
         self.export_window(ctx);
         self.confirm_window(ctx);
     }
@@ -5752,7 +6402,94 @@ fn tool_icon(p: &egui::Painter, r: Rect, t: Tool, ink: Color32) {
         Tool::Text => {
             p.text(at(0.5, 0.5), egui::Align2::CENTER_CENTER, "T", egui::FontId::proportional(r.height() * 1.15), ink);
         }
+        Tool::Measure => {
+            // a ruler on the diagonal with tick marks
+            let (a, b) = (at(0.0, 0.75), at(1.0, 0.25));
+            let n = Vec2::new(0.25, 0.5).normalized();
+            p.line_segment([a, b], s);
+            for k in 0..=5 {
+                let t = k as f32 / 5.0;
+                let q = a + (b - a) * t;
+                let len = if k % 5 == 0 { 7.0 } else { 3.5 };
+                p.line_segment([q, q + n * len], s);
+            }
+        }
     }
+}
+
+/// A short satin column at 8× scale: strands as wide as the thread lying at
+/// the weight's spacing, so the difference in fineness is visible.
+fn weight_swatch(ui: &mut egui::Ui, w: thread::ThreadWeight, spacing_mm: f64) {
+    let (r, _) = ui.allocate_exact_size(Vec2::new(110.0, 26.0), Sense::hover());
+    let k = 8.0_f64; // 8 points per mm
+    let p = ui.painter_at(r);
+    p.rect_filled(r, 3.0, Color32::from_rgb(240, 236, 228));
+    let strand = (w.strand_mm() * k) as f32;
+    let step = (spacing_mm * k) as f32;
+    let mut x = r.left() + 3.0;
+    while x < r.right() - 3.0 {
+        p.line_segment(
+            [Pos2::new(x - 3.0, r.bottom() - 3.0), Pos2::new(x + 3.0, r.top() + 3.0)],
+            Stroke::new(strand, Color32::from_rgb(28, 60, 140)),
+        );
+        p.line_segment(
+            [Pos2::new(x - 3.0 - strand * 0.25, r.bottom() - 3.0), Pos2::new(x + 3.0 - strand * 0.25, r.top() + 3.0)],
+            Stroke::new((strand * 0.25).max(0.5), Color32::from_rgb(90, 130, 210)),
+        );
+        x += step.max(1.0);
+    }
+}
+
+/// The measuring line on the canvas: the distance, and which thread weights
+/// a satin column that wide suits.
+fn measure_overlay(p: &egui::Painter, a: Pos2, b: Pos2, mm: f64, dark: bool) {
+    let ink = Color32::from_rgb(214, 60, 120);
+    p.line_segment([a, b], Stroke::new(1.6_f32, ink));
+    let d = (b - a).normalized();
+    let n = Vec2::new(-d.y, d.x) * 6.0;
+    for q in [a, b] {
+        p.line_segment([q - n, q + n], Stroke::new(1.6_f32, ink));
+    }
+    if mm < 0.05 {
+        return;
+    }
+    let text_col = if dark { Color32::WHITE } else { Color32::from_rgb(30, 30, 34) };
+    let good = Color32::from_rgb(40, 160, 80);
+    let bad = Color32::from_rgb(200, 60, 50);
+    let font = egui::FontId::proportional(13.0);
+    let mut job = egui::text::LayoutJob::default();
+    let put = |job: &mut egui::text::LayoutJob, t: &str, c: Color32| {
+        job.append(t, 0.0, egui::TextFormat { font_id: font.clone(), color: c, ..Default::default() });
+    };
+    put(&mut job, &format!("{:.2} mm · {:.3} in\n", mm, mm / 25.4), text_col);
+    put(&mut job, "As a satin column:  ", text_col);
+    for w in thread::ThreadWeight::ALL.iter().rev() {
+        let ok = mm >= w.min_column() && mm <= settings::Limits::SATIN_MAX + 2.0;
+        put(&mut job, &format!("{} wt {}   ", w.number(), if ok { "ok" } else { "no" }), if ok { good } else { bad });
+    }
+    put(&mut job, "\nAs letter height:  ", text_col);
+    for w in thread::ThreadWeight::ALL.iter().rev() {
+        let ok = mm >= w.min_text_height();
+        put(&mut job, &format!("{} wt {}   ", w.number(), if ok { "ok" } else { "no" }), if ok { good } else { bad });
+    }
+    let galley = p.layout_job(job);
+    // keep the readout on the canvas
+    let clip = p.clip_rect();
+    let mut at = b + Vec2::new(12.0, 10.0);
+    if at.x + galley.size().x + 12.0 > clip.right() {
+        at.x = b.x - 12.0 - galley.size().x;
+    }
+    if at.y + galley.size().y + 12.0 > clip.bottom() {
+        at.y = b.y - 10.0 - galley.size().y;
+    }
+    let r = Rect::from_min_size(at, galley.size()).expand(6.0);
+    p.rect_filled(
+        r,
+        5.0,
+        if dark { Color32::from_rgba_unmultiplied(30, 30, 36, 235) } else { Color32::from_rgba_unmultiplied(255, 255, 255, 240) },
+    );
+    p.rect_stroke(r, 5.0, Stroke::new(1.0_f32, ink), egui::StrokeKind::Inside);
+    p.galley(at, galley, Color32::WHITE);
 }
 
 /// A stitch setting a layer can set for itself; blank means the fabric's.
@@ -5932,6 +6669,62 @@ fn open_path(p: &std::path::Path) {
 // puts the file in the in-memory file store, and downloads for results.
 
 /// What a picked file is for.
+/// File types opened as artwork (vector, PDF, or traced pictures).
+const ART_EXT: &[&str] = &["svg", "pdf", "ai", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"];
+
+struct TraceDlg {
+    name: String,
+    add: bool,
+    src: trace::Raster,
+    opts: trace::TraceOptions,
+    width_in: f64,
+    result: Option<Result<trace::Trace, String>>,
+    /// When a setting last changed (seconds; -1 = nothing pending).
+    changed_at: f64,
+    src_tex: Option<egui::TextureHandle>,
+    out_tex: Option<egui::TextureHandle>,
+    drag: Option<(Pos2, Pos2)>,
+    notes: Vec<String>,
+}
+
+/// Render SVG to RGBA pixels, longest side `max_px`.
+fn render_svg(svg: &str, max_px: u32) -> Option<(usize, usize, Vec<u8>)> {
+    let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).ok()?;
+    let sz = tree.size();
+    let k = max_px as f32 / sz.width().max(sz.height());
+    let (w, h) = ((sz.width() * k).ceil() as u32, (sz.height() * k).ceil() as u32);
+    let mut pix = resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1))?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(k, k), &mut pix.as_mut());
+    // tiny-skia is premultiplied; egui wants straight alpha here
+    let mut px = pix.take();
+    for c in px.chunks_mut(4) {
+        let a = c[3] as u32;
+        if a > 0 && a < 255 {
+            for v in c.iter_mut().take(3) {
+                *v = ((*v as u32 * 255) / a).min(255) as u8;
+            }
+        }
+    }
+    Some((w as usize, h as usize, px))
+}
+
+/// Light checkerboard (transparent areas of a picture).
+fn checker(p: &egui::Painter, r: Rect) {
+    p.rect_filled(r, 4.0, Color32::from_gray(236));
+    let s = 10.0;
+    let mut y = r.top();
+    let mut row = 0;
+    while y < r.bottom() {
+        let mut x = r.left() + if row % 2 == 0 { 0.0 } else { s };
+        while x < r.right() {
+            p.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::splat(s)).intersect(r), 0.0, Color32::from_gray(222));
+            x += 2.0 * s;
+        }
+        y += s;
+        row += 1;
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Want {
     Open,

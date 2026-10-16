@@ -21,6 +21,10 @@ pub struct Recipe {
     pub underlay_inset: f64,
     pub backing: String,
     pub topping: String,
+    /// The design's default thread weight (layers may override it). The
+    /// spacings above are for 40 wt and are scaled for other weights.
+    #[serde(default)]
+    pub weight: crate::thread::ThreadWeight,
 }
 
 pub fn recipe(name: &str) -> Option<Recipe> {
@@ -34,6 +38,7 @@ pub fn recipe(name: &str) -> Option<Recipe> {
         underlay_inset: 0.6,
         backing: "Cutaway 2.5 oz".into(),
         topping: "None".into(),
+        weight: Default::default(),
     };
     Some(match name {
         "pique" => base,

@@ -91,12 +91,17 @@ pub fn preview_svg(d: &Design, scale: f64, fabric: &str) -> String {
     );
     for (i, p) in &chunks {
         let rgb = d.stops[*i].thread.rgb;
+        // strand width follows the thread weight (40 wt ≈ 0.33 mm)
+        let k = d.stops[*i].weight.strand_mm() / 0.33;
         s.push_str(&format!(
-            "<path d='{p}' stroke='{}' stroke-width='0.44'/><path d='{p}' stroke='{}' stroke-width='0.30'/>\
-             <path d='{p}' stroke='{}' stroke-width='0.07' stroke-opacity='0.5' transform='translate(-0.05 -0.05)'/>",
+            "<path d='{p}' stroke='{}' stroke-width='{:.3}'/><path d='{p}' stroke='{}' stroke-width='{:.3}'/>\
+             <path d='{p}' stroke='{}' stroke-width='{:.3}' stroke-opacity='0.5' transform='translate(-0.05 -0.05)'/>",
             shade(rgb, 0.6),
+            0.44 * k,
             hex(rgb),
-            shade(rgb, 1.35)
+            0.30 * k,
+            shade(rgb, 1.35),
+            0.07 * k
         ));
     }
     s.push_str("</g>");
@@ -125,17 +130,23 @@ pub fn preview_png(d: &Design, px_per_mm: f32) -> Result<Vec<u8>, String> {
 }
 
 pub fn stops_csv(d: &Design) -> String {
-    let mut s = String::from("stop,needle,brand,code,name,hex,stitches\n");
+    let mut s = String::from(
+        "stop,needle,brand,code,name,hex,weight,needle_size,stitches,top_thread_m,bobbin_m\n",
+    );
     for (i, st) in d.stops.iter().enumerate() {
         s.push_str(&format!(
-            "{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{:.1},{:.1}\n",
             i + 1,
             st.needle,
             st.thread.brand,
             st.thread.code,
             st.thread.name,
             hex(st.thread.rgb),
-            st.stitches
+            st.weight.number(),
+            st.weight.needle(),
+            st.stitches,
+            st.top_m,
+            st.bobbin_m
         ));
     }
     s
@@ -167,8 +178,11 @@ pub fn operator_sheet(d: &Design, job: &JobInfo, generated: &str) -> String {
     for (i, s) in d.stops.iter().enumerate() {
         rows.push_str(&format!(
             "<tr><td class='n'>{}</td><td class='n'>{}</td><td><span class='sw' style='background:{}'></span></td>\
-             <td><b>{}</b> {}</td><td>{}</td><td class='n'>{}</td></tr>",
-            i + 1, s.needle, hex(s.thread.rgb), esc(&s.thread.code), esc(&s.thread.name), esc(&s.thread.brand), fmt_int(s.stitches)
+             <td><b>{}</b> {}</td><td>{}</td><td>{}{}</td><td class='n'>{}</td><td class='n'>{:.1} m</td></tr>",
+            i + 1, s.needle, hex(s.thread.rgb), esc(&s.thread.code), esc(&s.thread.name), esc(&s.thread.brand),
+            s.weight.label(),
+            if s.weight == crate::thread::ThreadWeight::W40 { String::new() } else { format!(" · needle {}", s.weight.needle()) },
+            fmt_int(s.stitches), s.top_m
         ));
     }
     let mut seq = String::new();
@@ -178,7 +192,7 @@ pub fn operator_sheet(d: &Design, job: &JobInfo, generated: &str) -> String {
             o.sequence,
             esc(&o.label),
             o.stitch_type,
-            esc(&o.thread_code),
+            esc(&format!("{} · {}", o.thread_code, o.weight.label())),
             fmt_int(o.stitches)
         ));
     }
@@ -229,6 +243,8 @@ pub fn operator_sheet(d: &Design, job: &JobInfo, generated: &str) -> String {
            <div class='kv'><span>Color stops</span><b>{}</b></div>\
            <div class='kv'><span>Trims</span><b>{}</b></div>\
            <div class='kv'><span>Est. run time</span><b>{:.1} min</b></div>\
+           <div class='kv'><span>Thread (each)</span><b>{:.0} m top · {:.0} m bobbin</b></div>\
+           <div class='kv'><span>Thread weight</span><b>{}</b></div>\
            <div class='kv'><span>Sewing order</span><b>{}</b></div>\
            <div class='kv'><span>Fabric recipe</span><b>{}</b></div>\
            <div class='kv'><span>Backing</span><b>{}</b></div>\
@@ -237,11 +253,12 @@ pub fn operator_sheet(d: &Design, job: &JobInfo, generated: &str) -> String {
          </div></section>",
         in_(st.width_mm), in_(st.height_mm), st.width_mm, st.height_mm,
         fmt_int(st.stitches), d.stops.len(), st.trims, st.run_minutes,
+        st.top_m, st.bobbin_m, weights_line(d),
         d.profile.label(), d.recipe.name, d.recipe.backing, d.recipe.topping
     ));
     html.push_str(&format!(
         "<section><h3>Color stops</h3><table><thead><tr><th class='n'>Stop</th><th class='n'>Needle</th><th></th>\
-         <th>Thread</th><th>Brand</th><th class='n'>Stitches</th></tr></thead><tbody>{rows}</tbody></table></section>"
+         <th>Thread</th><th>Brand</th><th>Weight</th><th class='n'>Stitches</th><th class='n'>Thread</th></tr></thead><tbody>{rows}</tbody></table></section>"
     ));
     html.push_str(&warnings);
     html.push_str(&format!(
@@ -253,6 +270,20 @@ pub fn operator_sheet(d: &Design, job: &JobInfo, generated: &str) -> String {
     ));
     html.push_str("</main></body></html>");
     html
+}
+
+/// "40 wt · needle 75/11", or a list when the design mixes weights.
+fn weights_line(d: &Design) -> String {
+    let mut ws: Vec<crate::thread::ThreadWeight> = d.stops.iter().map(|s| s.weight).collect();
+    ws.sort();
+    ws.dedup();
+    if ws.is_empty() {
+        ws.push(d.recipe.weight);
+    }
+    ws.iter()
+        .map(|w| format!("{} · needle {}", w.label(), w.needle()))
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 fn fmt_int(n: usize) -> String {
