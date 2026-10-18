@@ -910,7 +910,7 @@ fn join_piece(
         return;
     };
     match out.last().map(|n| n.p) {
-        Some(c) if c.dist(first) <= near => {
+        Some(c) if c.dist(first) <= near && link_inside(rings, rule, c, first) => {
             // skip points right on top of the needle (e.g. where spiral
             // rings meet) so there are no tiny stitches
             let k = pts.iter().take_while(|q| q.dist(c) < 0.3).count();
@@ -918,6 +918,20 @@ fn join_piece(
         }
         _ => start_in_shape(out, rings, rule, pts, len, hidden),
     }
+}
+
+/// A straight link between two needle points stays on the shape (its ends
+/// may sit just past the edge, by pull compensation).
+fn link_inside(rings: &[Ring], rule: FillRule, a: Pt, b: Pt) -> bool {
+    let d = a.dist(b);
+    if d <= 1.2 {
+        return true;
+    }
+    let n = (d / 0.4).ceil() as usize;
+    (1..n)
+        .map(|k| a.lerp(b, k as f64 / n as f64))
+        .filter(|q| q.dist(a) > 0.5 && q.dist(b) > 0.5)
+        .all(|q| inside(rings, rule, q))
 }
 
 /// Contour fill: rings that follow the outline inward, outermost first.

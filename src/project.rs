@@ -268,6 +268,38 @@ fn seg_dist(p: Pt, a: Pt, b: Pt) -> f64 {
     p.dist(a.lerp(b, t.clamp(0.0, 1.0)))
 }
 
+/// Remove needle points from a stitch list. Where a single point is taken
+/// out of a straight stitch line, that stitch just gets longer. Anywhere
+/// else the thread jumps over the gap (and the machine ties off and trims if
+/// it is far), so no stitch is left lying across the hole.
+pub fn remove_needles(needles: &[Needle], gone: impl Fn(usize) -> bool) -> Vec<Needle> {
+    let mut keep: Vec<Needle> = Vec::with_capacity(needles.len());
+    let mut removed: Vec<Needle> = Vec::new();
+    for (i, nd) in needles.iter().enumerate() {
+        if gone(i) {
+            removed.push(*nd);
+            continue;
+        }
+        let mut nd = *nd;
+        if !removed.is_empty() {
+            if let Some(prev) = keep.last() {
+                let (a, b) = (prev.p, nd.p);
+                // one penetration taken out of a straight line: keep sewing
+                let on_line = removed.len() == 1 && !removed[0].jump && seg_dist(removed[0].p, a, b) <= 0.3;
+                let long = a.dist(b) > crate::settings::Limits::MAX_STITCH;
+                if !on_line || long || removed.iter().any(|r| r.jump) {
+                    nd.jump = true;
+                }
+            } else if removed.iter().any(|r| r.jump) {
+                nd.jump = true;
+            }
+            removed.clear();
+        }
+        keep.push(nd);
+    }
+    keep
+}
+
 /// Turn visible layers into artwork for the engine. Custom threads are added
 /// to a copy of the chart; returns the artwork and that working chart.
 pub fn compose(layers: &[Layer], chart: &[Thread]) -> (Artwork, Vec<Thread>) {
@@ -641,6 +673,23 @@ mod object_tests {
         l.opts.density = Some(0.6);
         assert!(l.out_of_sync());
     }
+
+    #[test]
+    fn removing_stitches_jumps_over_the_hole() {
+        let n = |x: f64, y: f64| Needle { p: Pt::new(x, y), jump: false };
+        // a row along y=0 and a row back along y=1
+        let row = vec![n(0.0, 0.0), n(3.0, 0.0), n(6.0, 0.0), n(9.0, 0.0), n(9.0, 1.0), n(6.0, 1.0), n(3.0, 1.0), n(0.0, 1.0)];
+        // a penetration in the middle of a straight line: the stitch just gets longer
+        let a = remove_needles(&row, |i| i == 1);
+        assert!(!a[1].jump);
+        // the turn and the start of the next row: that would cut across, so jump
+        let b = remove_needles(&row, |i| i == 3 || i == 4);
+        assert_eq!(b.len(), 6);
+        assert!(b[3].jump, "{:?}", b[3]);
+        // a stretch of a row taken out (an erased area): jump, don't bridge it
+        let c = remove_needles(&row, |i| i == 1 || i == 2);
+        assert!(c[1].jump);
+    }
 }
 
 /// The project's artwork as an SVG file (mm units): every visible layer's
@@ -710,4 +759,143 @@ pub fn art_svg(layers: &[Layer], chart: &[Thread]) -> String {
     }
     out.push_str("</svg>\n");
     out
+}
+
+#[cfg(test)]
+mod stays_inside {
+    //! Every stitch of a fill or satin area lands inside its shape (or within
+    //! pull compensation of the edge): no travel or turn stitches across open
+    //! fabric.
+    use super::*;
+    use crate::geom::{FillRule, Pt};
+    use crate::import::{FillPattern, StitchChoice};
+    use crate::settings::Profile;
+
+    fn poly(pts: &[(f64, f64)]) -> Vec<Pt> {
+        pts.iter().map(|&(x, y)| Pt::new(x, y)).collect()
+    }
+    fn circle(cx: f64, cy: f64, r: f64, n: usize) -> Vec<Pt> {
+        (0..n).map(|k| {
+            let a = k as f64 / n as f64 * std::f64::consts::TAU;
+            Pt::new(cx + r * a.cos(), cy + r * a.sin())
+        }).collect()
+    }
+    fn shapes() -> Vec<(&'static str, Vec<Vec<Pt>>)> {
+        let star: Vec<Pt> = (0..10).map(|k| {
+            let a = k as f64 / 10.0 * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2;
+            let r = if k % 2 == 0 { 30.0 } else { 12.0 };
+            Pt::new(30.0 + r * a.cos(), 30.0 + r * a.sin())
+        }).collect();
+        vec![
+            ("chevron", vec![poly(&[(0.0, 0.0), (22.1, 0.0), (22.1, 77.0), (36.9, 92.0), (83.3, 93.0), (88.1, 113.0), (26.8, 113.0), (0.0, 87.0)])]),
+            ("L", vec![poly(&[(0.0, 0.0), (10.0, 0.0), (10.0, 40.0), (50.0, 40.0), (50.0, 50.0), (0.0, 50.0)])]),
+            ("U", vec![poly(&[(0.0, 0.0), (10.0, 0.0), (10.0, 30.0), (30.0, 30.0), (30.0, 0.0), (40.0, 0.0), (40.0, 40.0), (0.0, 40.0)])]),
+            ("ring", vec![circle(25.0, 25.0, 25.0, 72), circle(25.0, 25.0, 12.0, 48)]),
+            ("star", vec![star]),
+            ("sliver", vec![poly(&[(0.0, 0.0), (60.0, 2.0), (60.0, 9.0), (0.0, 4.0)])]),
+            ("comb", vec![poly(&[(0.0, 0.0), (8.0, 0.0), (8.0, 20.0), (16.0, 20.0), (16.0, 0.0), (24.0, 0.0), (24.0, 20.0), (32.0, 20.0), (32.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)])]),
+        ]
+    }
+
+    fn inside(rings: &[Vec<Pt>], p: Pt) -> bool {
+        let mut c = false;
+        for r in rings {
+            let n = r.len();
+            for i in 0..n {
+                let (a, b) = (r[i], r[(i + 1) % n]);
+                if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+                    c = !c;
+                }
+            }
+        }
+        c
+    }
+    fn edge_dist(rings: &[Vec<Pt>], p: Pt) -> f64 {
+        let mut d = f64::MAX;
+        for r in rings {
+            for i in 0..r.len() {
+                let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                let ab = b.sub(a);
+                let dot = |u: Pt, v: Pt| u.x * v.x + u.y * v.y;
+                let t = (dot(p.sub(a), ab) / dot(ab, ab)).clamp(0.0, 1.0);
+                d = d.min(a.add(ab.mul(t)).dist(p));
+            }
+        }
+        d
+    }
+
+    /// Worst distance (mm) any stitch strays outside the shape.
+    fn worst_stray(rings: &[Vec<Pt>], stitch: StitchChoice, fill: FillPattern, angle: Option<f64>, profile: Profile) -> (f64, String) {
+        let shape = Shape {
+            kind: ShapeKind::Area { rings: rings.to_vec(), rule: FillRule::EvenOdd },
+            rgb: [60, 60, 60], label: "s".into(), group: 0, opts: ShapeOpts::default(), curves: Vec::new(),
+        };
+        let mut l = Layer::new(1, "s".into(), vec![shape], false);
+        l.opts.stitch = stitch;
+        l.opts.fill = fill;
+        l.opts.angle_deg = angle;
+        let rings: Vec<Vec<Pt>> = rings.iter().map(|r| r.iter().map(|p| l.tf(*p)).collect()).collect();
+        let mut p = Project::new("t", vec![l]);
+        p.keep_order = true;
+        p.profile = profile;
+        let d = p.build().unwrap();
+        let mut prev: Option<Pt> = None;
+        let mut worst = (0.0, String::new());
+        for c in &d.cmds {
+            match c {
+                crate::design::Cmd::Stitch(q) => {
+                    if let Some(a) = prev {
+                        let n = (a.dist(*q) / 0.3).ceil().max(1.0) as usize;
+                        for k in 1..=n {
+                            let s = a.lerp(*q, k as f64 / n as f64);
+                            if !inside(&rings, s) {
+                                let e = edge_dist(&rings, s);
+                                if e > worst.0 {
+                                    worst = (e, format!("{a:?} -> {q:?}"));
+                                }
+                            }
+                        }
+                    }
+                    prev = Some(*q);
+                }
+                crate::design::Cmd::Jump(q) => prev = Some(*q),
+                crate::design::Cmd::Trim | crate::design::Cmd::Color(_) => prev = None,
+                _ => {}
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn fills_never_stitch_across_open_fabric() {
+        let mut fails = Vec::new();
+        for (name, rings) in shapes() {
+            for profile in [Profile::Flat, Profile::Cap] {
+                for angle in [None, Some(0.0), Some(30.0), Some(45.0), Some(90.0), Some(135.0)] {
+                    for fill in [FillPattern::Tatami, FillPattern::Contour, FillPattern::Spiral, FillPattern::Radial] {
+                        let (w, at) = worst_stray(&rings, StitchChoice::Fill, fill, angle, profile);
+                        // pull compensation (wider on caps) may round a concave corner by ~0.6 mm
+                        if w > 0.7 {
+                            fails.push(format!("{name} {profile:?} {angle:?} {fill:?}: {w:.2} mm out at {at}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fails.is_empty(), "{} cases:\n{}", fails.len(), fails.join("\n"));
+    }
+
+    #[test]
+    fn satin_areas_never_stitch_across_open_fabric() {
+        let mut fails = Vec::new();
+        for (name, rings) in shapes() {
+            for angle in [None, Some(0.0), Some(45.0), Some(90.0)] {
+                let (w, at) = worst_stray(&rings, StitchChoice::Satin, FillPattern::Tatami, angle, Profile::Flat);
+                if w > 0.6 {
+                    fails.push(format!("{name} {angle:?}: {w:.2} mm out at {at}"));
+                }
+            }
+        }
+        assert!(fails.is_empty(), "{} cases:\n{}", fails.len(), fails.join("\n"));
+    }
 }

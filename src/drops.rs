@@ -190,6 +190,29 @@ pub enum Case {
     Title,
 }
 
+/// What happens to a name wider than the limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Fit {
+    /// Narrow the letters first (down to `min_condense`), then shrink the
+    /// whole name: names keep their height as long as they can.
+    #[default]
+    Condense,
+    /// Shrink the whole name, keeping its proportions.
+    Shrink,
+}
+
+/// The order names sew in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Order {
+    /// As they are in the sheet.
+    #[default]
+    AsListed,
+    /// A→Z by the whole name.
+    AToZ,
+    /// A→Z by the last word (surname), then the rest.
+    LastName,
+}
+
 /// Everything about a name-drop run. Saved inside the project.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -212,8 +235,17 @@ pub struct DropSetup {
     pub logo_every_drop: bool,
     /// Shrink names wider than this (mm), keeping their proportions.
     pub max_width_mm: Option<f64>,
-    /// Hand fixes to individual names, by position in the list.
+    /// Hand fixes to individual names, by position in the sheet order.
     pub edits: BTreeMap<usize, String>,
+    pub fit: Fit,
+    /// Narrowest a name's letters may be squeezed before it is shrunk (0–1).
+    pub min_condense: f64,
+    pub order: Order,
+    /// Column that sorts names into groups (garment, size, team…): each
+    /// group sews together.
+    pub group_column: Option<usize>,
+    /// Start every group on a fresh drop so a drop never mixes groups.
+    pub group_new_drop: bool,
 }
 
 impl Default for DropSetup {
@@ -233,6 +265,11 @@ impl Default for DropSetup {
             logo_every_drop: true,
             max_width_mm: None,
             edits: BTreeMap::new(),
+            fit: Fit::Condense,
+            min_condense: 0.8,
+            order: Order::AsListed,
+            group_column: None,
+            group_new_drop: true,
         }
     }
 }
@@ -240,7 +277,16 @@ impl Default for DropSetup {
 /// One name in the run and where it sews.
 #[derive(Clone, Debug, Serialize)]
 pub struct Slot {
+    /// Position in the run (sewing order).
     pub index: usize,
+    /// Position in the sheet order (what hand fixes are keyed by).
+    pub key: usize,
+    /// Position inside its drop.
+    pub pos: usize,
+    /// Group value (from the group column), if grouping.
+    pub group: String,
+    /// The same name appears on another row too.
+    pub duplicate: bool,
     pub text: String,
     /// Spreadsheet row it came from (1-based, as Excel numbers rows).
     pub row: usize,
@@ -266,7 +312,8 @@ fn title_case(s: &str) -> String {
 }
 
 impl DropSetup {
-    /// The name list after columns, joining, case, blanks and quantities.
+    /// The name list after columns, joining, case, blanks, quantities,
+    /// fixes, order and grouping, with each name's drop, head and pass.
     pub fn names(&self) -> Vec<Slot> {
         let Some(t) = &self.table else { return vec![] };
         let per = self.per_drop.max(1);
@@ -303,9 +350,18 @@ impl DropSetup {
                 .and_then(|v| v.trim().parse::<f64>().ok())
                 .map(|q| q.max(0.0).round() as usize)
                 .unwrap_or(1);
+            let group = self
+                .group_column
+                .and_then(|c| r.get(c))
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default();
             for _ in 0..qty {
                 out.push(Slot {
                     index: 0,
+                    key: 0,
+                    pos: 0,
+                    group: group.clone(),
+                    duplicate: false,
                     text: text.clone(),
                     row: ri + skip,
                     drop: 0,
@@ -316,22 +372,69 @@ impl DropSetup {
             }
         }
         for (k, s) in out.iter_mut().enumerate() {
-            s.index = k;
+            s.key = k;
             if let Some(e) = self.edits.get(&k) {
                 s.text = e.clone();
                 s.edited = true;
             }
-            let slot = k % per;
-            s.drop = k / per;
-            s.head = slot % heads + 1;
-            s.pass = slot / heads + 1;
+        }
+        // the same name from different rows (quantities don't count)
+        let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let mut rows_by_name: BTreeMap<String, std::collections::BTreeSet<usize>> = BTreeMap::new();
+        for s in &out {
+            rows_by_name.entry(norm(&s.text)).or_default().insert(s.row);
+        }
+        for s in &mut out {
+            s.duplicate = !s.text.trim().is_empty() && rows_by_name[&norm(&s.text)].len() > 1;
+        }
+        // order: groups together (in the order they first appear), then the
+        // chosen order inside each group; ties keep the sheet order
+        let mut first_seen: Vec<String> = Vec::new();
+        for s in &out {
+            if !first_seen.contains(&s.group) {
+                first_seen.push(s.group.clone());
+            }
+        }
+        let last_word = |t: &str| {
+            let w: Vec<&str> = t.split_whitespace().collect();
+            match w.split_last() {
+                Some((l, rest)) => format!("{} {}", l.to_lowercase(), rest.join(" ").to_lowercase()),
+                None => String::new(),
+            }
+        };
+        out.sort_by(|a, b| {
+            let ga = first_seen.iter().position(|g| *g == a.group);
+            let gb = first_seen.iter().position(|g| *g == b.group);
+            ga.cmp(&gb)
+                .then_with(|| match self.order {
+                    Order::AsListed => std::cmp::Ordering::Equal,
+                    Order::AToZ => norm(&a.text).cmp(&norm(&b.text)),
+                    Order::LastName => last_word(&a.text).cmp(&last_word(&b.text)),
+                })
+                .then(a.key.cmp(&b.key))
+        });
+        let mut drop = 0;
+        let mut pos = 0;
+        let mut last_group: Option<String> = None;
+        for (k, s) in out.iter_mut().enumerate() {
+            let new_group = last_group.as_ref().map(|g| *g != s.group).unwrap_or(false);
+            if (pos == per) || (new_group && self.group_column.is_some() && self.group_new_drop && pos > 0) {
+                drop += 1;
+                pos = 0;
+            }
+            last_group = Some(s.group.clone());
+            s.index = k;
+            s.pos = pos;
+            s.drop = drop;
+            s.head = pos % heads + 1;
+            s.pass = pos / heads + 1;
+            pos += 1;
         }
         out
     }
 
     pub fn drop_count(&self) -> usize {
-        let n = self.names().len();
-        n.div_ceil(self.per_drop.max(1))
+        self.names().last().map(|s| s.drop + 1).unwrap_or(0)
     }
 
     /// What's missing before drops can be made, in plain words.
@@ -405,14 +508,7 @@ pub fn drop_layers(
         l.text = Some(spec);
         l.opts.stop = Some(true); // every name gets its own stop
         l.opts.overlay = true; // names never cut holes in the logo or each other
-        if let Some(max) = s.max_width_mm {
-            let w = l.bbox().width();
-            if w > max && w > 0.0 {
-                let k = max / w;
-                l.sx *= k;
-                l.sy *= k;
-            }
-        }
+        fit_name(&mut l, s);
         let pass = if slot.pass > 1 {
             format!(", pass {}", slot.pass)
         } else {
@@ -430,6 +526,82 @@ pub fn drop_layers(
     Ok((layers, n_logo, slots))
 }
 
+/// How a name came out after fitting it to the width limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct FitInfo {
+    pub width_mm: f64,
+    /// Capital-letter height after fitting (mm).
+    pub height_mm: f64,
+    /// Letter width and height as a share of the template's (1 = untouched).
+    pub sx: f64,
+    pub sy: f64,
+}
+
+/// Fit a laid-out name layer into the width limit; returns what was done.
+pub fn fit_name(l: &mut Layer, s: &DropSetup) -> FitInfo {
+    let cap = l.text.as_ref().map(|t| t.height_mm).unwrap_or(0.0);
+    let (sx0, sy0) = (l.sx, l.sy);
+    if let Some(max) = s.max_width_mm {
+        let w = layer_width(l);
+        if w > max && w > 0.0 {
+            let k = max / w;
+            match s.fit {
+                Fit::Shrink => {
+                    l.sx *= k;
+                    l.sy *= k;
+                }
+                Fit::Condense => {
+                    let floor = s.min_condense.clamp(0.5, 1.0);
+                    if k >= floor {
+                        l.sx *= k;
+                    } else {
+                        l.sx *= floor;
+                        let rest = k / floor;
+                        l.sx *= rest;
+                        l.sy *= rest;
+                    }
+                }
+            }
+        }
+    }
+    FitInfo {
+        width_mm: layer_width(l),
+        height_mm: cap * l.sy.abs(),
+        sx: if sx0 != 0.0 { l.sx / sx0 } else { 1.0 },
+        sy: if sy0 != 0.0 { l.sy / sy0 } else { 1.0 },
+    }
+}
+
+/// Fit report for every name (sheet order kept in `Slot::index`), so the
+/// list can flag names that get narrowed, shrunk or end up too small.
+pub fn fit_report(project: &Project, opt: &usvg::Options) -> Vec<(usize, FitInfo)> {
+    let s = &project.drops;
+    let Some(template) = s.name_layer.and_then(|id| project.layers.iter().find(|l| l.id == id)) else {
+        return vec![];
+    };
+    let Some(spec0) = template.text.clone() else { return vec![] };
+    let mut cache: BTreeMap<String, FitInfo> = BTreeMap::new();
+    let mut out = Vec::new();
+    for slot in s.names() {
+        let info = match cache.get(&slot.text) {
+            Some(i) => *i,
+            None => {
+                let mut l = template.clone();
+                let mut spec = spec0.clone();
+                spec.text = slot.text.clone();
+                let Ok(shapes) = text_shapes(opt, &spec) else { continue };
+                l.shapes = shapes;
+                l.text = Some(spec);
+                let i = fit_name(&mut l, s);
+                cache.insert(slot.text.clone(), i);
+                i
+            }
+        };
+        out.push((slot.index, info));
+    }
+    out
+}
+
 /// Build one drop's design.
 pub fn build_drop(
     project: &Project,
@@ -439,7 +611,7 @@ pub fn build_drop(
     let (layers, n_logo, slots) = drop_layers(project, opt, drop)?;
     let (art, chart) = compose(&layers, &project.chart);
     let name = format!("{}-drop{}", project.name, drop + 1);
-    let d = build_with(
+    let mut d = build_with(
         &name,
         &art,
         &chart,
@@ -450,7 +622,33 @@ pub fn build_drop(
             auto_stops: project.auto_stops,
         },
     )?;
+    d.warnings = merge_name_warnings(std::mem::take(&mut d.warnings));
     Ok((d, n_logo, slots))
+}
+
+/// Every name in a drop usually trips the same thin-stroke check: say it
+/// once for all of them, with the thinnest stroke.
+fn merge_name_warnings(w: Vec<String>) -> Vec<String> {
+    let key = "strokes as thin as ";
+    let thin: Vec<(f64, String)> = w
+        .iter()
+        .filter(|m| m.starts_with("Name ") && m.contains(key))
+        .filter_map(|m| {
+            let rest = &m[m.find(key)? + key.len()..];
+            let v: f64 = rest.split_whitespace().next()?.parse().ok()?;
+            Some((v, rest.to_string()))
+        })
+        .collect();
+    if thin.len() < 2 {
+        return w;
+    }
+    let (_, worst) = thin.iter().cloned().fold((f64::MAX, String::new()), |a, b| if b.0 < a.0 { b } else { a });
+    let mut out: Vec<String> = w
+        .into_iter()
+        .filter(|m| !(m.starts_with("Name ") && m.contains(key)))
+        .collect();
+    out.insert(0, format!("{} names have strokes as thin as {worst}", thin.len()));
+    out
 }
 
 /// Stop-by-stop instructions for the operator: what sews and which heads run.
@@ -559,8 +757,10 @@ pub fn export_drops(
                 row
             ));
         }
+        let group = slots.first().map(|s| s.group.clone()).filter(|g| !g.is_empty() && slots.iter().all(|s| s.group == *g));
+        let group = group.map(|g| format!(" · {}", esc(&g))).unwrap_or_default();
         html_drops.push_str(&format!(
-            "<section><h2>Drop {} of {} <span>{} · {} names · {} stitches · ~{:.0} min</span></h2>\
+            "<section><h2>Drop {} of {}{group} <span>{} · {} names · {} stitches · ~{:.0} min</span></h2>\
              <table><thead><tr><th class='n'>Stop</th><th>Thread</th><th>Sews</th><th>Heads running</th><th class='n'>Sheet row</th></tr></thead><tbody>{rows}</tbody></table></section>",
             drop + 1, n, esc(&file), slots.len(), d.stats.stitches, d.stats.run_minutes
         ));
@@ -755,6 +955,57 @@ mod tests {
         let (layers, _, _) = drop_layers(&p, &opt, 0).unwrap();
         let hs: Vec<f64> = layers[1..].iter().map(|l| l.bbox().height()).collect();
         assert!(hs.iter().all(|h| (*h - 8.0).abs() < 0.6), "{hs:?}");
+    }
+
+    #[test]
+    fn order_groups_and_duplicates() {
+        let mut s = setup_with(&["Cy Ng", "Ann Zed", "Bo Diaz", "Ann Zed", "Di Ames"], 2, 4);
+        s.order = Order::LastName;
+        let t: Vec<String> = s.names().into_iter().map(|x| x.text).collect();
+        assert_eq!(t, vec!["Di Ames", "Bo Diaz", "Cy Ng", "Ann Zed", "Ann Zed"]);
+        assert!(s.names().iter().filter(|x| x.duplicate).count() == 2);
+        // group by a column: each group starts a new drop
+        if let Some(tb) = &mut s.table {
+            tb.raw[0].push("Size".into());
+            for (i, sz) in ["S", "L", "S", "L", "S"].iter().enumerate() {
+                tb.raw[i + 1].push(sz.to_string());
+            }
+        }
+        s.order = Order::AsListed;
+        s.group_column = Some(3);
+        let n = s.names();
+        let g: Vec<(&str, usize, usize)> = n.iter().map(|x| (x.group.as_str(), x.drop, x.head)).collect();
+        assert_eq!(g, vec![("S", 0, 1), ("S", 0, 2), ("S", 0, 1), ("L", 1, 1), ("L", 1, 2)]);
+        assert_eq!(s.drop_count(), 2);
+        // a fix follows its name even when the order changes
+        s.edits.insert(1, "ANN ZED".into());
+        s.order = Order::AToZ;
+        assert!(s.names().iter().any(|x| x.text == "ANN ZED" && x.key == 1));
+    }
+
+    #[test]
+    fn long_names_condense_before_shrinking() {
+        let (opt, _) = crate::import::font_options(None).unwrap();
+        let spec = TextSpec { text: "Name".into(), font: "DejaVu Sans".into(), height_mm: 8.0, rgb: [0, 0, 0], ..Default::default() };
+        let mut name = Layer::new(2, "Name".into(), text_shapes(&opt, &spec).unwrap(), false);
+        name.text = Some(spec);
+        let mut p = Project::new("team", vec![name]);
+        p.drops = setup_with(&["Al Bo", "Maximiliana Featherstonehaugh"], 2, 2);
+        p.drops.name_layer = Some(2);
+        let w_short = {
+            let r = fit_report(&p, &opt);
+            r[0].1.width_mm
+        };
+        p.drops.max_width_mm = Some(w_short * 2.0);
+        let r = fit_report(&p, &opt);
+        assert_eq!(r[0].1.sx, 1.0, "short name untouched");
+        let long = r[1].1;
+        assert!((long.width_mm - w_short * 2.0).abs() < 0.5, "{long:?}");
+        assert!((long.sx / long.sy - 0.8).abs() < 1e-6, "{long:?}");
+        assert!(long.sy < 1.0, "very long: narrowed to 80% then shrunk");
+        p.drops.fit = Fit::Shrink;
+        let r = fit_report(&p, &opt);
+        assert!((r[1].1.sx - r[1].1.sy).abs() < 1e-9);
     }
 
     #[test]

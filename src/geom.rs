@@ -418,7 +418,15 @@ pub fn group_runs(rows: Vec<Vec<Seg>>) -> Vec<Vec<Seg>> {
                     continue;
                 }
                 let prev = runs[ri].last().unwrap();
-                if s.x0 < prev.x1 && s.x1 > prev.x0 {
+                // Rows of a run are sewn back and forth, so both ends must
+                // line up: a row that sticks far out past the one before it
+                // would be reached by a long stitch across open fabric.
+                let reach = (4.0 * (s.y - prev.y).abs()).max(3.5);
+                if s.x0 < prev.x1
+                    && s.x1 > prev.x0
+                    && (s.x0 - prev.x0).abs() <= reach
+                    && (s.x1 - prev.x1).abs() <= reach
+                {
                     runs[ri].push(s);
                     used[k] = true;
                     next_open.push(ri);
@@ -656,11 +664,14 @@ mod tests {
     fn hole_splits_into_runs() {
         let rings = vec![rect(0.0, 0.0, 10.0, 10.0), rect(3.0, 3.0, 7.0, 7.0)];
         let runs = group_runs(scan(&rings, FillRule::EvenOdd, 0.4, 0.1));
-        assert_eq!(
-            runs.len(),
-            2,
-            "top+left+bottom continue as one run; right side is the second"
-        );
+        // top band, the two sides of the hole and the bottom band: a run never
+        // turns around with a long stitch from one row end to the next
+        assert_eq!(runs.len(), 4);
+        for run in &runs {
+            for w in run.windows(2) {
+                assert!((w[0].x0 - w[1].x0).abs() <= 3.5 && (w[0].x1 - w[1].x1).abs() <= 3.5);
+            }
+        }
     }
 }
 

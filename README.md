@@ -1,4 +1,4 @@
-# StitchForge v0.10 — embroidery app
+# StitchForge v0.11 — embroidery app
 
 Vector art, PDFs, pictures (PNG/JPG, even mockup photos) and any-font text
 in; machine-ready DST, a printable operator
@@ -124,10 +124,20 @@ name so the operator runs it on one head at a time.
    `examples/team-roster.xlsx`). Tick the name column(s) (e.g. First + Last),
    same line or separate lines, letter case, an optional quantity column.
 3. Pick the **name layer** and the **logo layers** (sewn on all heads).
+   **Order** names as in the sheet, A–Z or by last name, and **group by** a
+   column (garment, size, team) so each group sews together; with "Each group
+   starts a new drop", a drop never mixes groups (the run sheet shows the
+   group on each drop).
 4. Set **heads** and **names per drop** (up to 2 × heads: the second half is a
    second pass on the same heads), logo in every drop, and an optional
-   maximum name width (wider names shrink to fit).
-5. Fix any name by typing over it in the list. The left panel shows the drop
+   **maximum name width**. Long names are **narrowed first** (letters down to
+   80% of their width, adjustable) so they keep their height, and only shrink
+   if that isn't enough; or pick **Shrink** to scale the whole name.
+5. Fix any name by typing over it in the list (fixes stay with the name when
+   you change the order). Each name shows whether it was narrowed (e.g.
+   "86% w") or shrunk, and a red height when its letters end up smaller
+   than the thread weight can sew legibly (5 mm for 40 wt). Names that appear
+   on two different rows are marked 2× so double entries get caught. The left panel shows the drop
    as layers: logo, then STOP + name + head for each name; click one to see it.
 6. **Export…** writes one machine file per drop, an operator sheet per drop,
    and a printable **run sheet** (plus CSV) listing every stop, which head to
@@ -148,6 +158,23 @@ StitchForge, so a logo can be built from scratch or added to:
   with any number of points, **Line (L)**: drag to draw, Shift to constrain;
   a click alone makes a 20 mm shape.
 - **Text (T)**: click where the words go.
+- **Knife (K)**: drag a line across a shape to cut it into two layers (the
+  selected layers, or whatever the line crosses). Works on outlines too.
+  Shift snaps to 15°. Each piece gets fresh stitches.
+- **Eraser (X)**: draw around the part to remove. It is cut out of the
+  shape (or the outline is trimmed) and the stitches are rebuilt around the
+  hole; a layer erased completely is removed. While editing stitches, the
+  eraser removes the needle points you draw around instead.
+
+**Editing stitches (M).** Click or box-select needle points (Alt/Option-drag
+draws a free-hand selection), drag or arrow-nudge them, double-click a stitch
+to add a point. **Delete** removes points: taking one point out of a straight
+line just lengthens that stitch; anywhere else the thread **jumps** over the
+gap (tie-off and trim when it's far), so no stitch is left lying across the
+hole. Clean-up buttons: **Remove strays** (points off the shape, and stitches
+that cross open fabric become jumps), **Remove tiny stitches** (under
+0.3 mm) and **Split long stitches** (over 7 mm). Hand edits stay when you
+press Done, are what the machine file sews, and are saved in the project.
 - New shapes use the fill and outline colours and outline width shown on the
   right while a drawing tool is active. Points snap to existing anchors, and
   to a 1 mm grid when that box is ticked.

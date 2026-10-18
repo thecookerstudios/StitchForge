@@ -21,7 +21,7 @@ use stitchforge::trace;
 use stitchforge::import::{self, Artwork, Shape, ShapeKind, ShapeOpts, StitchChoice};
 use stitchforge::import::{Cap, Corner, Underlay};
 use stitchforge::project::{Layer, Project, TextSpec};
-use stitchforge::settings::{self, Profile, Recipe};
+use stitchforge::settings::{self, Limits, Profile, Recipe};
 use stitchforge::sheet::JobInfo;
 use stitchforge::{export, sampler, thread};
 
@@ -93,10 +93,12 @@ enum Tool {
     Line,
     Text,
     Measure,
+    Knife,
+    Eraser,
 }
 
 impl Tool {
-    const ALL: [Tool; 10] = [
+    const ALL: [Tool; 12] = [
         Tool::Select,
         Tool::Nodes,
         Tool::Stitches,
@@ -107,6 +109,8 @@ impl Tool {
         Tool::Line,
         Tool::Text,
         Tool::Measure,
+        Tool::Knife,
+        Tool::Eraser,
     ];
     fn hint(&self) -> &'static str {
         match self {
@@ -120,6 +124,8 @@ impl Tool {
             Tool::Line => "Line (L)\nDrag; Shift snaps to 15°",
             Tool::Text => "Text (T)\nClick where the words go",
             Tool::Measure => "Measure (D)\nDrag across a column or gap to see its size and which thread weights it suits",
+            Tool::Knife => "Knife (K)\nDrag a line across a shape to cut it into separate pieces; Shift snaps to 15°",
+            Tool::Eraser => "Eraser (X)\nDraw around the part to remove: it is cut out of the shape and the stitches follow",
         }
     }
     fn key(&self) -> egui::Key {
@@ -134,6 +140,8 @@ impl Tool {
             Tool::Line => egui::Key::L,
             Tool::Text => egui::Key::T,
             Tool::Measure => egui::Key::D,
+            Tool::Knife => egui::Key::K,
+            Tool::Eraser => egui::Key::X,
         }
     }
     /// Tools that make new shapes on the canvas.
@@ -170,6 +178,8 @@ enum EditDrag {
     Stitches(Pt, Vec<(usize, Pt)>),
     Node(NodeRef, Pt, Node),
     Box(Pos2),
+    /// Free-hand selection outline (screen points).
+    Lasso(Vec<Pos2>),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -279,6 +289,8 @@ struct App {
     drop_view: usize,
     drop_sel: usize,
     drop_info: Option<(usize, Vec<Slot>)>,
+    /// How each name fits the width limit (by run position).
+    drop_fit: Vec<(usize, drops_mod::FitInfo)>,
     quiet_regen: bool,
 
     // editing a design object's stitches or shape on the canvas
@@ -295,6 +307,10 @@ struct App {
     show_border: bool,
     show_weights: bool,
     measure: Option<(Pt, Pt)>,
+    /// Knife line being dragged (design mm).
+    cut: Option<(Pt, Pt)>,
+    /// Eraser outline being drawn (design mm).
+    lasso: Vec<Pt>,
     trace_dlg: Option<TraceDlg>,
     /// Bumped whenever the design is rebuilt (vector view cache key).
     layers_rev: u64,
@@ -376,6 +392,7 @@ impl App {
             drop_view: 0,
             drop_sel: 0,
             drop_info: None,
+            drop_fit: Vec::new(),
             quiet_regen: false,
             edit: Edit::None,
             tool: Tool::Select,
@@ -399,6 +416,8 @@ impl App {
             show_border: false,
             show_weights: false,
             measure: None,
+            cut: None,
+            lasso: Vec::new(),
             trace_dlg: None,
             layers_rev: 0,
             vec_tex: None,
@@ -1330,10 +1349,11 @@ impl App {
             self.drop_view = self.drop_view.min(n - 1);
             let proj = self.to_project();
             let view = self.drop_view;
-            let res = {
+            let (res, fit) = {
                 let opt = self.fonts_db();
-                drops_mod::build_drop(&proj, opt, view)
+                (drops_mod::build_drop(&proj, opt, view), drops_mod::fit_report(&proj, opt))
             };
+            self.drop_fit = fit;
             match res {
                 Ok((d, n_logo, slots)) => {
                     self.drop_sel = self.drop_sel.min(slots.len().saturating_sub(1));
@@ -1376,32 +1396,8 @@ impl App {
             self.design = None;
             return;
         }
-        let mut shapes = Vec::new();
-        // Custom threads join the chart for this build.
-        let mut chart = self.chart.clone();
-        for (li, l) in self.layers.iter().enumerate() {
-            if !l.visible {
-                continue;
-            }
-            let mut opts = ShapeOpts {
-                layer: li,
-                ..l.opts.clone()
-            };
-            if let Some(t) = &l.custom {
-                chart.push(t.clone());
-                opts.thread = Some(chart.len() - 1);
-            }
-            for mut s in l.transformed() {
-                s.opts = opts.clone();
-                s.label = l.name.clone();
-                shapes.push(s);
-            }
-        }
-        let art = Artwork {
-            fixed: Default::default(),
-            shapes,
-            warnings: Vec::new(),
-        };
+        // Hand-edited layers sew exactly the stitches the user left them with.
+        let (art, chart) = stitchforge::project::compose(&self.layers, &self.chart);
         let name = format!(
             "{}-{}",
             self.design_name,
@@ -1749,19 +1745,7 @@ impl App {
                     self.hard_checkpoint();
                     let sel = std::mem::take(&mut self.st_sel);
                     let n = &mut self.layers[li].embroidery.needles;
-                    let mut keep = Vec::with_capacity(n.len());
-                    let mut carry_jump = false;
-                    for (i, nd) in n.iter().enumerate() {
-                        if sel.contains(&i) {
-                            carry_jump |= nd.jump;
-                            continue;
-                        }
-                        let mut nd = *nd;
-                        nd.jump |= carry_jump;
-                        carry_jump = false;
-                        keep.push(nd);
-                    }
-                    *n = keep;
+                    *n = stitchforge::project::remove_needles(n, |i| sel.contains(&i));
                     self.touch_stitches(li);
                     return true;
                 }
@@ -1812,6 +1796,7 @@ impl App {
     fn edit_panel(&mut self, ui: &mut egui::Ui) {
         let Some(li) = self.edit_layer() else { return };
         let accent = Color32::from_rgb(30, 110, 230);
+        let mut clean: Option<u8> = None;
         egui::Frame::NONE
             .fill(accent.gamma_multiply(0.12))
             .corner_radius(6.0)
@@ -1826,7 +1811,20 @@ impl App {
                             group(l.embroidery.needles.len()),
                             self.st_sel.len()
                         ));
-                        ui.label(RichText::new("Click a point or drag a box to select (Shift adds) · drag to move · arrows nudge 0.1 mm (Shift 0.5) · Delete removes · double-click a stitch to add a point · Ctrl/Cmd+A selects all · right-drag pans").weak().small());
+                        ui.label(RichText::new("Click a point or drag a box to select (Shift adds) · Alt/Option-drag draws a free-hand selection · drag to move · arrows nudge 0.1 mm (Shift 0.5) · Delete removes (the thread jumps over the gap) · Eraser (X) wipes out the points you draw around · double-click a stitch to add a point · Ctrl/Cmd+A selects all · right-drag pans").weak().small());
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("CLEAN UP").small().strong());
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Remove strays").on_hover_text("Drop needle points that are off the shape, and turn any stitch still crossing open fabric into a jump").clicked() {
+                                clean = Some(0);
+                            }
+                            if ui.button("Remove tiny stitches").on_hover_text("Stitches shorter than 0.3 mm break thread and make knots").clicked() {
+                                clean = Some(1);
+                            }
+                            if ui.button("Split long stitches").on_hover_text("Break stitches over 7 mm so they don't snag").clicked() {
+                                clean = Some(2);
+                            }
+                        });
                     }
                     Edit::Shape(_) => {
                         let anchors: usize = l.shapes.iter().flat_map(|s| s.curves.iter()).map(|c| c.nodes.len()).sum();
@@ -1843,6 +1841,9 @@ impl App {
                     self.end_edit();
                 }
             });
+        if let Some(c) = clean {
+            self.stitch_cleanup(li, c);
+        }
         ui.add_space(6.0);
     }
 
@@ -3671,6 +3672,39 @@ impl App {
                     });
             });
             changed |= ui.checkbox(&mut d.skip_blank, "Skip blank rows").changed();
+            ui.horizontal(|ui| {
+                ui.label("Order");
+                changed |= ui.selectable_value(&mut d.order, drops_mod::Order::AsListed, "As in sheet").changed();
+                changed |= ui.selectable_value(&mut d.order, drops_mod::Order::AToZ, "A–Z").changed();
+                changed |= ui.selectable_value(&mut d.order, drops_mod::Order::LastName, "By last name").changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Group by").on_hover_text("Keep names of one garment, size or team together");
+                let shown = d
+                    .group_column
+                    .and_then(|c| headers.get(c).cloned())
+                    .unwrap_or("No grouping".into());
+                egui::ComboBox::from_id_salt("group-col")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(d.group_column.is_none(), "No grouping").clicked() {
+                            d.group_column = None;
+                            changed = true;
+                        }
+                        for (i, h) in headers.iter().enumerate() {
+                            if ui.selectable_label(d.group_column == Some(i), h).clicked() {
+                                d.group_column = Some(i);
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            if d.group_column.is_some() {
+                changed |= ui
+                    .checkbox(&mut d.group_new_drop, "Each group starts a new drop")
+                    .on_hover_text("A drop never mixes groups, so one hooping run is one garment or size")
+                    .changed();
+            }
         }
 
         section(ui, "2 · Layers");
@@ -3781,7 +3815,7 @@ impl App {
                 .changed();
             ui.horizontal(|ui| {
                 let mut on = d.max_width_mm.is_some();
-                if ui.checkbox(&mut on, "Shrink names wider than").changed() {
+                if ui.checkbox(&mut on, "Names no wider than").changed() {
                     d.max_width_mm = if on { Some(76.2) } else { None };
                     changed = true;
                 }
@@ -3792,6 +3826,29 @@ impl App {
                     }
                 }
             });
+            if d.max_width_mm.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("Long names");
+                    changed |= ui
+                        .selectable_value(&mut d.fit, drops_mod::Fit::Condense, "Narrow, then shrink")
+                        .on_hover_text("Letters get narrower first so the name keeps its height; only very long names also get smaller")
+                        .changed();
+                    changed |= ui
+                        .selectable_value(&mut d.fit, drops_mod::Fit::Shrink, "Shrink")
+                        .on_hover_text("The whole name gets smaller, keeping its proportions")
+                        .changed();
+                });
+                if d.fit == drops_mod::Fit::Condense {
+                    ui.horizontal(|ui| {
+                        ui.label("Narrowest letters");
+                        if let Some(v) = num_field(ui, "min-cond", d.min_condense * 100.0, 0, "%") {
+                            d.min_condense = (v / 100.0).clamp(0.5, 1.0);
+                            changed = true;
+                        }
+                        ui.label(RichText::new("of normal width (80% reads well)").weak().small());
+                    });
+                }
+            }
         }
 
         let names = self.drops.names();
@@ -3809,14 +3866,49 @@ impl App {
                     .weak()
                     .small(),
             );
+            // how names fit, and which are too small for the thread
+            let weight = self
+                .drops
+                .name_layer
+                .and_then(|id| self.layers.iter().find(|l| l.id == id))
+                .and_then(|l| l.opts.weight)
+                .unwrap_or(self.recipe.weight);
+            let min_h = weight.min_text_height();
+            let fit: std::collections::HashMap<usize, drops_mod::FitInfo> = self.drop_fit.iter().copied().collect();
+            let narrowed = names.iter().filter(|n| fit.get(&n.index).map(|f| f.sx < 0.999 && f.sy >= 0.999).unwrap_or(false)).count();
+            let shrunk = names.iter().filter(|n| fit.get(&n.index).map(|f| f.sy < 0.999).unwrap_or(false)).count();
+            let small = names.iter().filter(|n| fit.get(&n.index).map(|f| f.height_mm < min_h - 0.05).unwrap_or(false)).count();
+            let dups = names.iter().filter(|n| n.duplicate).count();
+            let mut bits = Vec::new();
+            if narrowed > 0 { bits.push(format!("{narrowed} narrowed")); }
+            if shrunk > 0 { bits.push(format!("{shrunk} shrunk")); }
+            if dups > 0 { bits.push(format!("{dups} repeated on another row")); }
+            if !bits.is_empty() {
+                ui.label(RichText::new(bits.join(" · ")).small().color(Color32::from_rgb(196, 130, 20)));
+            }
+            if small > 0 {
+                ui.label(RichText::new(format!("{small} name{} under {:.1} mm tall: too small to read in {} thread. Allow a wider name, use a thinner thread or split onto two lines.", if small == 1 { " is" } else { "s are" }, min_h, weight.label())).small().color(Color32::from_rgb(200, 60, 40)));
+            }
             let mut edit: Option<(usize, Option<String>)> = None;
             let mut show: Option<(usize, usize)> = None;
+            let groups = if self.drops.group_column.is_some() {
+                names.iter().map(|n| n.group.as_str()).collect::<std::collections::BTreeSet<_>>().len()
+            } else {
+                0
+            };
+            let list_h = (((names.len() + groups) as f32) * 25.0).min(300.0);
             egui::ScrollArea::vertical()
                 .id_salt("names")
-                .max_height(260.0)
-                .auto_shrink([false, true])
+                .max_height(list_h)
+                .min_scrolled_height(list_h)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    let mut last_group: Option<&str> = None;
                     for n in &names {
+                        if self.drops.group_column.is_some() && last_group != Some(n.group.as_str()) {
+                            ui.label(RichText::new(if n.group.is_empty() { "(blank)".to_string() } else { n.group.clone() }).small().strong());
+                            last_group = Some(n.group.as_str());
+                        }
                         let here = n.drop == self.drop_view
                             && Some(n.index)
                                 == self
@@ -3843,15 +3935,15 @@ impl App {
                                 ))
                                 .clicked()
                             {
-                                show = Some((n.drop, n.index));
+                                show = Some((n.drop, n.pos));
                             }
                             if let Some(v) = text_field(
                                 ui,
-                                &format!("nm-{}", n.index),
+                                &format!("nm-{}", n.key),
                                 &n.text.replace('\n', " / "),
                                 170.0,
                             ) {
-                                edit = Some((n.index, Some(v.replace(" / ", "\n"))));
+                                edit = Some((n.key, Some(v.replace(" / ", "\n"))));
                             }
                             if n.edited
                                 && ui
@@ -3859,7 +3951,24 @@ impl App {
                                     .on_hover_text("Undo your fix")
                                     .clicked()
                             {
-                                edit = Some((n.index, None));
+                                edit = Some((n.key, None));
+                            }
+                            if let Some(f) = fit.get(&n.index) {
+                                let warn = Color32::from_rgb(196, 130, 20);
+                                if f.height_mm < min_h - 0.05 {
+                                    ui.label(RichText::new(format!("{:.1} mm", f.height_mm)).small().color(Color32::from_rgb(200, 60, 40)))
+                                        .on_hover_text(format!("Letters {:.1} mm tall: under the {:.1} mm minimum for {}", f.height_mm, min_h, weight.label()));
+                                } else if f.sy < 0.999 {
+                                    ui.label(RichText::new(format!("{:.0}%", f.sy * 100.0)).small().color(warn))
+                                        .on_hover_text(format!("Shrunk to {:.0}% to fit ({:.1} mm tall)", f.sy * 100.0, f.height_mm));
+                                } else if f.sx < 0.999 {
+                                    ui.label(RichText::new(format!("{:.0}% w", f.sx * 100.0)).small().color(warn))
+                                        .on_hover_text(format!("Letters narrowed to {:.0}% to fit; full height kept", f.sx * 100.0));
+                                }
+                            }
+                            if n.duplicate {
+                                ui.label(RichText::new("2×").small().color(Color32::from_rgb(196, 130, 20)))
+                                    .on_hover_text("This name is also on another row of the sheet: check it isn't a double entry");
                             }
                         });
                     }
@@ -3875,9 +3984,9 @@ impl App {
                 }
                 changed = true;
             }
-            if let Some((drop, idx)) = show {
+            if let Some((drop, pos)) = show {
                 self.drop_view = drop;
-                self.drop_sel = idx % self.drops.per_drop.max(1);
+                self.drop_sel = pos;
                 self.dirty = true;
                 self.quiet_regen = true;
             }
@@ -4409,7 +4518,8 @@ impl App {
         if drawing {
             self.draw_input(&resp, ui, &to_mm, &to_screen, zoom);
         }
-        let object_edit = editing && !drawing && self.edit_layer().is_some();
+        let cut_tool = matches!(self.tool, Tool::Knife | Tool::Eraser);
+        let object_edit = editing && !drawing && !cut_tool && self.edit_layer().is_some();
         if object_edit {
             self.edit_input(&resp, ui, &to_mm, &to_screen, zoom);
         }
@@ -4434,7 +4544,11 @@ impl App {
                 }
             }
         }
-        let object_edit = object_edit || drawing || measuring;
+        let cutting = editing && matches!(self.tool, Tool::Knife | Tool::Eraser);
+        if cutting {
+            self.cut_input(&resp, ui, &to_mm);
+        }
+        let object_edit = object_edit || drawing || measuring || cutting;
         let no_layers: Vec<Layer> = Vec::new();
         let hit_src: &[Layer] = if editing { &self.layers } else { &no_layers };
         if !object_edit && resp.drag_started() {
@@ -4678,6 +4792,26 @@ impl App {
             }
         }
 
+        if let Some((a, b)) = self.cut {
+            let red = Color32::from_rgb(220, 50, 40);
+            let (sa, sb) = (to_screen(a), to_screen(b));
+            painter.line_segment([sa, sb], Stroke::new(4.0_f32, Color32::from_white_alpha(170)));
+            for seg in EShape::dashed_line(&[sa, sb], Stroke::new(2.0_f32, red), 6.0, 4.0) {
+                painter.add(seg);
+            }
+            painter.circle_filled(sa, 3.5, red);
+            painter.circle_filled(sb, 3.5, red);
+        }
+        if self.lasso.len() >= 2 {
+            let red = Color32::from_rgb(220, 50, 40);
+            let pts: Vec<Pos2> = self.lasso.iter().map(|p| to_screen(*p)).collect();
+            let mut closed = pts.clone();
+            closed.push(pts[0]);
+            painter.add(EShape::line(closed.clone(), Stroke::new(4.0_f32, Color32::from_white_alpha(150))));
+            for seg in EShape::dashed_line(&closed, Stroke::new(1.8_f32, red), 5.0, 3.0) {
+                painter.add(seg);
+            }
+        }
         if let Some((a, b)) = self.measure {
             measure_overlay(&painter, to_screen(a), to_screen(b), a.dist(b), ui.visuals().dark_mode);
         }
@@ -4767,25 +4901,32 @@ impl App {
                     .all(|o| (o.angle_deg - pieces[0].angle_deg).abs() < 0.5);
                 if let Some(o) = pieces.first().filter(|_| same) {
                     {
+                        // Stitch-direction guide: a dashed, arrow-tipped
+                        // overlay in the selection colour with a labelled
+                        // pill, so it never reads as a stitch.
                         let a = o.angle_deg.to_radians() as f32;
                         let c = r.center();
                         let len = (r.width().min(r.height()) * 0.35).clamp(20.0, 70.0);
-                        let dir = Vec2::new(a.cos(), -a.sin()) * len;
-                        let col = Color32::from_rgb(255, 255, 255);
-                        painter.line_segment(
-                            [c - dir, c + dir],
-                            Stroke::new(5.0_f32, Color32::from_black_alpha(120)),
-                        );
-                        painter.line_segment([c - dir, c + dir], Stroke::new(2.5_f32, col));
-                        painter.circle_filled(c + dir, 4.5, col);
-                        painter.circle_filled(c - dir, 4.5, col);
-                        painter.text(
-                            c + Vec2::new(0.0, -14.0),
-                            egui::Align2::CENTER_BOTTOM,
-                            format!("{:.0}°", o.angle_deg),
-                            egui::FontId::proportional(13.0),
-                            col,
-                        );
+                        let u = Vec2::new(a.cos(), -a.sin());
+                        let dir = u * len;
+                        let halo = Stroke::new(4.0_f32, Color32::from_white_alpha(170));
+                        let ink = Stroke::new(1.6_f32, accent);
+                        for st in [halo, ink] {
+                            for seg in EShape::dashed_line(&[c - dir, c + dir], st, 5.0, 4.0) {
+                                painter.add(seg);
+                            }
+                        }
+                        let n = Vec2::new(-u.y, u.x);
+                        for tip in [c + dir, c - dir] {
+                            let back = if tip == c + dir { -u } else { u };
+                            let pts = vec![tip, tip + back * 9.0 + n * 5.0, tip + back * 9.0 - n * 5.0];
+                            painter.add(EShape::convex_polygon(pts, accent, Stroke::new(1.0_f32, Color32::WHITE)));
+                        }
+                        let label = format!("Stitch angle {:.0}°", o.angle_deg);
+                        let galley = painter.layout_no_wrap(label, egui::FontId::proportional(12.0), Color32::WHITE);
+                        let pill = Rect::from_center_size(c, galley.size() + Vec2::new(14.0, 6.0));
+                        painter.rect_filled(pill, 9.0, accent);
+                        painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
                     }
                 }
             }
@@ -4819,7 +4960,9 @@ impl App {
         }
         self.finish_pen(false);
         self.shape_drag = None;
-        if self.edit != Edit::None {
+        // the eraser works on needle points while stitches are being edited
+        let keep = t == Tool::Eraser && matches!(self.edit, Edit::Stitches(_));
+        if self.edit != Edit::None && !keep {
             self.end_edit();
         }
         self.tool = t;
@@ -4842,11 +4985,22 @@ impl App {
             Tool::Measure => {
                 self.status = "Measure: drag across a column, letter stroke or gap".into()
             }
+            Tool::Knife => {
+                self.status = "Knife: drag a line across a shape to cut it in two (the selected layers, or whatever the line crosses)".into()
+            }
+            Tool::Eraser if keep => {
+                self.status = "Eraser: draw around needle points to remove them; Esc when done".into()
+            }
+            Tool::Eraser => {
+                self.status = "Eraser: draw around what to remove from the selected layers (or from anything under it)".into()
+            }
             Tool::Select => {}
         }
         if t != Tool::Measure {
             self.measure = None;
         }
+        self.cut = None;
+        self.lasso.clear();
     }
 
     /// Snap a point: to an existing anchor within reach, else the 1 mm grid
@@ -5279,6 +5433,271 @@ impl App {
         self.multi = [id].into_iter().collect();
         self.dirty = true;
         self.status = "Combined into one layer".into();
+    }
+
+    /// Knife and Eraser: collect the drag, then cut when it ends.
+    fn cut_input(&mut self, resp: &egui::Response, ui: &egui::Ui, to_mm: &dyn Fn(Pos2) -> Pt) {
+        let Some(pos) = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos())) else { return };
+        let mut p = to_mm(pos);
+        // a drag is only recognised after the pointer has moved a little:
+        // start from where the button went down
+        let origin = ui.input(|i| i.pointer.press_origin()).map(|o| to_mm(o)).unwrap_or(p);
+        match self.tool {
+            Tool::Knife => {
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    self.cut = Some((origin, p));
+                } else if resp.dragged_by(egui::PointerButton::Primary) {
+                    if let Some((a, _)) = self.cut {
+                        if ui.input(|i| i.modifiers.shift) {
+                            let d = p.sub(a);
+                            let step = std::f64::consts::PI / 12.0;
+                            let ang = (d.y.atan2(d.x) / step).round() * step;
+                            p = Pt::new(a.x + d.len() * ang.cos(), a.y + d.len() * ang.sin());
+                        }
+                        self.cut = Some((a, p));
+                    }
+                }
+                if resp.drag_stopped() {
+                    if let Some((a, b)) = self.cut.take() {
+                        self.apply_knife(a, b);
+                    }
+                }
+            }
+            Tool::Eraser => {
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    self.lasso = vec![origin, p];
+                } else if resp.dragged_by(egui::PointerButton::Primary) {
+                    if self.lasso.last().map(|l| l.dist(p) > 0.2).unwrap_or(true) {
+                        self.lasso.push(p);
+                    }
+                }
+                if resp.drag_stopped() {
+                    let lasso = std::mem::take(&mut self.lasso);
+                    if lasso.len() >= 3 {
+                        self.apply_eraser(&stitchforge::geom::simplify(&lasso, 0.05));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Layers a cut applies to: the selection, or every visible layer the
+    /// test says is under the tool.
+    fn cut_targets(&self, under: &dyn Fn(&Self, usize) -> bool) -> Vec<usize> {
+        let sel: Vec<usize> = self.sel_layers().into_iter().filter(|&li| self.layers[li].visible).collect();
+        if !sel.is_empty() {
+            return sel.into_iter().filter(|&li| under(self, li)).collect();
+        }
+        (0..self.layers.len()).filter(|&li| self.layers[li].visible && under(self, li)).collect()
+    }
+
+    /// A layer rebuilt from new geometry, keeping everything else about it.
+    fn reshaped(&mut self, li: usize, areas: Option<Vec<stitchforge::geom::Ring>>, lines: Option<Vec<Vec<Pt>>>, name: String, keep_id: bool) -> Layer {
+        let old = self.layers[li].clone();
+        let id = if keep_id { old.id } else { let id = self.next_id; self.next_id += 1; id };
+        let rgb = self.layer_color(li);
+        let mut shapes = Vec::new();
+        if let Some(rings) = areas {
+            let mut sh = Shape {
+                kind: ShapeKind::Area { rings: Vec::new(), rule: FillRule::EvenOdd },
+                rgb,
+                label: name.clone(),
+                group: 0,
+                opts: ShapeOpts::default(),
+                curves: vector::rings_to_curves(&rings),
+            };
+            sh.reflatten();
+            shapes.push(sh);
+        }
+        if let Some(paths) = lines {
+            let width = old.transformed().iter().find_map(|s| match &s.kind {
+                ShapeKind::Line { width, .. } => Some(*width * (old.sx * old.sy).abs().sqrt()),
+                _ => None,
+            }).unwrap_or(1.0);
+            let mut sh = Shape {
+                kind: ShapeKind::Line { paths: Vec::new(), width },
+                rgb,
+                label: name.clone(),
+                group: 0,
+                opts: ShapeOpts::default(),
+                curves: paths
+                    .iter()
+                    .map(|p| stitchforge::geom::VPath { nodes: p.iter().map(|q| stitchforge::geom::Node::corner(*q)).collect(), closed: false })
+                    .collect(),
+            };
+            sh.reflatten();
+            shapes.push(sh);
+        }
+        let mut l = Layer::new(id, name, shapes, old.is_outline);
+        l.opts = old.opts.clone();
+        if old.opts.column_width.is_some() {
+            // the stroke width is now baked into the new geometry
+            l.opts.column_width = old.opts.column_width.map(|w| w * (old.sx * old.sy).abs().sqrt());
+        }
+        l.custom = old.custom.clone();
+        l.visible = old.visible;
+        l
+    }
+
+    /// Area and stroke geometry of a layer in design mm.
+    fn layer_geometry(&self, li: usize) -> (Vec<stitchforge::geom::Ring>, Vec<Vec<Pt>>) {
+        let l = &self.layers[li];
+        let (mut rings, mut paths) = (Vec::new(), Vec::new());
+        let mut parts = Vec::new();
+        for s in l.transformed() {
+            match s.kind {
+                ShapeKind::Area { rings: r, rule } => parts.push((r, rule)),
+                ShapeKind::Line { paths: p, .. } => paths.extend(p),
+            }
+        }
+        if !parts.is_empty() {
+            rings = vector::boolean(&parts, BoolOp::Union);
+        }
+        (rings, paths)
+    }
+
+    fn apply_knife(&mut self, a: Pt, b: Pt) {
+        if a.dist(b) < 0.5 {
+            return;
+        }
+        if self.edit != Edit::None {
+            self.end_edit();
+        }
+        let crosses = |s: &Self, li: usize| -> bool {
+            let (rings, paths) = s.layer_geometry(li);
+            stitchforge::cut::knife_rings(&rings, FillRule::EvenOdd, a, b).is_some()
+                || stitchforge::cut::knife_paths(&paths, a, b).is_some()
+        };
+        let targets = self.cut_targets(&crosses);
+        if targets.is_empty() {
+            self.status = "Knife: the line has to cross a shape all the way to cut it".into();
+            return;
+        }
+        self.hard_checkpoint();
+        let mut made = 0;
+        let mut first_ids = Vec::new();
+        for &li in targets.iter().rev() {
+            let (rings, paths) = self.layer_geometry(li);
+            let ra = stitchforge::cut::knife_rings(&rings, FillRule::EvenOdd, a, b);
+            let pa = stitchforge::cut::knife_paths(&paths, a, b);
+            let (al, ar) = match ra {
+                Some((l, r)) => (Some(l), Some(r)),
+                None => (Some(rings.clone()).filter(|r| !r.is_empty()), None),
+            };
+            let (pl, pr) = match pa {
+                Some((l, r)) => (Some(l), Some(r)),
+                None => (Some(paths.clone()).filter(|p| !p.is_empty()), None),
+            };
+            let name = self.layers[li].name.clone();
+            let one = self.reshaped(li, al, pl, format!("{name} 1"), true);
+            let two = self.reshaped(li, ar, pr, format!("{name} 2"), false);
+            first_ids.push(one.id);
+            self.layers[li] = one;
+            self.layers.insert(li + 1, two);
+            made += 1;
+        }
+        self.multi = first_ids.iter().copied().collect();
+        self.selected = first_ids.first().copied();
+        self.dirty = true;
+        self.status = if made == 1 {
+            "Cut in two: the pieces are separate layers now".into()
+        } else {
+            format!("Cut {made} layers in two")
+        };
+    }
+
+    fn apply_eraser(&mut self, lasso: &[Pt]) {
+        // While editing stitches, the eraser removes needle points instead.
+        if let (Edit::Stitches(_), Some(li)) = (self.edit, self.edit_layer()) {
+            let l = &self.layers[li];
+            let gone: Vec<usize> = (0..l.embroidery.needles.len())
+                .filter(|&i| stitchforge::cut::point_in_poly(lasso, l.tf(l.embroidery.needles[i].p)))
+                .collect();
+            if gone.is_empty() {
+                return;
+            }
+            self.hard_checkpoint();
+            let n = gone.len();
+            let l = &mut self.layers[li];
+            l.embroidery.needles = stitchforge::project::remove_needles(&l.embroidery.needles, |i| gone.binary_search(&i).is_ok());
+            self.st_sel.clear();
+            self.touch_stitches(li);
+            self.status = format!("Erased {n} needle point{}; the thread jumps over the gap. For a clean edge, erase the shape instead (outside stitch editing) and the stitches are rebuilt around the hole", if n == 1 { "" } else { "s" });
+            return;
+        }
+        let under = |s: &Self, li: usize| -> bool {
+            let (rings, paths) = s.layer_geometry(li);
+            (!rings.is_empty() && stitchforge::cut::lasso_touches(&rings, FillRule::EvenOdd, lasso))
+                || paths.iter().flatten().any(|p| stitchforge::cut::point_in_poly(lasso, *p))
+                || stitchforge::cut::erase_paths(&paths, lasso).len() != paths.len()
+        };
+        let targets = self.cut_targets(&under);
+        if targets.is_empty() {
+            self.status = "Eraser: draw around part of a shape to remove it".into();
+            return;
+        }
+        self.hard_checkpoint();
+        let mut removed = 0;
+        for &li in targets.iter().rev() {
+            let (rings, paths) = self.layer_geometry(li);
+            let left = if rings.is_empty() { None } else { Some(stitchforge::cut::erase_rings(&rings, FillRule::EvenOdd, lasso)).filter(|r| !r.is_empty()) };
+            let lines = if paths.is_empty() { None } else { Some(stitchforge::cut::erase_paths(&paths, lasso)).filter(|p| !p.is_empty()) };
+            if left.is_none() && lines.is_none() {
+                self.layers.remove(li);
+                removed += 1;
+                continue;
+            }
+            let name = self.layers[li].name.clone();
+            let nl = self.reshaped(li, left, lines, name, true);
+            self.layers[li] = nl;
+        }
+        if self.selected.map(|id| !self.layers.iter().any(|l| l.id == id)).unwrap_or(false) {
+            self.selected = None;
+        }
+        self.multi.retain(|id| self.layers.iter().any(|l| l.id == *id));
+        self.dirty = true;
+        self.status = match (targets.len(), removed) {
+            (n, 0) => format!("Erased from {n} layer{}", if n == 1 { "" } else { "s" }),
+            (_, r) => format!("Erased; {r} layer{} removed completely", if r == 1 { " was" } else { "s were" }),
+        };
+    }
+
+    /// Clean-up commands for the layer whose stitches are being edited.
+    fn stitch_cleanup(&mut self, li: usize, what: u8) {
+        let (rings, _) = self.layer_geometry(li);
+        let l = &self.layers[li];
+        // work in design mm, store back in the layer's own frame
+        let design: Vec<Needle> = l.embroidery.needles.iter().map(|n| Needle { p: l.tf(n.p), jump: n.jump }).collect();
+        let (new, msg) = match what {
+            0 => {
+                if rings.is_empty() {
+                    self.status = "Stray clean-up needs a filled shape".into();
+                    return;
+                }
+                let (v, gone, bridged) = stitchforge::cut::clean_strays(&design, &rings, FillRule::EvenOdd, 0.6);
+                (v, format!("Removed {gone} stray point{} and turned {bridged} stitch{} across open fabric into jumps", if gone == 1 { "" } else { "s" }, if bridged == 1 { "" } else { "es" }))
+            }
+            1 => {
+                let t = stitchforge::cut::tiny(&design, Limits::SHORT_STITCH);
+                let n = t.len();
+                (stitchforge::project::remove_needles(&design, |i| t.binary_search(&i).is_ok()), format!("Removed {n} stitch{} shorter than {:.1} mm", if n == 1 { "" } else { "es" }, Limits::SHORT_STITCH))
+            }
+            _ => {
+                let (v, n) = stitchforge::cut::split_long(&design, 7.0);
+                (v, format!("Split long stitches: {n} point{} added (no stitch over 7 mm)", if n == 1 { "" } else { "s" }))
+            }
+        };
+        if new.len() == design.len() && new.iter().zip(&design).all(|(a, b)| a.jump == b.jump) {
+            self.status = "Nothing to clean up".into();
+            return;
+        }
+        self.hard_checkpoint();
+        let l = &mut self.layers[li];
+        l.embroidery.needles = new.into_iter().map(|n| Needle { p: l.inv(n.p), jump: n.jump }).collect();
+        self.st_sel.clear();
+        self.touch_stitches(li);
+        self.status = msg;
     }
 
     fn break_apart(&mut self) {
@@ -5826,9 +6245,16 @@ impl App {
                                 .filter_map(|&k| l.embroidery.needles.get(k).map(|n| (k, l.tf(n.p))))
                                 .collect();
                             self.edit_drag = Some(EditDrag::Stitches(to_mm(pos), orig));
+                        } else if ui.input(|i| i.modifiers.alt) {
+                            self.edit_drag = Some(EditDrag::Lasso(vec![pos]));
                         } else {
                             self.edit_drag = Some(EditDrag::Box(pos));
                         }
+                    }
+                }
+                if let (true, Some(pos), Some(EditDrag::Lasso(pts))) = (primary_drag, latest, &mut self.edit_drag) {
+                    if pts.last().map(|l| l.distance(pos) > 2.0).unwrap_or(true) {
+                        pts.push(pos);
                     }
                 }
                 if primary_drag {
@@ -5844,6 +6270,19 @@ impl App {
                 if resp.drag_stopped() {
                     match self.edit_drag.take() {
                         Some(EditDrag::Stitches(..)) => self.touch_stitches(li),
+                        Some(EditDrag::Lasso(pts)) if pts.len() >= 3 => {
+                            if !shift {
+                                self.st_sel.clear();
+                            }
+                            let poly: Vec<Pt> = pts.iter().map(|p| Pt::new(p.x as f64, p.y as f64)).collect();
+                            let l = &self.layers[li];
+                            for (i, n) in l.embroidery.needles.iter().enumerate() {
+                                let q = to_screen(l.tf(n.p));
+                                if stitchforge::cut::point_in_poly(&poly, Pt::new(q.x as f64, q.y as f64)) {
+                                    self.st_sel.insert(i);
+                                }
+                            }
+                        }
                         Some(EditDrag::Box(a)) => {
                             if let Some(b) = latest {
                                 let r = Rect::from_two_pos(a, b);
@@ -6059,6 +6498,15 @@ impl App {
                     } else if zoom >= 3.0 {
                         painter.circle_filled(*p, r, Color32::WHITE);
                         painter.circle_stroke(*p, r, Stroke::new(1.0_f32, Color32::from_black_alpha(160)));
+                    }
+                }
+                if let Some(EditDrag::Lasso(pts)) = &self.edit_drag {
+                    if pts.len() >= 2 {
+                        let mut closed = pts.clone();
+                        closed.push(pts[0]);
+                        for seg in EShape::dashed_line(&closed, Stroke::new(1.2_f32, accent), 4.0, 3.0) {
+                            painter.add(seg);
+                        }
                     }
                 }
                 if let Some(EditDrag::Box(a)) = &self.edit_drag {
@@ -6293,7 +6741,7 @@ impl eframe::App for App {
                     self.view = v;
                 }
             }
-            if (self.tool.draws() || self.tool == Tool::Measure)
+            if (self.tool.draws() || matches!(self.tool, Tool::Measure | Tool::Knife | Tool::Eraser))
                 && ctx.input(|i| i.key_pressed(egui::Key::Escape))
             {
                 self.set_tool(Tool::Select);
@@ -6796,6 +7244,20 @@ fn tool_icon(p: &egui::Painter, r: Rect, t: Tool, ink: Color32) {
         }
         Tool::Text => {
             p.text(at(0.5, 0.5), egui::Align2::CENTER_CENTER, "T", egui::FontId::proportional(r.height() * 1.15), ink);
+        }
+        Tool::Knife => {
+            // a blade on the diagonal and a dashed cut line through a square
+            p.rect_stroke(Rect::from_min_max(at(0.1, 0.35), at(0.65, 0.9)), 1.0, Stroke::new(1.2_f32, ink.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+            for seg in EShape::dashed_line(&[at(0.0, 1.0), at(0.75, 0.25)], s, 3.0, 2.0) {
+                p.add(seg);
+            }
+            p.add(EShape::convex_polygon(vec![at(0.7, 0.3), at(1.0, 0.0), at(0.95, 0.15), at(0.8, 0.4)], ink, Stroke::NONE));
+        }
+        Tool::Eraser => {
+            // an eraser block, tilted
+            let body = vec![at(0.05, 0.62), at(0.5, 0.17), at(0.95, 0.55), at(0.5, 1.0)];
+            p.add(EShape::convex_polygon(body, Color32::TRANSPARENT, s));
+            p.add(EShape::convex_polygon(vec![at(0.05, 0.62), at(0.28, 0.39), at(0.73, 0.78), at(0.5, 1.0)], ink, Stroke::NONE));
         }
         Tool::Measure => {
             // a ruler on the diagonal with tick marks

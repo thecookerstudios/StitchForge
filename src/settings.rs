@@ -174,6 +174,8 @@ impl Limits {
     pub const TRIM_AFTER: f64 = 3.0;
     /// Stitches shorter than this are flagged (mm).
     pub const SHORT_STITCH: f64 = 0.3;
+    /// Longest single stitch a machine file can hold (mm).
+    pub const MAX_STITCH: f64 = 12.0;
     /// Smallest area worth stitching (mm²).
     pub const MIN_AREA: f64 = 0.8;
 }
