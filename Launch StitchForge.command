@@ -22,6 +22,12 @@ if ! command -v cargo >/dev/null 2>&1; then
   source "$HOME/.cargo/env"
 fi
 
+# newer StitchForge versions need a recent Rust; this is quick when already up to date
+if command -v rustup >/dev/null 2>&1; then
+  echo "Checking Rust is up to date..."
+  rustup update stable >/dev/null 2>&1 || true
+fi
+
 echo "Building StitchForge... (first build takes a few minutes; later ones take seconds)"
 if ! cargo build --release; then
   echo
