@@ -3140,6 +3140,51 @@ impl App {
                         }
                     }
                 });
+                // where the satin sits on the art's line: 50/50, or shifted
+                let w = l.opts.column_width.or(art_width).unwrap_or(3.0);
+                let closed = l.shapes.iter().any(|s| match &s.kind {
+                    ShapeKind::Line { paths, .. } => paths.iter().any(|p| p.len() > 2 && p[0].dist(*p.last().unwrap()) < 0.05),
+                    _ => false,
+                });
+                let (inner, outer) = if closed { ("Inside", "Outside") } else { ("Left", "Right") };
+                ui.horizontal(|ui| {
+                    ui.label("Satin position").on_hover_text(
+                        "Where the satin column sits on the line: centred (half on each side), or moved toward one side",
+                    );
+                    let off = l.opts.satin_offset;
+                    if ui.small_button("◀").on_hover_text(format!("Move 0.1 mm {}", inner.to_lowercase())).clicked() {
+                        l.opts.satin_offset = ((off - 0.1) * 10.0).round() / 10.0;
+                        changed = true;
+                    }
+                    if let Some(v) = num_field(ui, "satin-off", off, 1, "mm") {
+                        l.opts.satin_offset = v;
+                        changed = true;
+                    }
+                    if ui.small_button("▶").on_hover_text(format!("Move 0.1 mm {}", outer.to_lowercase())).clicked() {
+                        l.opts.satin_offset = ((off + 0.1) * 10.0).round() / 10.0;
+                        changed = true;
+                    }
+                    let pct = (50.0 + 50.0 * off / (w / 2.0)).clamp(0.0, 100.0);
+                    ui.label(RichText::new(format!("{:.0}/{:.0} {}/{}", 100.0 - pct, pct, inner.to_lowercase(), outer.to_lowercase())).weak().small());
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(96.0);
+                    for (label, v, tip) in [
+                        (format!("{inner} edge"), -w / 2.0, format!("The whole column {} the line", if closed { "inside" } else { "left of" })),
+                        ("Centred 50/50".to_string(), 0.0, "Half the column on each side of the line".to_string()),
+                        (format!("{outer} edge"), w / 2.0, format!("The whole column {} the line", if closed { "outside" } else { "right of" })),
+                    ] {
+                        if ui
+                            .selectable_label((l.opts.satin_offset - v).abs() < 0.005, label)
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            l.opts.satin_offset = (v * 100.0).round() / 100.0;
+                            changed = true;
+                        }
+                    }
+                });
+                l.opts.satin_offset = l.opts.satin_offset.clamp(-w, w);
                 ui.horizontal(|ui| {
                     ui.label("Corners");
                     egui::ComboBox::from_id_salt("corner")

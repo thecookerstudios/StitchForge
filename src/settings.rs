@@ -59,7 +59,8 @@ impl CapSize {
 pub fn recipe(name: &str) -> Option<Recipe> {
     let base = Recipe {
         name: "pique".into(),
-        fill_spacing: 0.40,
+        // first sew-out (Oct 2026): 0.40 left fabric showing through tatami
+        fill_spacing: 0.36,
         fill_len: 3.5,
         satin_spacing: 0.40,
         pull_comp: 0.25,
@@ -74,7 +75,7 @@ pub fn recipe(name: &str) -> Option<Recipe> {
         "pique" => base,
         "tshirt" => Recipe {
             name: "tshirt".into(),
-            fill_spacing: 0.45,
+            fill_spacing: 0.40,
             pull_comp: 0.30,
             underlay_spacing: 2.0,
             backing: "No-show mesh cutaway".into(),
@@ -82,7 +83,7 @@ pub fn recipe(name: &str) -> Option<Recipe> {
         },
         "fleece" => Recipe {
             name: "fleece".into(),
-            fill_spacing: 0.42,
+            fill_spacing: 0.38,
             underlay_spacing: 2.0,
             topping: "Water-soluble film".into(),
             ..base
@@ -102,7 +103,7 @@ pub fn recipe(name: &str) -> Option<Recipe> {
         },
         "towel" => Recipe {
             name: "towel".into(),
-            fill_spacing: 0.38,
+            fill_spacing: 0.34,
             underlay_spacing: 1.8,
             topping: "Water-soluble film".into(),
             backing: "Tearaway 2.0 oz".into(),

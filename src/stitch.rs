@@ -606,6 +606,14 @@ fn generate_top(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
         (ShapeKind::Line { paths, width }, kind) => {
             let mut cur = from;
             for path in order_paths(&p.visible_paths(paths), cur) {
+                // satin position: centred on the art's line, or moved to one side
+                let path = if p.opts.satin_offset != 0.0
+                    && matches!(kind, StitchType::SatinColumn)
+                {
+                    shift_path(&path, p.opts.satin_offset)
+                } else {
+                    path
+                };
                 match kind {
                     StitchType::SatinColumn if p.opts.corner != Corner::Square => {
                         let width = p.opts.column_width.unwrap_or(*width);
@@ -1744,6 +1752,67 @@ fn travel_ok(rings: &[Ring], rule: FillRule, a: Pt, b: Pt, hidden: &dyn Fn(Pt) -
     } else {
         hid as f64 >= 0.85 * samples.len() as f64
     }
+}
+
+/// Move a path sideways by `d` mm. Closed paths move outward for +d (inward
+/// for −d); open paths move to the right of their direction of travel.
+/// Corners keep their shape (mitred, limited at very sharp turns).
+pub fn shift_path(path: &[Pt], d: f64) -> Vec<Pt> {
+    let n = path.len();
+    if n < 2 || d == 0.0 {
+        return path.to_vec();
+    }
+    let closed = n > 2 && path[0].dist(path[n - 1]) < 0.05;
+    // the unique points (a closed path repeats its first point at the end)
+    let pts: Vec<Pt> = if closed { path[..n - 1].to_vec() } else { path.to_vec() };
+    let m = pts.len();
+    if m < 2 {
+        return path.to_vec();
+    }
+    // which way is "out": for a closed ring, away from its inside
+    let sign = if closed {
+        let mut a = 0.0;
+        for i in 0..m {
+            let (p, q) = (pts[i], pts[(i + 1) % m]);
+            a += p.x * q.y - q.x * p.y;
+        }
+        // a > 0: the left normal points inside, so outward is to the right
+        if a > 0.0 { 1.0 } else { -1.0 }
+    } else {
+        1.0
+    };
+    let right = |a: Pt, b: Pt| -> Pt {
+        let u = b.sub(a).norm();
+        Pt::new(u.y, -u.x)
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..m {
+        let prev = if i > 0 { Some(pts[i - 1]) } else if closed { Some(pts[m - 1]) } else { None };
+        let next = if i + 1 < m { Some(pts[i + 1]) } else if closed { Some(pts[0]) } else { None };
+        let nrm = match (prev, next) {
+            (Some(a), Some(b)) => {
+                let n1 = right(a, pts[i]);
+                let n2 = right(pts[i], b);
+                let s = n1.add(n2);
+                let len = s.len();
+                if len < 1e-9 {
+                    n1
+                } else {
+                    // mitre: longer at corners so the sides stay parallel
+                    let cos = (len / 2.0).max(0.35);
+                    s.mul(1.0 / len).mul(1.0 / cos)
+                }
+            }
+            (None, Some(b)) => right(pts[i], b),
+            (Some(a), None) => right(a, pts[i]),
+            (None, None) => Pt::new(0.0, 0.0),
+        };
+        out.push(pts[i].add(nrm.mul(d * sign)));
+    }
+    if closed {
+        out.push(out[0]);
+    }
+    out
 }
 
 /// Left-hand normal of a direction.

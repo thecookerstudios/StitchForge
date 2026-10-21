@@ -154,6 +154,10 @@ pub struct ShapeOpts {
     pub column_width: Option<f64>,
     /// Satin areas (e.g. lettering): widen (+) or narrow (−) by this many mm.
     pub widen: f64,
+    /// Satin outline position on its path (mm): 0 = centred on the line
+    /// (50/50); + moves it outward (right of an open path), − inward.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub satin_offset: f64,
     pub corner: Corner,
     pub cap: Cap,
     /// Sews on top without cutting holes in the layers under it (used for
@@ -275,6 +279,10 @@ impl Underlay {
             Underlay::DoubleTatami => "Heavy fabric or very large fills",
         }
     }
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 impl ShapeOpts {

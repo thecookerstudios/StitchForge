@@ -1,4 +1,4 @@
-# StitchForge v0.11 — embroidery app
+# StitchForge v0.12 — embroidery app
 
 Vector art, PDFs, pictures (PNG/JPG, even mockup photos) and any-font text
 in; machine-ready DST, a printable operator
@@ -165,6 +165,12 @@ StitchForge, so a logo can be built from scratch or added to:
   shape (or the outline is trimmed) and the stitches are rebuilt around the
   hole; a layer erased completely is removed. While editing stitches, the
   eraser removes the needle points you draw around instead.
+
+**Satin position (outlines and borders).** In the layer panel, Satin
+position sets where the satin column sits on the art's line: **Centred
+50/50** (half on each side), **Inside edge** / **Outside edge** (the whole
+column on one side; Left/Right for open paths), or nudge it 0.1 mm at a time
+with ◀ ▶ or type an exact offset. The split (e.g. 30/70) is shown beside it.
 
 **Editing stitches (M).** Click or box-select needle points (Alt/Option-drag
 draws a free-hand selection), drag or arrow-nudge them, double-click a stitch

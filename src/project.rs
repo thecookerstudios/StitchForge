@@ -675,6 +675,40 @@ mod object_tests {
     }
 
     #[test]
+    fn satin_outline_position_on_the_path() {
+        // a 20 mm square outline, 2 mm satin
+        let sq = vec![Pt::new(0.0, 0.0), Pt::new(20.0, 0.0), Pt::new(20.0, 20.0), Pt::new(0.0, 20.0), Pt::new(0.0, 0.0)];
+        let shape = Shape {
+            kind: ShapeKind::Line { paths: vec![sq.clone()], width: 2.0 },
+            rgb: [20, 40, 120], label: "o".into(), group: 0, opts: ShapeOpts::default(), curves: Vec::new(),
+        };
+        let mut l = Layer::new(1, "Border".into(), vec![shape], true);
+        l.opts.stitch = StitchChoice::Satin;
+        l.opts.no_underlay = true;
+        // how far each needle point sits outside (+) or inside (−) the square
+        let reach = |l: &Layer| -> (f64, f64) {
+            let d = build(vec![l.clone()]);
+            let pts: Vec<Pt> = d.layer_needles[&0].iter().map(|n| l.inv(n.p)).collect();
+            let side = |p: Pt| {
+                let inside = p.x > 0.0 && p.x < 20.0 && p.y > 0.0 && p.y < 20.0;
+                let e = p.x.min(20.0 - p.x).min(p.y).min(20.0 - p.y).abs()
+                    .min((p.x).abs()).min((p.x - 20.0).abs()).min(p.y.abs()).min((p.y - 20.0).abs());
+                if inside { -e } else { e }
+            };
+            let v: Vec<f64> = pts.iter().map(|p| side(*p)).collect();
+            (v.iter().cloned().fold(f64::MAX, f64::min), v.iter().cloned().fold(f64::MIN, f64::max))
+        };
+        let (lo, hi) = reach(&l);
+        assert!((lo + 1.25).abs() < 0.3 && (hi - 1.25).abs() < 0.3, "centred 50/50: {lo} {hi}");
+        l.opts.satin_offset = 1.0;
+        let (lo, hi) = reach(&l);
+        assert!(lo > -0.4 && (hi - 2.25).abs() < 0.3, "moved outside: {lo} {hi}");
+        l.opts.satin_offset = -1.0;
+        let (lo, hi) = reach(&l);
+        assert!(hi < 0.4 && (lo + 2.25).abs() < 0.3, "moved inside: {lo} {hi}");
+    }
+
+    #[test]
     fn removing_stitches_jumps_over_the_hole() {
         let n = |x: f64, y: f64| Needle { p: Pt::new(x, y), jump: false };
         // a row along y=0 and a row back along y=1
