@@ -22,6 +22,9 @@
   #loader p { margin: 0; color: var(--muted); max-width: 34ch; line-height: 1.45; }
   #bar { width: min(260px, 70vw); height: 4px; border-radius: 2px; background: var(--panel); overflow: hidden; margin: 6px auto 0; }
   #bar span { display: block; height: 100%; width: 35%; background: var(--accent); animation: slide 1.2s ease-in-out infinite; }
+  #bar span.known { width: 0%; animation: none; transition: width 0.2s; }
+  #detail { font-size: 0.85rem; font-variant-numeric: tabular-nums; min-height: 1.2em; }
+  #retry { justify-self: center; font: inherit; padding: 8px 16px; border-radius: 6px; border: 1px solid var(--muted); background: transparent; color: var(--fg); }
   @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
   @media (prefers-reduced-motion: reduce) { #bar span { animation: none; width: 100%; } }
   #sheet { position: fixed; inset: 0; background: var(--bg); display: flex; flex-direction: column; z-index: 5; }
@@ -45,8 +48,10 @@
 <canvas id="app" tabindex="0"></canvas>
 <div id="loader">
   <h1>StitchForge</h1>
-  <p>Loading the embroidery app (about 10 MB the first time)…</p>
-  <div id="bar"><span></span></div>
+  <p id="stage">Downloading the app (about 9 MB the first time; later visits are quicker)…</p>
+  <div id="bar"><span id="fill"></span></div>
+  <p id="detail"></p>
+  <button id="retry" type="button" hidden>Try again</button>
 </div>
 <div id="toast" role="status" hidden></div>
 <div id="sheet" hidden>
@@ -104,14 +109,71 @@
 <script type="module">
   import init, { WebHandle } from "./stitchforge.js";
   const loader = document.getElementById("loader");
+  const stage = document.getElementById("stage");
+  const detail = document.getElementById("detail");
+  const fill = document.getElementById("fill");
+  const retry = document.getElementById("retry");
+  retry.addEventListener("click", () => location.reload());
+  const mb = (n) => (n / 1048576).toFixed(1) + " MB";
+  let lastProgress = Date.now();
+  // If nothing moves for a while, say so instead of spinning forever.
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastProgress > 30000) {
+      detail.textContent += " · Still working. A slow connection or an older device can take a minute; you can also try again.";
+      retry.hidden = false;
+      lastProgress = Date.now();
+    }
+  }, 5000);
   try {
-    await init();
+    // 1. download, showing how much has arrived
+    const res = await fetch("./stitchforge_bg.wasm");
+    if (!res.ok) throw new Error("download failed (" + res.status + ")");
+    const total = Number(res.headers.get("content-length")) || 0;
+    let bytes;
+    if (res.body && res.body.getReader) {
+      const reader = res.body.getReader();
+      const parts = [];
+      let got = 0;
+      if (total) fill.classList.add("known");
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value);
+        got += value.length;
+        lastProgress = Date.now();
+        detail.textContent = total ? mb(got) + " of " + mb(total) : mb(got) + " downloaded";
+        if (total) fill.style.width = Math.min(100, (got / total) * 100).toFixed(0) + "%";
+      }
+      bytes = new Uint8Array(got);
+      let off = 0;
+      for (const p of parts) { bytes.set(p, off); off += p.length; }
+    } else {
+      bytes = new Uint8Array(await res.arrayBuffer());
+    }
+    // 2. compile (the slow step on older iPads and phones)
+    fill.classList.remove("known");
+    fill.style.width = "";
+    stage.textContent = "Starting the app…";
+    detail.textContent = "Preparing " + mb(bytes.length) + " of code; this can take a little while on older devices.";
+    lastProgress = Date.now();
+    await init({ module_or_path: bytes });
+    // 3. open
+    stage.textContent = "Opening…";
+    detail.textContent = "";
+    lastProgress = Date.now();
     const handle = new WebHandle();
     await handle.start(document.getElementById("app"));
+    clearInterval(watchdog);
     loader.hidden = true;
   } catch (e) {
+    clearInterval(watchdog);
     console.error(e);
-    loader.querySelector("p").textContent = "StitchForge couldn't start in this browser: " + e;
-    loader.querySelector("#bar").hidden = true;
+    const msg = String(e && e.message ? e.message : e);
+    stage.textContent = "StitchForge couldn't start in this browser.";
+    detail.textContent = /webgl/i.test(msg)
+      ? "This browser has graphics (WebGL) turned off or unavailable. In Safari settings, check that WebGL isn't disabled, then try again. (" + msg + ")"
+      : msg;
+    document.getElementById("bar").hidden = true;
+    retry.hidden = false;
   }
 </script>
