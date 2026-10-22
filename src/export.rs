@@ -11,6 +11,8 @@ pub struct Written {
     /// The machine files written, first one first.
     pub machine: Vec<PathBuf>,
     pub sheet: PathBuf,
+    /// The same sheet as a PDF (colours print exactly).
+    pub sheet_pdf: PathBuf,
     pub summary: Value,
 }
 
@@ -49,6 +51,9 @@ pub fn write_formats(
         p("sheet.html"),
         sheet::operator_sheet(d, job, generated).as_bytes(),
     )?;
+    // the PDF keeps the thread colours exactly when printed
+    let pdf = crate::pdfsheet::operator_sheet_pdf(d, job, generated, job.sequence_page)?;
+    write(p("sheet.pdf"), &pdf.bytes)?;
     write(p("stops.csv"), sheet::stops_csv(d).as_bytes())?;
     // SF_PREVIEW_SCALE (pixels per mm) is a development aid for close-ups.
     let scale = std::env::var("SF_PREVIEW_SCALE")
@@ -66,6 +71,7 @@ pub fn write_formats(
         .chain(
             [
                 "sheet.html",
+                "sheet.pdf",
                 "stops.csv",
                 "preview.png",
                 "preview.svg",
@@ -95,6 +101,7 @@ pub fn write_formats(
     Ok(Written {
         machine,
         sheet: p("sheet.html"),
+        sheet_pdf: p("sheet.pdf"),
         summary,
     })
 }

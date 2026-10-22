@@ -279,7 +279,7 @@ pub fn split_long(needles: &[Needle], max: f64) -> (Vec<Needle>, usize) {
             if d > max {
                 let k = (d / max).ceil() as usize;
                 for j in 1..k {
-                    out.push(Needle { p: prev.p.lerp(n.p, j as f64 / k as f64), jump: false });
+                    out.push(Needle { p: prev.p.lerp(n.p, j as f64 / k as f64), jump: false, under: n.under });
                     added += 1;
                 }
             }
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn cleanups_find_strays_and_tiny_stitches() {
         let sq = vec![rect(0.0, 0.0, 10.0, 10.0)];
-        let n = |x: f64, y: f64, jump: bool| Needle { p: Pt::new(x, y), jump };
+        let n = |x: f64, y: f64, jump: bool| Needle::new(Pt::new(x, y), jump);
         let st = vec![n(1.0, 1.0, true), n(5.0, 1.0, false), n(5.0, 15.0, false), n(6.0, 2.0, false), n(6.05, 2.0, false), n(20.0, 20.0, true)];
         assert_eq!(strays(&st, &sq, FillRule::NonZero, 0.5), vec![2, 5]);
         let (clean, gone, bridged) = clean_strays(&st, &sq, FillRule::NonZero, 0.5);

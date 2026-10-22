@@ -733,6 +733,9 @@ pub fn export_drops(
         let sheet_path = dir.join(format!("{base}.sheet.html"));
         crate::vfs::write(&sheet_path, sheet::operator_sheet(&d, &job, generated))
             .map_err(|e| format!("{}: {e}", sheet_path.display()))?;
+        let pdf = crate::pdfsheet::operator_sheet_pdf(&d, &job, generated, job.sequence_page)?;
+        let pdf_path = dir.join(format!("{base}.sheet.pdf"));
+        crate::vfs::write(&pdf_path, &pdf.bytes).map_err(|e| format!("{}: {e}", pdf_path.display()))?;
         let file = format!("{base}.{}", fmts.first().map(|f| f.ext()).unwrap_or("dst"));
         let plan = stop_plan(&d, n_logo, &slots);
         let mut rows = String::new();

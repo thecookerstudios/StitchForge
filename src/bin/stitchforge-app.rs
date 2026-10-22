@@ -95,10 +95,11 @@ enum Tool {
     Measure,
     Knife,
     Eraser,
+    Guides,
 }
 
 impl Tool {
-    const ALL: [Tool; 12] = [
+    const ALL: [Tool; 13] = [
         Tool::Select,
         Tool::Nodes,
         Tool::Stitches,
@@ -111,6 +112,7 @@ impl Tool {
         Tool::Measure,
         Tool::Knife,
         Tool::Eraser,
+        Tool::Guides,
     ];
     fn hint(&self) -> &'static str {
         match self {
@@ -126,6 +128,7 @@ impl Tool {
             Tool::Measure => "Measure (D)\nDrag across a column or gap to see its size and which thread weights it suits",
             Tool::Knife => "Knife (K)\nDrag a line across a shape to cut it into separate pieces; Shift snaps to 15°",
             Tool::Eraser => "Eraser (X)\nDraw around the part to remove: it is cut out of the shape and the stitches follow",
+            Tool::Guides => "Direction lines (A)\nDrag across a fill to show which way the stitches run there; add more lines and the rows turn smoothly between them. Click a line and press Delete to remove it",
         }
     }
     fn key(&self) -> egui::Key {
@@ -142,6 +145,7 @@ impl Tool {
             Tool::Measure => egui::Key::D,
             Tool::Knife => egui::Key::K,
             Tool::Eraser => egui::Key::X,
+            Tool::Guides => egui::Key::A,
         }
     }
     /// Tools that make new shapes on the canvas.
@@ -257,6 +261,8 @@ struct App {
     view_center: Pt,
     fit: bool,
     show_jumps: bool,
+    /// Highlight the underlay (top stitches faded).
+    show_underlay: bool,
     selected: Option<u64>,
     moving: Option<Pt>,
     expanded: HashSet<u64>,
@@ -311,6 +317,9 @@ struct App {
     cut: Option<(Pt, Pt)>,
     /// Eraser outline being drawn (design mm).
     lasso: Vec<Pt>,
+    /// Direction line being dragged (design mm), and the picked line.
+    guide_drag: Option<(Pt, Pt)>,
+    guide_sel: Option<usize>,
     trace_dlg: Option<TraceDlg>,
     /// Bumped whenever the design is rebuilt (vector view cache key).
     layers_rev: u64,
@@ -367,6 +376,7 @@ impl App {
             view_center: Pt::new(0.0, 0.0),
             fit: true,
             show_jumps: false,
+            show_underlay: false,
             selected: None,
             moving: None,
             expanded: HashSet::new(),
@@ -418,6 +428,8 @@ impl App {
             measure: None,
             cut: None,
             lasso: Vec::new(),
+            guide_drag: None,
+            guide_sel: None,
             trace_dlg: None,
             layers_rev: 0,
             vec_tex: None,
@@ -1011,6 +1023,62 @@ impl App {
                     }
                     ui.end_row();
                 });
+                // ---- fine control: each starts at what the Detail level picks
+                let tuned = dlg.opts.smooth_mm.is_some()
+                    || dlg.opts.speck_mm2.is_some()
+                    || dlg.opts.min_line_mm.is_some()
+                    || dlg.opts.merge_de.is_some()
+                    || dlg.opts.fit_tol_mm.is_some()
+                    || !dlg.opts.snap_circles
+                    || !dlg.opts.snap_corners;
+                egui::CollapsingHeader::new(RichText::new(if tuned { "Fine tune •" } else { "Fine tune" }).strong())
+                    .id_salt("trace-fine")
+                    .default_open(tuned)
+                    .show(ui, |ui| {
+                        let o = &mut dlg.opts;
+                        let (c_sm, c_fit, c_sp, c_line, c_de) = (o.eff_smooth(), o.eff_fit(), o.eff_speck(), o.eff_min_line(), o.eff_merge() as f64);
+                        let slider = |ui: &mut egui::Ui, label: &str, tip: &str, v: &mut Option<f64>, cur: f64, range: std::ops::RangeInclusive<f64>, unit: &str, dec: usize| -> bool {
+                            let mut x = v.unwrap_or(cur);
+                            let mut ch = false;
+                            ui.horizontal(|ui| {
+                                ui.add_sized([150.0, 18.0], egui::Label::new(label)).on_hover_text(tip);
+                                if ui.add(egui::Slider::new(&mut x, range).suffix(unit).fixed_decimals(dec)).changed() {
+                                    *v = Some(x);
+                                    ch = true;
+                                }
+                                if v.is_some() && ui.small_button("↺").on_hover_text("Back to the Detail level's setting").clicked() {
+                                    *v = None;
+                                    ch = true;
+                                }
+                            });
+                            ch
+                        };
+                        changed |= slider(ui, "Edge smoothing", "Smooths jagged pixel edges. More = rounder, softer outlines; less = follows the picture exactly", &mut o.smooth_mm, c_sm, 0.0..=0.6, " mm", 2);
+                        changed |= slider(ui, "Curve accuracy", "How closely the vector curves follow the edge. Smaller = more points and closer fit", &mut o.fit_tol_mm, c_fit, 0.02..=0.4, " mm", 2);
+                        changed |= slider(ui, "Smallest piece", "Specks and islands smaller than this are dropped (too small to sew)", &mut o.speck_mm2, c_sp, 0.1..=10.0, " mm²", 1);
+                        changed |= slider(ui, "Thinnest line", "Lines thinner than this are absorbed into the colour around them", &mut o.min_line_mm, c_line, 0.1..=2.0, " mm", 2);
+                        let mut de = o.merge_de.map(|v| v as f64);
+                        if slider(ui, "Merge similar colors", "Colours closer than this (ΔE) become one thread. Higher = fewer colours", &mut de, c_de, 3.0..=40.0, "", 0) {
+                            o.merge_de = de.map(|v| v as f32);
+                            reset_colors = true;
+                            changed = true;
+                        }
+                        ui.horizontal(|ui| {
+                            changed |= ui.checkbox(&mut o.snap_circles, "Snap circles").on_hover_text("Round shapes become perfect circles").changed();
+                            changed |= ui.checkbox(&mut o.snap_corners, "Snap straight edges").on_hover_text("Bars, stars and block letters get crisp straight sides and sharp corners").changed();
+                        });
+                        if tuned && ui.small_button("All back to the Detail level").clicked() {
+                            o.smooth_mm = None;
+                            o.speck_mm2 = None;
+                            o.min_line_mm = None;
+                            o.merge_de = None;
+                            o.fit_tol_mm = None;
+                            o.snap_circles = true;
+                            o.snap_corners = true;
+                            reset_colors = true;
+                            changed = true;
+                        }
+                    });
                 if let Some(Ok(t)) = &dlg.result {
                     section(ui, "Thread colors (click to switch on or off)");
                     let mut toggle: Option<(usize, bool)> = None;
@@ -1510,7 +1578,7 @@ impl App {
                     names.join(", "),
                     dir.display()
                 );
-                deliver(&dir, &format!("{}-files", d.name), &w.sheet);
+                deliver(&dir, &format!("{}-files", d.name), &w.sheet, &w.sheet_pdf);
                 if cfg!(target_arch = "wasm32") {
                     self.status = format!("Downloaded {}-files.zip ({})", d.name, names.join(", "));
                 }
@@ -1646,7 +1714,7 @@ impl App {
                     v.iter()
                         .map(|n| Needle {
                             p: l.inv(n.p),
-                            jump: n.jump,
+                            ..*n
                         })
                         .collect()
                 })
@@ -2393,7 +2461,9 @@ impl App {
                 ui.checkbox(&mut self.export_fmts[i], f.label());
             }
             ui.add_space(4.0);
-            ui.label(RichText::new("Always included: operator sheet (prints to PDF), color-stop CSV, PNG preview, job summary.").weak().small());
+            ui.label(RichText::new("Always included: operator sheet as a PDF (thread colours print exactly) and as a web page, color-stop CSV, PNG preview, job summary.").weak().small());
+            ui.checkbox(&mut self.job.sequence_page, "Sheet: stitch list by object on page 2")
+                .on_hover_text("Page 1 is what the operator needs at the machine; the object-by-object stitch list goes on its own page. Untick to leave it out.");
             ui.add_space(6.0);
             if ui.button(RichText::new("Choose folder and export").strong()).clicked() {
                 go = true;
@@ -3023,7 +3093,19 @@ impl App {
                 .iter()
                 .all(|s| matches!(s.kind, ShapeKind::Line { .. }));
             let shaped_fill = l.opts.stitch == StitchChoice::Fill && l.opts.fill != FillPattern::Tatami;
-            if !is_outline_layer && !shaped_fill {
+            if !l.opts.guides.is_empty() && !is_outline_layer {
+                ui.horizontal(|ui| {
+                    ui.label("Angle");
+                    ui.label(RichText::new(format!("follows {} direction line{}", l.opts.guides.len(), if l.opts.guides.len() == 1 { "" } else { "s" })).strong());
+                    if ui.small_button("Edit").on_hover_text("Direction lines tool (A)").clicked() {
+                        action = Some("guides");
+                    }
+                    if ui.small_button("Clear").on_hover_text("Back to one straight angle").clicked() {
+                        l.opts.guides.clear();
+                        changed = true;
+                    }
+                });
+            } else if !is_outline_layer && !shaped_fill {
                 ui.horizontal(|ui| {
                     ui.label("Angle");
                     let mut auto = l.opts.angle_deg.is_none();
@@ -3298,6 +3380,24 @@ impl App {
                 let o = &mut l.opts;
                 changed |= underlay_combo(ui, "fill-ul", "Fill underlay", &mut o.fill_underlay, &Underlay::FILL, &mut o.no_underlay);
             }
+            // what the underlay actually is, with its numbers
+            if let Some(d) = &self.design {
+                let objs: Vec<&stitchforge::design::ObjectInfo> = d.objects.iter().filter(|o| o.layer == li).collect();
+                let mut kinds: Vec<&str> = objs.iter().map(|o| o.underlay.as_str()).filter(|u| !u.is_empty()).collect();
+                kinds.dedup();
+                let n: usize = objs.iter().map(|o| o.underlay_stitches).sum();
+                let total: usize = objs.iter().map(|o| o.stitches).sum();
+                if !kinds.is_empty() && (is_fill || is_satin) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Underlay:").small());
+                        let shown = if kinds.len() > 2 { format!("{} (+{} more)", kinds[..2].join("; "), kinds.len() - 2) } else { kinds.join("; ") };
+                        ui.label(RichText::new(shown).small().strong());
+                        if n > 0 {
+                            ui.label(RichText::new(format!("· {} of {} stitches ({:.0}%)", group(n), group(total), 100.0 * n as f64 / total.max(1) as f64)).small().weak());
+                        }
+                    });
+                }
+            }
             if is_fill || is_satin {
                 let rec = &self.recipe;
                 let own = l.opts.has_own_settings();
@@ -3323,10 +3423,10 @@ impl App {
                             changed |= own_setting(ui, "Satin spacing", "own-dens", &mut o.density, rec.satin_spacing, 2, "mm", (0.15, 3.0));
                         }
                         changed |= own_setting(ui, "Pull comp.", "own-pc", &mut o.pull_comp, rec.pull_comp, 2, "mm", (-0.5, 2.0));
-                        if is_fill {
-                            changed |= own_setting(ui, "Underlay spacing", "own-us", &mut o.underlay_spacing, rec.underlay_spacing, 1, "mm", (0.5, 8.0));
-                            changed |= own_setting(ui, "Underlay inset", "own-ui", &mut o.underlay_inset, rec.underlay_inset, 2, "mm", (0.0, 3.0));
-                        }
+                        ui.label(RichText::new("UNDERLAY").small().strong());
+                        changed |= own_setting(ui, if is_fill { "Underlay rows" } else { "Zigzag spacing" }, "own-us", &mut o.underlay_spacing, rec.underlay_spacing, 1, "mm", (0.5, 8.0));
+                        changed |= own_setting(ui, "Underlay inset", "own-ui", &mut o.underlay_inset, rec.underlay_inset, 2, "mm", (0.0, 3.0));
+                        changed |= own_setting(ui, "Underlay stitch", "own-ul", &mut o.underlay_len, rec.underlay_len, 1, "mm", (1.0, 7.0));
                         if is_fill && matches!(o.fill, FillPattern::Tatami | FillPattern::Radial) {
                             ui.horizontal(|ui| {
                                 ui.label("Needle pattern");
@@ -3353,6 +3453,7 @@ impl App {
                             o.pull_comp = None;
                             o.underlay_spacing = None;
                             o.underlay_inset = None;
+                            o.underlay_len = None;
                             o.stagger = None;
                             changed = true;
                         }
@@ -3517,7 +3618,7 @@ impl App {
                     ex.files.len() / fmts.len().max(1),
                     dir.display()
                 );
-                deliver(dir, &format!("{}-name-drops", proj.name), &ex.sheet);
+                deliver(dir, &format!("{}-name-drops", proj.name), &ex.sheet, &ex.sheet);
                 self.last_dir = Some(dir.to_path_buf());
                 self.show_export = false;
             }
@@ -4058,6 +4159,10 @@ impl App {
         match a {
             "edit-stitches" => return self.start_stitch_edit(li),
             "edit-shape" => return self.start_shape_edit(li),
+            "guides" => {
+                self.selected = Some(self.layers[li].id);
+                return self.set_tool(Tool::Guides);
+            }
             _ => {}
         }
         self.hard_checkpoint();
@@ -4450,6 +4555,8 @@ impl App {
                 });
             }
             ui.toggle_value(&mut self.show_jumps, "Jumps");
+            ui.toggle_value(&mut self.show_underlay, "Underlay")
+                .on_hover_text("Show the underlay in orange with the top stitches faded");
             // garment colour the design is shown on (also used on the sheet)
             let cur = self.job.garment_rgb.unwrap_or(CANVAS);
             let name = GARMENTS.iter().find(|g| g.1 == cur).map(|g| g.0).unwrap_or("Custom");
@@ -4496,7 +4603,8 @@ impl App {
             self.refresh_vector_texture(ui.ctx());
         }
         // view switcher floating at the top left of the canvas
-        if self.machine.is_none() || self.view != View::Vector {
+        // (hidden while a dialog is open so it never sits on top of one)
+        if (self.machine.is_none() || self.view != View::Vector) && self.trace_dlg.is_none() && !self.show_export {
             egui::Area::new(egui::Id::new("view-pill"))
                 .fixed_pos(rect.left_top() + Vec2::new(10.0, 10.0))
                 .order(egui::Order::Foreground)
@@ -4593,7 +4701,11 @@ impl App {
         if cutting {
             self.cut_input(&resp, ui, &to_mm);
         }
-        let object_edit = object_edit || drawing || measuring || cutting;
+        let guiding = editing && self.tool == Tool::Guides;
+        if guiding {
+            self.guide_input(&resp, ui, &to_mm, &to_screen, zoom);
+        }
+        let object_edit = object_edit || drawing || measuring || cutting || guiding;
         let no_layers: Vec<Layer> = Vec::new();
         let hit_src: &[Layer] = if editing { &self.layers } else { &no_layers };
         if !object_edit && resp.drag_started() {
@@ -4825,6 +4937,38 @@ impl App {
             }
         }
 
+        // underlay view: wash out the top stitches, draw the underlay on top
+        if self.show_underlay && !vector_view {
+            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(250, 248, 244, 175));
+            let orange = Color32::from_rgb(232, 96, 16);
+            let w = (0.12 * zoom).clamp(1.0, 2.5);
+            for &(a, b) in &d.underlay_cmds {
+                if a >= end {
+                    continue;
+                }
+                let b = b.min(end);
+                let mut pts: Vec<Pos2> = Vec::new();
+                if a > 0 {
+                    if let Cmd::Stitch(p) = d.cmds[a - 1] {
+                        pts.push(to_screen(p));
+                    }
+                }
+                for c in &d.cmds[a..b] {
+                    if let Cmd::Stitch(p) = c {
+                        pts.push(to_screen(*p));
+                    }
+                }
+                if pts.len() >= 2 {
+                    painter.add(EShape::line(pts.clone(), Stroke::new(w, orange)));
+                    if zoom >= 4.0 {
+                        for p in &pts {
+                            painter.circle_filled(*p, w + 0.6, orange);
+                        }
+                    }
+                }
+            }
+        }
+
         // needle marker during playback
         if end < d.cmds.len() {
             if let Some(p) = d.cmds[..end].iter().rev().find_map(|c| match c {
@@ -4837,6 +4981,31 @@ impl App {
             }
         }
 
+        // direction lines of the selected layer (always while that tool is on)
+        if let Some(li) = self.sel_idx() {
+            let l = &self.layers[li];
+            if !l.opts.guides.is_empty() && (self.tool == Tool::Guides || self.edit == Edit::None) {
+                let col = Color32::from_rgb(0, 150, 140);
+                for (k, (a, b)) in l.opts.guides.iter().enumerate() {
+                    let (sa, sb) = (to_screen(l.tf(*a)), to_screen(l.tf(*b)));
+                    let picked = self.tool == Tool::Guides && self.guide_sel == Some(k);
+                    let w: f32 = if picked { 3.2 } else { 2.0 };
+                    painter.line_segment([sa, sb], Stroke::new(w + 2.5, Color32::from_white_alpha(190)));
+                    painter.line_segment([sa, sb], Stroke::new(w, if picked { Color32::from_rgb(230, 120, 0) } else { col }));
+                    let u = (sb - sa).normalized();
+                    let nrm = Vec2::new(-u.y, u.x);
+                    painter.add(EShape::convex_polygon(vec![sb, sb - u * 11.0 + nrm * 5.5, sb - u * 11.0 - nrm * 5.5], if picked { Color32::from_rgb(230, 120, 0) } else { col }, Stroke::new(1.0_f32, Color32::WHITE)));
+                    painter.circle_filled(sa, 3.5, col);
+                }
+            }
+        }
+        if let Some((a, b)) = self.guide_drag {
+            let col = Color32::from_rgb(0, 150, 140);
+            let (sa, sb) = (to_screen(a), to_screen(b));
+            painter.line_segment([sa, sb], Stroke::new(2.0_f32, col));
+            let deg = ((-(b.y - a.y)).atan2(b.x - a.x).to_degrees()).rem_euclid(180.0);
+            painter.text(sb + Vec2::new(8.0, -8.0), egui::Align2::LEFT_BOTTOM, format!("{deg:.0}°"), egui::FontId::proportional(13.0), col);
+        }
         if let Some((a, b)) = self.cut {
             let red = Color32::from_rgb(220, 50, 40);
             let (sa, sb) = (to_screen(a), to_screen(b));
@@ -4944,7 +5113,7 @@ impl App {
                 let same = pieces
                     .iter()
                     .all(|o| (o.angle_deg - pieces[0].angle_deg).abs() < 0.5);
-                if let Some(o) = pieces.first().filter(|_| same) {
+                if let Some(o) = pieces.first().filter(|_| same && self.layers[li].opts.guides.is_empty()) {
                     {
                         // Stitch-direction guide: a dashed, arrow-tipped
                         // overlay in the selection colour with a labelled
@@ -5032,6 +5201,9 @@ impl App {
             }
             Tool::Knife => {
                 self.status = "Knife: drag a line across a shape to cut it in two (the selected layers, or whatever the line crosses)".into()
+            }
+            Tool::Guides => {
+                self.status = "Direction lines: select a fill, then drag across it the way the stitches should run; add lines where they should turn".into()
             }
             Tool::Eraser if keep => {
                 self.status = "Eraser: draw around needle points to remove them; Esc when done".into()
@@ -5527,6 +5699,86 @@ impl App {
         }
     }
 
+    /// Direction lines: drag to add one to the selected fill; click one to
+    /// pick it (Delete removes it).
+    fn guide_input(&mut self, resp: &egui::Response, ui: &egui::Ui, to_mm: &dyn Fn(Pos2) -> Pt, to_screen: &dyn Fn(Pt) -> Pos2, zoom: f32) {
+        let Some(pos) = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos())) else { return };
+        let mut p = to_mm(pos);
+        let origin = ui.input(|i| i.pointer.press_origin()).map(|o| to_mm(o)).unwrap_or(p);
+        if resp.clicked() {
+            // pick a line of the selected layer, or select the layer clicked
+            let mut hit = None;
+            if let Some(li) = self.sel_idx() {
+                let l = &self.layers[li];
+                for (k, (a, b)) in l.opts.guides.iter().enumerate() {
+                    let (sa, sb) = (to_screen(l.tf(*a)), to_screen(l.tf(*b)));
+                    let ab = sb - sa;
+                    let t = ((pos - sa).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+                    if (sa + ab * t).distance(pos) < 8.0 {
+                        hit = Some(k);
+                    }
+                }
+            }
+            if hit.is_some() {
+                self.guide_sel = hit;
+                self.status = "Direction line picked: Delete removes it".into();
+            } else {
+                self.guide_sel = None;
+                let tol = (4.0 / zoom) as f64;
+                if let Some(l) = self.layers.iter().rev().find(|l| l.visible && l.hit(p, tol)) {
+                    self.selected = Some(l.id);
+                    self.multi = [l.id].into_iter().collect();
+                }
+            }
+            return;
+        }
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            self.guide_drag = Some((origin, p));
+        } else if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some((a, _)) = self.guide_drag {
+                if ui.input(|i| i.modifiers.shift) {
+                    let d = p.sub(a);
+                    let step = std::f64::consts::PI / 12.0;
+                    let ang = (d.y.atan2(d.x) / step).round() * step;
+                    p = Pt::new(a.x + d.len() * ang.cos(), a.y + d.len() * ang.sin());
+                }
+                self.guide_drag = Some((a, p));
+            }
+        }
+        if resp.drag_stopped() {
+            let Some((a, b)) = self.guide_drag.take() else { return };
+            if a.dist(b) < 1.0 {
+                return;
+            }
+            // the selected layer, else the one the line starts on
+            let li = self.sel_idx().or_else(|| {
+                let tol = (4.0 / zoom) as f64;
+                self.layers.iter().rposition(|l| l.visible && l.hit(a, tol))
+            });
+            let Some(li) = li else {
+                self.status = "Direction lines: select a filled shape first".into();
+                return;
+            };
+            self.hard_checkpoint();
+            let l = &mut self.layers[li];
+            let (la, lb) = (l.inv(a), l.inv(b));
+            l.opts.guides.push((la, lb));
+            if l.opts.stitch != StitchChoice::Fill {
+                l.opts.stitch = StitchChoice::Fill;
+            }
+            l.opts.fill = FillPattern::Tatami;
+            self.selected = Some(l.id);
+            self.guide_sel = Some(l.opts.guides.len() - 1);
+            let n = l.opts.guides.len();
+            self.dirty = true;
+            self.status = if n == 1 {
+                "Direction line added. Add more where the stitches should turn; the rows bend smoothly between them".into()
+            } else {
+                format!("{n} direction lines: the rows turn to follow them")
+            };
+        }
+    }
+
     /// Layers a cut applies to: the selection, or every visible layer the
     /// test says is under the tool.
     fn cut_targets(&self, under: &dyn Fn(&Self, usize) -> bool) -> Vec<usize> {
@@ -5713,7 +5965,7 @@ impl App {
         let (rings, _) = self.layer_geometry(li);
         let l = &self.layers[li];
         // work in design mm, store back in the layer's own frame
-        let design: Vec<Needle> = l.embroidery.needles.iter().map(|n| Needle { p: l.tf(n.p), jump: n.jump }).collect();
+        let design: Vec<Needle> = l.embroidery.needles.iter().map(|n| Needle { p: l.tf(n.p), ..*n }).collect();
         let (new, msg) = match what {
             0 => {
                 if rings.is_empty() {
@@ -5739,7 +5991,7 @@ impl App {
         }
         self.hard_checkpoint();
         let l = &mut self.layers[li];
-        l.embroidery.needles = new.into_iter().map(|n| Needle { p: l.inv(n.p), jump: n.jump }).collect();
+        l.embroidery.needles = new.into_iter().map(|n| Needle { p: l.inv(n.p), ..n }).collect();
         self.st_sel.clear();
         self.touch_stitches(li);
         self.status = msg;
@@ -6368,7 +6620,7 @@ impl App {
                             let l = &mut self.layers[li];
                             let a = l.embroidery.needles[k].p;
                             let b = l.embroidery.needles[k + 1].p;
-                            l.embroidery.needles.insert(k + 1, Needle { p: a.lerp(b, t as f64), jump: false });
+                            l.embroidery.needles.insert(k + 1, Needle { p: a.lerp(b, t as f64), jump: false, under: l.embroidery.needles[k + 1].under });
                             self.st_sel = [k + 1].into_iter().collect();
                             self.touch_stitches(li);
                         }
@@ -6786,7 +7038,7 @@ impl eframe::App for App {
                     self.view = v;
                 }
             }
-            if (self.tool.draws() || matches!(self.tool, Tool::Measure | Tool::Knife | Tool::Eraser))
+            if (self.tool.draws() || matches!(self.tool, Tool::Measure | Tool::Knife | Tool::Eraser | Tool::Guides))
                 && ctx.input(|i| i.key_pressed(egui::Key::Escape))
             {
                 self.set_tool(Tool::Select);
@@ -6847,7 +7099,18 @@ impl eframe::App for App {
                     self.dirty = true;
                 }
                 if pressed(egui::Key::Delete) || pressed(egui::Key::Backspace) {
-                    self.layer_action("del", li);
+                    if let (Tool::Guides, Some(g)) = (self.tool, self.guide_sel) {
+                        // remove the picked direction line, not the layer
+                        if g < self.layers[li].opts.guides.len() {
+                            self.hard_checkpoint();
+                            self.layers[li].opts.guides.remove(g);
+                            self.guide_sel = None;
+                            self.dirty = true;
+                            self.status = "Direction line removed".into();
+                        }
+                    } else {
+                        self.layer_action("del", li);
+                    }
                 }
                 if cmd && pressed(egui::Key::D) {
                     self.layer_action("dup", li);
@@ -7298,6 +7561,19 @@ fn tool_icon(p: &egui::Painter, r: Rect, t: Tool, ink: Color32) {
             }
             p.add(EShape::convex_polygon(vec![at(0.7, 0.3), at(1.0, 0.0), at(0.95, 0.15), at(0.8, 0.4)], ink, Stroke::NONE));
         }
+        Tool::Guides => {
+            // curved rows with an arrow: stitches turning
+            for k in 0..3 {
+                let o = k as f32 * 0.22;
+                p.add(EShape::QuadraticBezier(egui::epaint::QuadraticBezierShape::from_points_stroke(
+                    [at(0.05, 0.95 - o), at(0.1 + o, 0.15 + o * 0.3), at(0.95 - o * 0.2, 0.1 + o)],
+                    false,
+                    Color32::TRANSPARENT,
+                    Stroke::new(1.3_f32, ink.gamma_multiply(if k == 0 { 1.0 } else { 0.6 })),
+                )));
+            }
+            p.add(EShape::convex_polygon(vec![at(1.0, 0.1), at(0.78, 0.0), at(0.8, 0.22)], ink, Stroke::NONE));
+        }
         Tool::Eraser => {
             // an eraser block, tilted
             let body = vec![at(0.05, 0.62), at(0.5, 0.17), at(0.95, 0.55), at(0.5, 1.0)];
@@ -7741,11 +8017,11 @@ fn export_dir(_title: &str, _last: Option<&PathBuf>) -> Option<PathBuf> {
 /// After an export: open the sheet (desktop) or download everything as a
 /// zip and show the sheet in the page (browser).
 #[cfg(not(target_arch = "wasm32"))]
-fn deliver(_dir: &std::path::Path, _zip_name: &str, sheet: &std::path::Path) {
-    open_path(sheet);
+fn deliver(_dir: &std::path::Path, _zip_name: &str, sheet: &std::path::Path, pdf: &std::path::Path) {
+    open_path(if pdf.exists() { pdf } else { sheet });
 }
 #[cfg(target_arch = "wasm32")]
-fn deliver(dir: &std::path::Path, zip_name: &str, sheet: &std::path::Path) {
+fn deliver(dir: &std::path::Path, zip_name: &str, sheet: &std::path::Path, _pdf: &std::path::Path) {
     use std::io::Write;
     let mut buf = std::io::Cursor::new(Vec::new());
     {

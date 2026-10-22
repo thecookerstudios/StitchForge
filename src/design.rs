@@ -54,6 +54,10 @@ pub struct ObjectInfo {
     pub starts_stop: bool,
     /// Stitch direction actually used, degrees counter-clockwise (0–180).
     pub angle_deg: f64,
+    /// The underlay it got, in words with its numbers.
+    pub underlay: String,
+    /// Stitches in its underlay (part of `stitches`).
+    pub underlay_stitches: usize,
     /// Thread the layer asked for (may differ from the stop's thread if the
     /// stop before it was switched off).
     #[serde(skip)]
@@ -110,6 +114,9 @@ pub struct Design {
     /// the embroidery side of each design object, kept with the project.
     #[serde(skip)]
     pub layer_needles: std::collections::BTreeMap<usize, Vec<Needle>>,
+    /// `cmds` ranges that are underlay (start, end), for showing it apart.
+    #[serde(skip)]
+    pub underlay_cmds: Vec<(usize, usize)>,
 }
 
 impl Design {
@@ -129,6 +136,7 @@ impl Design {
             bbox,
             warnings: Vec::new(),
             layer_needles: Default::default(),
+            underlay_cmds: Vec::new(),
         }
     }
 }
@@ -293,6 +301,7 @@ pub fn build_with(
     let mut last_dir = Pt::new(1.0, 0.0);
     let mut last_layer: Option<usize> = None;
     let mut layer_needles: std::collections::BTreeMap<usize, Vec<Needle>> = Default::default();
+    let mut underlay_cmds: Vec<(usize, usize)> = Vec::new();
     // thinnest satin stroke per layer, for one weight warning per layer
     let mut thin: std::collections::BTreeMap<usize, (String, ThreadWeight, f64)> =
         Default::default();
@@ -416,11 +425,24 @@ pub fn build_with(
                         last_dir = nd.p.sub(c).norm();
                     }
                 }
+                if nd.under {
+                    let i = cmds.len();
+                    match underlay_cmds.last_mut() {
+                        Some(r) if r.1 == i => r.1 = i + 1,
+                        _ => underlay_cmds.push((i, i + 1)),
+                    }
+                }
                 cmds.push(Cmd::Stitch(nd.p));
             }
             cur = Some(nd.p);
         }
         let added = count_stitches(&cmds) - before;
+        let under_n = underlay_cmds
+            .iter()
+            .map(|&(a, b)| (a.max(cmd_start), b))
+            .filter(|(a, b)| b > a)
+            .map(|(a, b)| b - a)
+            .sum::<usize>();
         stop.stitches += added;
         infos.push(ObjectInfo {
             sequence: seq + 1,
@@ -441,6 +463,12 @@ pub fn build_with(
                 if d >= 180.0 { 0.0 } else { d }
             },
             wanted_thread: o.thread,
+            underlay: if art.fixed.contains_key(&o.layer) {
+                "As edited by hand".into()
+            } else {
+                o.underlay_summary(recipe, profile)
+            },
+            underlay_stitches: under_n,
         });
         if o.kind == StitchType::Satin {
             let narrow = match &o.shape {
@@ -559,6 +587,7 @@ pub fn build_with(
         bbox,
         warnings,
         layer_needles,
+        underlay_cmds,
     })
 }
 
@@ -634,6 +663,8 @@ pub fn from_machine(
                 starts_stop: true,
                 angle_deg: 0.0,
                 wanted_thread: i,
+                underlay: String::new(),
+                underlay_stitches: 0,
             });
         }
     };
@@ -685,6 +716,7 @@ pub fn from_machine(
         bbox,
         warnings: Vec::new(),
         layer_needles: Default::default(),
+        underlay_cmds: Vec::new(),
     })
 }
 

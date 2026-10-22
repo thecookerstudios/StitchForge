@@ -12,6 +12,7 @@ eframe = { version = "0.33", default-features = false, features = ["default_font
 i_overlay = "9.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "tiff"] }
 lopdf = { version = "0.45", default-features = false }
+miniz_oxide = "0.8"
 resvg = "0.45"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }

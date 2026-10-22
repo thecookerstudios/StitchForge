@@ -14,6 +14,22 @@ pub struct Needle {
     pub p: Pt,
     /// Travel to this point without sewing (start of a new section).
     pub jump: bool,
+    /// Part of the underlay (the foundation sewn before the top stitches).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub under: bool,
+}
+
+impl Needle {
+    pub fn new(p: Pt, jump: bool) -> Self {
+        Needle { p, jump, under: false }
+    }
+}
+
+/// Mark needle points from `from` on as underlay.
+fn mark_under(out: &mut [Needle], from: usize) {
+    for n in out.iter_mut().skip(from) {
+        n.under = true;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -334,6 +350,9 @@ pub fn effective(r: &Recipe, o: &ShapeOpts) -> Recipe {
     if let Some(v) = o.underlay_inset {
         e.underlay_inset = v.clamp(0.0, 3.0);
     }
+    if let Some(v) = o.underlay_len {
+        e.underlay_len = v.clamp(1.0, 7.0);
+    }
     // 3D puff: satin packed about twice as tight so it covers and cuts the
     // foam cleanly, with a little more pull compensation over the foam
     if o.puff {
@@ -375,6 +394,52 @@ impl Planned {
             u => u,
         }
     }
+    /// The underlay this object actually gets, in words with its numbers
+    /// (what Auto resolved to, row spacing, inset).
+    pub fn underlay_summary(&self, r: &Recipe, profile: Profile) -> String {
+        let e = effective(r, &self.opts);
+        let sp = e.underlay_spacing;
+        let inset = e.underlay_inset;
+        match self.kind {
+            StitchType::Fill => {
+                let kind = if self.opts.no_underlay { Underlay::Off } else { self.opts.fill_underlay };
+                match kind {
+                    Underlay::Off => "None".into(),
+                    Underlay::Tatami => format!("Tatami across · rows {sp:.1} mm · inset {inset:.1} mm · {:.1} mm stitches", e.underlay_len),
+                    Underlay::EdgeRun => format!("Edge run · inset {:.1} mm", inset.max(0.4)),
+                    Underlay::EdgeTatami => format!("Edge run + tatami across · rows {sp:.1} mm · inset {inset:.1} mm"),
+                    Underlay::DoubleTatami => format!("Double tatami (across, then along) · rows {sp:.1} mm · inset {inset:.1} mm"),
+                    _ if profile == Profile::Cap => format!("Auto: edge run + double tatami · rows {sp:.1} mm · inset {inset:.1} mm"),
+                    _ => format!("Auto: tatami across · rows {sp:.1} mm · inset {inset:.1} mm · {:.1} mm stitches", e.underlay_len),
+                }
+            }
+            StitchType::Satin | StitchType::SatinColumn => {
+                if self.puff_stage == 2 {
+                    return "None (sews over foam)".into();
+                }
+                let width = match &self.shape {
+                    ShapeKind::Line { width, .. } => self.opts.column_width.unwrap_or(*width),
+                    ShapeKind::Area { rings, rule } => {
+                        2.0 * crate::geom::rings_area(rings, *rule) / crate::geom::rings_perimeter(rings).max(1e-9)
+                    }
+                };
+                let kind = self.satin_underlay(width, profile);
+                let auto = if self.opts.satin_underlay == Underlay::Auto && !self.opts.no_underlay { "Auto: " } else { "" };
+                let zz = sp.min(2.0);
+                let detail = match kind {
+                    Underlay::Off => return "None".into(),
+                    Underlay::CenterRun => format!("for a {width:.1} mm column"),
+                    Underlay::EdgeRun => format!("inset {:.1} mm", (inset * 0.6).max(0.35)),
+                    Underlay::Zigzag | Underlay::DoubleZigzag => format!("{zz:.1} mm apart · inset {inset:.1} mm"),
+                    Underlay::EdgeZigzag => format!("zigzag {zz:.1} mm apart · inset {inset:.1} mm"),
+                    _ => String::new(),
+                };
+                format!("{auto}{} · {detail}", kind.label())
+            }
+            StitchType::Run | StitchType::TripleRun => "None".into(),
+        }
+    }
+
     /// What the operator sheet and layer list call this object's stitching.
     pub fn stitch_label(&self) -> &'static str {
         match self.kind {
@@ -437,7 +502,16 @@ fn generate_top(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
             let mut cur = from;
             // Underlay. Auto: rows across the fill; on caps an edge run
             // first and a second, parallel layer of rows.
-            let across = p.angle + FRAC_PI_2;
+            let across = if p.opts.guides.is_empty() {
+                p.angle + FRAC_PI_2
+            } else {
+                // under a guided fill: across the main stitch direction
+                let mut b = crate::geom::BBox::empty();
+                for q in rings.iter().flatten() {
+                    b.add(*q);
+                }
+                crate::flow::direction_at(b.center(), &p.opts.guides) + FRAC_PI_2
+            };
             let cap = profile == Profile::Cap;
             let kind = if p.opts.no_underlay { Underlay::Off } else { p.opts.fill_underlay };
             let (edge, layers): (bool, Vec<f64>) = match kind {
@@ -463,14 +537,18 @@ fn generate_top(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
                     rows,
                     a,
                     &|s| (s.x0 + inset, s.x1 - inset),
-                    3.0,
+                    r.underlay_len,
                     1,
                     r.underlay_spacing,
                     cur,
                     &|_| true,
                 );
             }
+            mark_under(&mut out, 1);
             match p.opts.fill {
+                FillPattern::Tatami if !p.opts.guides.is_empty() => {
+                    guided_fill(&mut out, p, rings, *rule, r, pc, cur);
+                }
                 FillPattern::Tatami => {
                     let rows = p.rows(rings, *rule, p.angle, r.fill_spacing, 0.3);
                     sew_layer(
@@ -656,11 +734,13 @@ fn generate_top(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
                         let closed = path.len() > 2 && path[0].dist(*path.last().unwrap()) < 0.05;
                         let pieces = split_at_corners(&path, 35f64.to_radians());
                         if !p.opts.no_underlay {
+                            let s0 = out.len() + 1;
                             push_section(
                                 &mut out,
                                 &resample(&path, Limits::RUN_LEN),
                                 Limits::RUN_LEN,
                             );
+                            mark_under(&mut out, s0);
                         }
                         let n = pieces.len();
                         for (k, piece) in pieces.iter().enumerate().rev() {
@@ -751,6 +831,23 @@ fn satin_underlay_out(
     pc: f64,
     first: bool,
 ) {
+    let start = out.len();
+    satin_underlay_body(out, kind, path, ribs, r, pc, first);
+    // the jump that starts a section isn't underlay; everything after is
+    let from = if first { start + 1 } else { start };
+    mark_under(out, from);
+}
+
+fn satin_underlay_body(
+    out: &mut Vec<Needle>,
+    kind: Underlay,
+    path: &[Pt],
+    ribs: &[(Pt, Pt)],
+    r: &Recipe,
+    pc: f64,
+    first: bool,
+) {
+    let run_len = r.underlay_len.min(Limits::RUN_LEN);
     let push = |out: &mut Vec<Needle>, pts: &[Pt], max: f64, first: bool| {
         if pts.len() < 2 {
             return;
@@ -771,15 +868,15 @@ fn satin_underlay_out(
             })
             .collect()
     };
-    let center = resample(path, Limits::RUN_LEN);
+    let center = resample(path, run_len);
     let edges = |out: &mut Vec<Needle>, first: bool| {
         // out along one edge, back along the other
         let e = inset_ribs((r.underlay_inset * 0.6 + pc).max(0.35));
         let left: Vec<Pt> = e.iter().map(|x| x.0).collect();
         let right: Vec<Pt> = e.iter().rev().map(|x| x.1).collect();
-        push(out, &resample(&left, Limits::RUN_LEN), Limits::RUN_LEN, first);
-        let right = resample(&right, Limits::RUN_LEN);
-        push_continue(out, &right, Limits::RUN_LEN);
+        push(out, &resample(&left, run_len), run_len, first);
+        let right = resample(&right, run_len);
+        push_continue(out, &right, run_len);
     };
     let zig = |out: &mut Vec<Needle>, first: bool| {
         let inner = inset_ribs(r.underlay_inset + pc);
@@ -789,7 +886,7 @@ fn satin_underlay_out(
     match kind {
         Underlay::EdgeRun => {
             edges(out, first);
-            push_continue(out, &center, Limits::RUN_LEN);
+            push_continue(out, &center, run_len);
         }
         Underlay::Zigzag => zig(out, first),
         Underlay::EdgeZigzag => {
@@ -801,10 +898,10 @@ fn satin_underlay_out(
             let back: Vec<(Pt, Pt)> = inset_ribs(r.underlay_inset + pc).into_iter().rev().map(|(a, b)| (b, a)).collect();
             let zz = ribs_to_zigzag(&back, r.underlay_spacing.min(2.0) / 2.0 * 0.8);
             push_continue(out, &zz, Limits::SATIN_MAX);
-            push_continue(out, &center, Limits::RUN_LEN);
+            push_continue(out, &center, run_len);
         }
         // center run (also how the needle travels when there is no underlay)
-        _ => push(out, &center, Limits::RUN_LEN, first),
+        _ => push(out, &center, run_len, first),
     }
 }
 
@@ -940,6 +1037,139 @@ fn link_inside(rings: &[Ring], rule: FillRule, a: Pt, b: Pt) -> bool {
         .map(|k| a.lerp(b, k as f64 / n as f64))
         .filter(|q| q.dist(a) > 0.5 && q.dist(b) > 0.5)
         .all(|q| inside(rings, rule, q))
+}
+
+fn seg_dist(p: Pt, a: Pt, b: Pt) -> f64 {
+    let ab = b.sub(a);
+    let l2 = ab.x * ab.x + ab.y * ab.y;
+    if l2 < 1e-12 {
+        return p.dist(a);
+    }
+    let t = (((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / l2).clamp(0.0, 1.0);
+    p.dist(a.lerp(b, t))
+}
+
+/// Tatami rows that turn to follow the layer's direction lines.
+fn guided_fill(out: &mut Vec<Needle>, p: &Planned, rings: &[Ring], rule: FillRule, r: &Recipe, pc: f64, from: Pt) -> Pt {
+    let o = UNDERLAP;
+    let hidden = |q: Pt| {
+        [Pt::new(o, 0.0), Pt::new(-o, 0.0), Pt::new(0.0, o), Pt::new(0.0, -o), Pt::new(0.0, 0.0)]
+            .iter()
+            .all(|d| p.covered(q.add(*d)))
+    };
+    let keep = |q: Pt| inside(rings, rule, q) && (p.knockouts.is_empty() || !hidden(q));
+    let rows = crate::flow::guided_rows(rings, rule, &keep, &p.opts.guides, r.fill_spacing);
+    let len = r.fill_len;
+    let stagger = p.opts.stagger.unwrap_or(3).clamp(1, 8) as i64;
+    let tm = {
+        let mut b = crate::geom::BBox::empty();
+        for q in rings.iter().flatten() {
+            b.add(*q);
+        }
+        let a = crate::flow::direction_at(b.center(), &p.opts.guides);
+        Pt::new(a.cos(), a.sin())
+    };
+    // each row as stitches: ends pushed out by pull compensation, needle
+    // points staggered row to row (brick pattern) along the row
+    let stitched: Vec<Vec<Pt>> = rows
+        .iter()
+        .map(|(lv, row)| {
+            let mut row = row.clone();
+            let n = row.len();
+            if n >= 2 && pc > 0.0 {
+                let u0 = row[0].sub(row[1]).norm();
+                row[0] = row[0].add(u0.mul(pc));
+                let u1 = row[n - 1].sub(row[n - 2]).norm();
+                row[n - 1] = row[n - 1].add(u1.mul(pc));
+            }
+            let total: f64 = row.windows(2).map(|w| w[0].dist(w[1])).sum();
+            // needle points line up across rows like straight tatami: measure
+            // along the main direction from a fixed origin, not from each
+            // row's own start (which wanders with the edge)
+            let dir = row[row.len() - 1].sub(row[0]);
+            let sign = if dir.x * tm.x + dir.y * tm.y < 0.0 { -1.0 } else { 1.0 };
+            let base = sign * (row[0].x * tm.x + row[0].y * tm.y);
+            let off = ((lv.rem_euclid(stagger) as f64) * len / stagger as f64 - base).rem_euclid(len);
+            let min = 0.6_f64.min(len * 0.3);
+            let mut marks = vec![0.0];
+            let mut m = ((min - off) / len).ceil() as i64;
+            loop {
+                let s = off + m as f64 * len;
+                if s >= total - min {
+                    break;
+                }
+                if s > min {
+                    marks.push(s);
+                }
+                m += 1;
+            }
+            marks.push(total);
+            // the point on the row at a distance along it
+            let cum: Vec<f64> = std::iter::once(0.0)
+                .chain(row.windows(2).scan(0.0, |a, w| {
+                    *a += w[0].dist(w[1]);
+                    Some(*a)
+                }))
+                .collect();
+            let at = |s: f64| -> Pt {
+                let k = cum.partition_point(|&c| c < s).clamp(1, row.len() - 1);
+                let (a, b) = (row[k - 1], row[k]);
+                let l = (cum[k] - cum[k - 1]).max(1e-9);
+                a.lerp(b, ((s - cum[k - 1]) / l).clamp(0.0, 1.0))
+            };
+            // a stitch is straight: where the row bends (round a corner),
+            // add points so no stitch cuts across the bend
+            let bend = |a: f64, b: f64| -> f64 {
+                let (pa, pb) = (at(a), at(b));
+                cum.iter()
+                    .zip(&row)
+                    .filter(|(c, _)| **c > a && **c < b)
+                    .map(|(_, q)| seg_dist(*q, pa, pb))
+                    .fold(0.0, f64::max)
+            };
+            let mut fine = vec![marks[0]];
+            for w in marks.windows(2) {
+                let mut stack = vec![(w[0], w[1], 0)];
+                let mut out_s = Vec::new();
+                while let Some((a, b, depth)) = stack.pop() {
+                    if depth < 4 && bend(a, b) > 0.2 && b - a > 0.6 {
+                        let m = (a + b) / 2.0;
+                        stack.push((m, b, depth + 1));
+                        stack.push((a, m, depth + 1));
+                    } else {
+                        out_s.push(b);
+                    }
+                }
+                fine.extend(out_s);
+            }
+            fine.into_iter().map(at).collect::<Vec<Pt>>()
+        })
+        .filter(|v| v.len() >= 2)
+        .collect();
+    // sew nearest row end next, back and forth
+    let mut left: Vec<usize> = (0..stitched.len()).collect();
+    let mut cur = out.last().map(|n| n.p).unwrap_or(from);
+    let near = (3.0 * r.fill_spacing).max(1.5);
+    while !left.is_empty() {
+        let (pick, rev) = left
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &k)| {
+                let v = &stitched[k];
+                [(i, false, v[0].dist(cur)), (i, true, v[v.len() - 1].dist(cur))]
+            })
+            .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+            .map(|(i, rv, _)| (i, rv))
+            .unwrap();
+        let k = left.swap_remove(pick);
+        let mut pts = stitched[k].clone();
+        if rev {
+            pts.reverse();
+        }
+        join_piece(out, rings, rule, &pts, len, near, &|q| p.covered(q));
+        cur = out.last().map(|n| n.p).unwrap_or(cur);
+    }
+    cur
 }
 
 /// Contour fill: rings that follow the outline inward, outermost first.
@@ -1359,7 +1589,7 @@ fn turning_satin(
             if field.at(tip) > 0.05 { tip } else { path[0] }
         };
         if out.is_empty() {
-            out.push(Needle { p: start_pt, jump: true });
+            out.push(Needle::new(start_pt, true));
         } else {
             start_in_shape(out, rings, rule, &[start_pt], Limits::RUN_LEN, &|q| p.covered(q));
         }
@@ -2056,10 +2286,7 @@ fn satin_along(path: &[Pt], half: f64, step: f64) -> Vec<Pt> {
 /// Start a new section: jump to the first point, then sew the rest.
 fn push_section(out: &mut Vec<Needle>, pts: &[Pt], max: f64) {
     if let Some(first) = pts.first() {
-        out.push(Needle {
-            p: *first,
-            jump: true,
-        });
+        out.push(Needle::new(*first, true));
         push_continue(out, &pts[1..], max);
     }
 }
@@ -2072,14 +2299,11 @@ fn push_continue(out: &mut Vec<Needle>, pts: &[Pt], max: f64) {
             if d > max {
                 let n = (d / max).ceil() as usize;
                 for k in 1..n {
-                    out.push(Needle {
-                        p: last.lerp(p, k as f64 / n as f64),
-                        jump: false,
-                    });
+                    out.push(Needle::new(last.lerp(p, k as f64 / n as f64), false));
                 }
             }
         }
-        out.push(Needle { p, jump: false });
+        out.push(Needle::new(p, false));
     }
 }
 
@@ -2188,15 +2412,29 @@ fn sew_layer(
         if rev {
             run.reverse();
         }
-        let pts = sew_rows(&run, left, angle, ends, len, stagger);
+        let all = sew_rows(&run, left, angle, ends, len, stagger);
+        // a turn from one row to the next that would leave the shape (round
+        // a notch) splits the run there
+        let mut chunks: Vec<Vec<Pt>> = vec![vec![all[0]]];
+        for w in all.windows(2) {
+            if w[0].dist(w[1]) > 1.2 && !link_inside(rings, rule, w[0], w[1]) {
+                chunks.push(vec![w[1]]);
+            } else {
+                chunks.last_mut().unwrap().push(w[1]);
+            }
+        }
+        let pts = &chunks[0];
         if travel && cur.dist(start) > 0.05 {
             let t = resample(&[cur, start], Limits::RUN_LEN);
             push_continue(out, &t[1..], Limits::RUN_LEN);
             push_continue(out, &pts[1..], len);
         } else {
-            push_section(out, &pts, len);
+            push_section(out, pts, len);
         }
-        cur = *pts.last().unwrap();
+        for c in &chunks[1..] {
+            join_piece(out, rings, rule, c, len, 0.0, covered);
+        }
+        cur = *chunks.last().unwrap().last().unwrap();
     }
     cur
 }

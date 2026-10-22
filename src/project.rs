@@ -314,6 +314,8 @@ pub fn compose(layers: &[Layer], chart: &[Thread]) -> (Artwork, Vec<Thread>) {
             layer: li,
             ..l.opts.clone()
         };
+        // direction lines move, scale and turn with the layer
+        opts.guides = l.opts.guides.iter().map(|(a, b)| (l.tf(*a), l.tf(*b))).collect();
         if let Some(t) = &l.custom {
             chart.push(t.clone());
             opts.thread = Some(chart.len() - 1);
@@ -330,7 +332,7 @@ pub fn compose(layers: &[Layer], chart: &[Thread]) -> (Artwork, Vec<Thread>) {
                 .iter()
                 .map(|n| Needle {
                     p: l.tf(n.p),
-                    jump: n.jump,
+                    ..*n
                 })
                 .collect();
             fixed.insert(li, pts);
@@ -657,7 +659,7 @@ mod object_tests {
         let made = d.layer_needles[&0].clone();
         // edit: drop every other needle point, store in the layer's own frame
         l.embroidery = Embroidery {
-            needles: made.iter().step_by(2).map(|n| Needle { p: l.inv(n.p), jump: n.jump }).collect(),
+            needles: made.iter().step_by(2).map(|n| Needle { p: l.inv(n.p), ..*n }).collect(),
             edited: true,
             source: l.source_fingerprint(),
         };
@@ -710,7 +712,7 @@ mod object_tests {
 
     #[test]
     fn removing_stitches_jumps_over_the_hole() {
-        let n = |x: f64, y: f64| Needle { p: Pt::new(x, y), jump: false };
+        let n = |x: f64, y: f64| Needle::new(Pt::new(x, y), false);
         // a row along y=0 and a row back along y=1
         let row = vec![n(0.0, 0.0), n(3.0, 0.0), n(6.0, 0.0), n(9.0, 0.0), n(9.0, 1.0), n(6.0, 1.0), n(3.0, 1.0), n(0.0, 1.0)];
         // a penetration in the middle of a straight line: the stitch just gets longer
@@ -860,6 +862,9 @@ mod stays_inside {
 
     /// Worst distance (mm) any stitch strays outside the shape.
     fn worst_stray(rings: &[Vec<Pt>], stitch: StitchChoice, fill: FillPattern, angle: Option<f64>, profile: Profile) -> (f64, String) {
+        worst_stray_g(rings, stitch, fill, angle, profile, &[])
+    }
+    fn worst_stray_g(rings: &[Vec<Pt>], stitch: StitchChoice, fill: FillPattern, angle: Option<f64>, profile: Profile, guides: &[(Pt, Pt)]) -> (f64, String) {
         let shape = Shape {
             kind: ShapeKind::Area { rings: rings.to_vec(), rule: FillRule::EvenOdd },
             rgb: [60, 60, 60], label: "s".into(), group: 0, opts: ShapeOpts::default(), curves: Vec::new(),
@@ -868,6 +873,7 @@ mod stays_inside {
         l.opts.stitch = stitch;
         l.opts.fill = fill;
         l.opts.angle_deg = angle;
+        l.opts.guides = guides.to_vec();
         let rings: Vec<Vec<Pt>> = rings.iter().map(|r| r.iter().map(|p| l.tf(*p)).collect()).collect();
         let mut p = Project::new("t", vec![l]);
         p.keep_order = true;
@@ -917,6 +923,53 @@ mod stays_inside {
             }
         }
         assert!(fails.is_empty(), "{} cases:\n{}", fails.len(), fails.join("\n"));
+    }
+
+    #[test]
+    fn guided_fills_stay_inside_and_follow_the_lines() {
+        let (_, rings) = shapes().into_iter().next().unwrap(); // the chevron
+        let shape = Shape {
+            kind: ShapeKind::Area { rings: rings.clone(), rule: FillRule::EvenOdd },
+            rgb: [60, 60, 60], label: "s".into(), group: 0, opts: ShapeOpts::default(), curves: Vec::new(),
+        };
+        let mut l = Layer::new(1, "s".into(), vec![shape], false);
+        l.opts.stitch = StitchChoice::Fill;
+        // up the leg, then along the bar
+        l.opts.guides = vec![
+            (Pt::new(11.0, 10.0), Pt::new(11.0, 60.0)),
+            (Pt::new(45.0, 103.0), Pt::new(80.0, 103.0)),
+        ];
+        let tr: Vec<Vec<Pt>> = rings.iter().map(|r| r.iter().map(|p| l.tf(*p)).collect()).collect();
+        let mut p = Project::new("t", vec![l.clone()]);
+        p.keep_order = true;
+        let d = p.build().unwrap();
+        // fill stitches (not underlay) run mostly vertical in the leg and
+        // mostly horizontal in the bar
+        let n = &d.layer_needles[&0];
+        let mut leg = (0.0, 0.0);
+        let mut bar = (0.0, 0.0);
+        for w in n.windows(2) {
+            if w[1].jump || w[1].under || w[0].p.dist(w[1].p) < 1.0 {
+                continue;
+            }
+            let (a, b) = (l.inv(w[0].p), l.inv(w[1].p));
+            let (dx, dy) = ((b.x - a.x).abs(), (b.y - a.y).abs());
+            if a.y < 60.0 && a.x < 20.0 { leg.0 += dx; leg.1 += dy; }
+            if a.y > 97.0 && a.x > 50.0 { bar.0 += dx; bar.1 += dy; }
+        }
+        assert!(leg.1 > 3.0 * leg.0, "leg runs vertical: {leg:?}");
+        assert!(bar.0 > 3.0 * bar.1, "bar runs horizontal: {bar:?}");
+        let _ = tr;
+        for profile in [Profile::Flat, Profile::Cap] {
+            let (w, at) = worst_stray_g(&rings, StitchChoice::Fill, FillPattern::Tatami, None, profile, &l.opts.guides);
+            assert!(w < 0.7, "{profile:?}: {w} {at}");
+        }
+        // guides on other shapes too: a ring and a star, guides at odd angles
+        for (name, rings) in shapes() {
+            let g = vec![(Pt::new(0.0, 0.0), Pt::new(30.0, 10.0)), (Pt::new(10.0, 40.0), Pt::new(15.0, 10.0))];
+            let (w, at) = worst_stray_g(&rings, StitchChoice::Fill, FillPattern::Tatami, None, Profile::Flat, &g);
+            assert!(w < 0.7, "{name}: {w} {at}");
+        }
     }
 
     #[test]

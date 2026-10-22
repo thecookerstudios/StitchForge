@@ -1,4 +1,4 @@
-# StitchForge v0.12 — embroidery app
+# StitchForge v0.13 — embroidery app
 
 Vector art, PDFs, pictures (PNG/JPG, even mockup photos) and any-font text
 in; machine-ready DST, a printable operator
@@ -165,6 +165,32 @@ StitchForge, so a logo can be built from scratch or added to:
   shape (or the outline is trimmed) and the stitches are rebuilt around the
   hole; a layer erased completely is removed. While editing stitches, the
   eraser removes the needle points you draw around instead.
+
+**Direction lines (A).** For fills whose stitches should turn with the
+shape (a curved banner, a swoosh, a letter with a bend): select the fill,
+pick the Direction lines tool and drag across it the way the stitches should
+run. Add more lines where the direction changes; the rows bend smoothly
+between them, stay evenly spaced, and reach the edges. Shift snaps to 15°.
+Click a line and press Delete to remove it; the layer panel shows "Angle:
+follows N direction lines" with Edit and Clear.
+
+**Underlay view and settings.** The **Underlay** toggle in the bottom bar
+shows the underlay in orange with the top stitches faded. Each layer lists
+the underlay it actually got (what Auto chose, row or zigzag spacing, inset,
+stitch length, and how many of its stitches are underlay). Under "Stitch
+settings (this layer)" you can change underlay rows/zigzag spacing, inset and
+stitch length for that layer.
+
+**Operator sheet PDF.** Export writes `NAME.sheet.pdf` (thread colours print
+exactly, US Letter): page 1 has the job, preview, specs, colour stops with
+swatches, warnings and notes; the object-by-object stitch list (with
+underlay) is on its own page and can be turned off in the Export window.
+The web-page sheet (`.sheet.html`) also prints colours now.
+
+**Trace fine tune.** In the trace window, **Fine tune** sets edge smoothing,
+curve accuracy, smallest piece, thinnest line and how similar colours must be
+to merge, and turns circle and straight-edge snapping on or off. ↺ returns a
+setting to what the Detail level picks.
 
 **Satin position (outlines and borders).** In the layer panel, Satin
 position sets where the satin column sits on the art's line: **Centred

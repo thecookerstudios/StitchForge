@@ -19,6 +19,10 @@ pub struct Recipe {
     pub underlay_spacing: f64,
     /// How far underlay stays inside the edge (mm).
     pub underlay_inset: f64,
+    /// Underlay stitch length (mm): fill underlay rows; edge and center
+    /// runs use this or 2.5 mm, whichever is shorter.
+    #[serde(default = "underlay_len_default")]
+    pub underlay_len: f64,
     pub backing: String,
     pub topping: String,
     /// The design's default thread weight (layers may override it). The
@@ -28,6 +32,10 @@ pub struct Recipe {
     /// Cap front size limits (adult or youth) when sewing on caps.
     #[serde(default)]
     pub cap_size: CapSize,
+}
+
+fn underlay_len_default() -> f64 {
+    3.0
 }
 
 /// Cap front sizes: the most a standard structured cap front takes.
@@ -66,6 +74,7 @@ pub fn recipe(name: &str) -> Option<Recipe> {
         pull_comp: 0.25,
         underlay_spacing: 2.5,
         underlay_inset: 0.6,
+        underlay_len: 3.0,
         backing: "Cutaway 2.5 oz".into(),
         topping: "None".into(),
         weight: Default::default(),

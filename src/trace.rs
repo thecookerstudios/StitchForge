@@ -118,6 +118,45 @@ pub struct TraceOptions {
     pub keep: Vec<usize>,
     /// Lower colours run under the ones on top (no gaps between colours).
     pub overlap: bool,
+    /// Fine control (None = what the Detail level picks):
+    /// edge smoothing radius (mm)
+    pub smooth_mm: Option<f64>,
+    /// smallest piece kept (mm²)
+    pub speck_mm2: Option<f64>,
+    /// thinnest line kept (mm)
+    pub min_line_mm: Option<f64>,
+    /// colours closer than this ΔE become one thread
+    pub merge_de: Option<f32>,
+    /// how closely curves follow the picture (mm; smaller = closer)
+    pub fit_tol_mm: Option<f64>,
+    /// snap round shapes to true circles
+    pub snap_circles: bool,
+    /// snap straight-edged shapes to sharp corners
+    pub snap_corners: bool,
+}
+
+impl TraceOptions {
+    pub fn eff_smooth(&self) -> f64 {
+        self.smooth_mm.unwrap_or(self.detail.smooth_mm()).clamp(0.0, 1.0)
+    }
+    pub fn eff_speck(&self) -> f64 {
+        self.speck_mm2.unwrap_or(self.detail.speck_mm2()).clamp(0.05, 50.0)
+    }
+    pub fn eff_min_line(&self) -> f64 {
+        self.min_line_mm
+            .unwrap_or(match self.detail {
+                Detail::Clean => 0.6,
+                Detail::Balanced => 0.45,
+                Detail::Fine => 0.3,
+            })
+            .clamp(0.05, 3.0)
+    }
+    pub fn eff_merge(&self) -> f32 {
+        self.merge_de.unwrap_or(self.detail.merge_de()).clamp(2.0, 60.0)
+    }
+    pub fn eff_fit(&self) -> f64 {
+        self.fit_tol_mm.unwrap_or(self.detail.fit_tol()).clamp(0.02, 0.5)
+    }
 }
 
 impl Default for TraceOptions {
@@ -132,6 +171,13 @@ impl Default for TraceOptions {
             drop: Vec::new(),
             keep: Vec::new(),
             overlap: true,
+            smooth_mm: None,
+            speck_mm2: None,
+            min_line_mm: None,
+            merge_de: None,
+            fit_tol_mm: None,
+            snap_circles: true,
+            snap_corners: true,
         }
     }
 }
@@ -1301,7 +1347,7 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
         Detail::Fine => 0.0012,
     };
     cs.retain(|c| c.1 as f64 >= total as f64 * min_share);
-    let mut cs = merge_colors(cs, detail.merge_de(), max);
+    let mut cs = merge_colors(cs, o.eff_merge(), max);
     cs.sort_by(|a, b| b.1.cmp(&a.1));
     let centers: Vec<[f32; 3]> = cs.iter().map(|c| c.0).collect();
     if centers.is_empty() {
@@ -1340,13 +1386,9 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
     for _ in 0..2 {
         majority(&mut labels, w, h);
     }
-    let speck_px = (detail.speck_mm2() / (mm_per_px * mm_per_px)).max(4.0) as usize;
+    let speck_px = (o.eff_speck() / (mm_per_px * mm_per_px)).max(4.0) as usize;
     // thinner than this can't be sewn as an area (mm, then px)
-    let min_thick = match detail {
-        Detail::Clean => 0.6,
-        Detail::Balanced => 0.45,
-        Detail::Fine => 0.3,
-    };
+    let min_thick = o.eff_min_line();
     let thin_px = min_thick / mm_per_px;
     despeckle(&mut labels, w, h, speck_px, thin_px);
 
@@ -1521,7 +1563,7 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
 
     // 6. outlines → curves
     let under_px = (0.6 / mm_per_px).round().max(1.0) as usize;
-    let min_ring_mm2 = detail.speck_mm2() * 0.6;
+    let min_ring_mm2 = o.eff_speck() * 0.6;
     let mut layers = Vec::new();
     let mut used_names: std::collections::HashMap<String, usize> = Default::default();
     let chart = crate::thread::generic_chart();
@@ -1590,16 +1632,26 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
         let mut paths = Vec::new();
         // photos are never as exact as artwork: smooth them more
         let photo = if bg.mockup { 2.0 } else { 1.0 };
-        let sigma_mm = detail.smooth_mm().max(0.45 * src_px_mm) * photo;
-        let tol = (detail.fit_tol().max(0.3 * src_px_mm) * photo).min(0.3);
+        let sigma_mm = if o.smooth_mm.is_some() {
+            o.eff_smooth() * photo
+        } else {
+            detail.smooth_mm().max(0.45 * src_px_mm) * photo
+        };
+        let tol = if o.fit_tol_mm.is_some() {
+            o.eff_fit()
+        } else {
+            (detail.fit_tol().max(0.3 * src_px_mm) * photo).min(0.3)
+        };
         for ring in contours(&mask, w, h, sigma_mm / mm_per_px) {
             let mm: Vec<Pt> = ring.iter().map(|q| Pt::new(q.x * mm_per_px, q.y * mm_per_px)).collect();
             if ring_area(&mm).abs() < min_ring_mm2 {
                 continue;
             }
-            let v = match as_circle(&mm) {
+            let circle = if o.snap_circles { as_circle(&mm) } else { None };
+            let poly = if o.snap_corners && circle.is_none() { as_polygon(&mm, tol) } else { None };
+            let v = match circle {
                 Some((c, r)) => crate::vector::ellipse(c.x, c.y, r, r),
-                None if let Some(poly) = as_polygon(&mm, tol) => poly,
+                None if let Some(poly) = poly => poly,
                 None => {
                     let mut v = fit_path(&mm, true, tol);
                     straighten(&mut v, tol);

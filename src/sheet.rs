@@ -4,7 +4,7 @@
 use crate::design::{Cmd, Design};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JobInfo {
     pub job: String,
     pub customer: String,
@@ -17,6 +17,31 @@ pub struct JobInfo {
     /// Garment colour the previews are drawn on (None = natural canvas).
     #[serde(default)]
     pub garment_rgb: Option<[u8; 3]>,
+    /// Put the object-by-object stitch list on its own page (page 2) of the
+    /// sheet; off leaves it out.
+    #[serde(default = "yes")]
+    pub sequence_page: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for JobInfo {
+    fn default() -> Self {
+        JobInfo {
+            job: String::new(),
+            customer: String::new(),
+            due: String::new(),
+            quantity: String::new(),
+            machine: String::new(),
+            placement: String::new(),
+            garment: String::new(),
+            notes: String::new(),
+            garment_rgb: None,
+            sequence_page: true,
+        }
+    }
 }
 
 impl JobInfo {
@@ -199,16 +224,25 @@ pub fn operator_sheet(d: &Design, job: &JobInfo, generated: &str) -> String {
         ));
     }
     let mut seq = String::new();
-    for o in &d.objects {
+    for o in d.objects.iter().filter(|_| job.sequence_page) {
         seq.push_str(&format!(
-            "<tr><td class='n'>{}</td><td>{}</td><td>{}</td><td>{}</td><td class='n'>{}</td></tr>",
+            "<tr><td class='n'>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class='n'>{}</td></tr>",
             o.sequence,
             esc(&o.label),
             o.stitch_type,
+            esc(&if o.underlay_stitches > 0 { format!("{} ({})", o.underlay, fmt_int(o.underlay_stitches)) } else { o.underlay.clone() }),
             esc(&format!("{} · {}", o.thread_code, o.weight.label())),
             fmt_int(o.stitches)
         ));
     }
+    let seq = if seq.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section class='seq'><h3>Sewing sequence (page 2)</h3><table><thead><tr><th class='n'>#</th><th>Object</th><th>Stitch</th><th>Underlay</th>\
+             <th>Thread</th><th class='n'>Stitches</th></tr></thead><tbody>{seq}</tbody></table></section>"
+        )
+    };
     let warnings = if d.warnings.is_empty() {
         String::new()
     } else {
@@ -276,8 +310,7 @@ pub fn operator_sheet(d: &Design, job: &JobInfo, generated: &str) -> String {
     html.push_str(&warnings);
     html.push_str(&format!(
         "<section><h3>Notes</h3><div class='notes'>{notes}</div></section>\
-         <section class='seq'><h3>Sewing sequence</h3><table><thead><tr><th class='n'>#</th><th>Object</th><th>Stitch</th>\
-         <th>Thread</th><th class='n'>Stitches</th></tr></thead><tbody>{seq}</tbody></table></section>\
+         {seq}\
          <footer>Generated {generated} by StitchForge · file {}.dst · sheet regenerates whenever the design changes</footer>",
         esc(&d.name)
     ));
@@ -343,5 +376,6 @@ td{padding:7px 8px;border-bottom:1px solid var(--rule)}
 .seq td,.seq th{font-size:12px;padding:4px 8px}
 footer{margin-top:22px;font-size:11px;color:var(--muted);border-top:1px solid var(--rule);padding-top:8px}
 @media (max-width:640px){main{margin:0;border-radius:0;padding:16px}.grid{grid-template-columns:1fr 1fr}.art{grid-template-columns:1fr}}
-@media print{body{background:#fff}main{box-shadow:none;margin:0;max-width:none;padding:0}button{display:none}.seq{break-before:auto}@page{size:letter;margin:12mm}}
+*{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+@media print{body{background:#fff}main{box-shadow:none;margin:0;max-width:none;padding:0}button{display:none}.seq{break-before:page}@page{size:letter;margin:12mm}}
 </style>"#;

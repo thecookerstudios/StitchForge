@@ -419,6 +419,7 @@ fn produce(mut art: import::Artwork, name: &str, o: &OutputArgs) -> Result<(), S
                 Some(c) => Some(parse_hex(c)?),
                 None => None,
             },
+            sequence_page: true,
         };
         let fmts: Vec<stitchforge::formats::Format> = o
             .formats

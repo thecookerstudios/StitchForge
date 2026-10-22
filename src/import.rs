@@ -154,10 +154,17 @@ pub struct ShapeOpts {
     pub column_width: Option<f64>,
     /// Satin areas (e.g. lettering): widen (+) or narrow (−) by this many mm.
     pub widen: f64,
+    /// Underlay stitch length for this layer (mm); None = the fabric's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underlay_len: Option<f64>,
     /// Satin outline position on its path (mm): 0 = centred on the line
     /// (50/50); + moves it outward (right of an open path), − inward.
     #[serde(skip_serializing_if = "is_zero")]
     pub satin_offset: f64,
+    /// Direction lines for fills (in the layer's own frame; design mm once
+    /// composed): stitch rows turn to follow them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guides: Vec<(crate::geom::Pt, crate::geom::Pt)>,
     pub corner: Corner,
     pub cap: Cap,
     /// Sews on top without cutting holes in the layers under it (used for
@@ -297,6 +304,7 @@ impl ShapeOpts {
             || self.pull_comp.is_some()
             || self.underlay_spacing.is_some()
             || self.underlay_inset.is_some()
+            || self.underlay_len.is_some()
             || self.stagger.is_some()
     }
 }
