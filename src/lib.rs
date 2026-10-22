@@ -3,6 +3,7 @@
 //! Built clean-room from the StitchForge spec, public format documentation
 //! and general embroidery practice.
 
+pub mod applique;
 pub mod cut;
 pub mod design;
 pub mod drops;

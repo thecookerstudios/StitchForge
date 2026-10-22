@@ -74,6 +74,9 @@ pub struct Planned {
     /// 3D puff: 0 = not puff, 1 = the contour sewn before the foam goes on,
     /// 2 = the tack-down, satin and end caps sewn over the foam.
     pub puff_stage: u8,
+    /// Appliqué: 0 = not appliqué, 1 = placement line, 2 = tack-down,
+    /// 3 = cover stitch over the edge.
+    pub applique_stage: u8,
 }
 
 /// Overlap left under an upper layer's edge so no fabric shows (mm).
@@ -188,6 +191,7 @@ pub fn plan(
                 stop: o.stop,
                 opts: o.clone(),
                 puff_stage: 0,
+                applique_stage: 0,
             };
         match &s.kind {
             ShapeKind::Area {
@@ -220,6 +224,23 @@ pub fn plan(
                 }
                 let islands = split_islands(all_rings, *rule);
                 let many = islands.len() > 1;
+                if o.applique.is_some() {
+                    // appliqué: each piece becomes its placement, tack-down
+                    // and cover (split into stages after this loop)
+                    for (k, rings) in islands.iter().enumerate() {
+                        let area = rings_area(rings, *rule);
+                        if area < Limits::MIN_AREA {
+                            continue;
+                        }
+                        let name = if many { format!("{name} {}", k + 1) } else { name.clone() };
+                        let bbox = BBox::of(rings.iter().flatten());
+                        let shape = ShapeKind::Area { rings: rings.clone(), rule: *rule };
+                        let mut q = mk(name, StitchType::Run, shape, bbox, 0.0);
+                        q.applique_stage = 1;
+                        out.push(q);
+                    }
+                    continue;
+                }
                 for (k, rings) in islands.iter().enumerate() {
                     let name = if many {
                         format!("{name} {}", k + 1)
@@ -305,6 +326,46 @@ pub fn plan(
                 out.push(mk(name, kind, s.kind.clone(), bbox, 0.0));
             }
         }
+    }
+    // Appliqué pieces of one layer sew stage by stage: every placement line,
+    // (stop) every tack-down, (stop to trim if cut in place) every cover.
+    if out.iter().any(|p| p.applique_stage > 0) {
+        let mut ex: Vec<Planned> = Vec::with_capacity(out.len() * 3);
+        let mut i = 0;
+        while i < out.len() {
+            if out[i].applique_stage == 0 {
+                ex.push(out[i].clone());
+                i += 1;
+                continue;
+            }
+            let layer = out[i].layer;
+            let mut j = i;
+            while j < out.len() && out[j].applique_stage > 0 && out[j].layer == layer {
+                j += 1;
+            }
+            let a = out[i].opts.applique.clone().unwrap_or_default();
+            let stages: Vec<u8> = [
+                (1u8, a.placement),
+                (2u8, a.tack != crate::applique::Tack::None),
+                (3u8, a.cover != crate::applique::Cover::None),
+            ]
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(s, _)| *s)
+            .collect();
+            for st in stages {
+                for piece in &out[i..j] {
+                    let mut q = piece.clone();
+                    q.applique_stage = st;
+                    if st == 3 && a.cover == crate::applique::Cover::Satin {
+                        q.kind = StitchType::SatinColumn;
+                    }
+                    ex.push(q);
+                }
+            }
+            i = j;
+        }
+        out = ex;
     }
     // Knockout: each area skips what later (upper) areas will cover.
     for i in 0..out.len() {
@@ -445,6 +506,19 @@ impl Planned {
         match self.kind {
             StitchType::Fill => self.opts.fill.short(),
             // auto-angle satin areas follow each stroke (turning satin)
+            _ if self.applique_stage == 1 => "Appliqué placement",
+            _ if self.applique_stage == 2 => match self.opts.applique.as_ref().map(|a| a.tack) {
+                Some(crate::applique::Tack::EStitch) => "Tack-down (E-stitch)",
+                Some(crate::applique::Tack::DoubleRun) => "Tack-down (double run)",
+                _ => "Tack-down (zigzag)",
+            },
+            _ if self.applique_stage == 3 => match self.opts.applique.as_ref().map(|a| a.cover) {
+                Some(crate::applique::Cover::EStitch) => "Appliqué E-stitch",
+                Some(crate::applique::Cover::Zigzag) => "Appliqué open zigzag",
+                Some(crate::applique::Cover::DoubleRun) => "Appliqué double run",
+                Some(crate::applique::Cover::Bean) => "Appliqué bean",
+                _ => "Appliqué satin border",
+            },
             _ if self.puff_stage == 1 => "Puff contour",
             _ if self.puff_stage == 2 => "3D puff satin",
             StitchType::Satin if self.opts.angle_deg.is_none() && self.knockouts.is_empty() => {
@@ -456,6 +530,9 @@ impl Planned {
 }
 
 pub fn generate(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Needle> {
+    if p.applique_stage > 0 {
+        return applique_stage(p, r, profile, from);
+    }
     match (p.puff_stage, &p.shape) {
         // before the foam: the outline, so the foam has a place and the
         // fabric is held
@@ -1923,6 +2000,161 @@ fn sew_satin(
         cur = out.last().map(|n| n.p).unwrap_or(cur);
     }
     cur
+}
+
+// ------------------------------------------------------------------ appliqué
+
+/// The piece's outlines as closed paths starting near `from` (nearest ring
+/// first), each with the sign that moves it out of the piece.
+fn applique_rings(rings: &[Ring], rule: FillRule, from: Pt) -> Vec<(Vec<Pt>, f64)> {
+    let mut left: Vec<Ring> = rings.iter().filter(|r| r.len() >= 3).cloned().collect();
+    let mut cur = from;
+    let mut out = Vec::new();
+    while !left.is_empty() {
+        let (ri, vi) = left
+            .iter()
+            .enumerate()
+            .flat_map(|(ri, r)| r.iter().enumerate().map(move |(vi, q)| (ri, vi, q.dist(cur))))
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(ri, vi, _)| (ri, vi))
+            .unwrap();
+        let mut ring = left.remove(ri);
+        ring.rotate_left(vi);
+        ring.push(ring[0]);
+        // which way is out of the piece (a hole's outline turns the other way)
+        let probe = shift_path(&ring, 0.25);
+        let n = probe.len().saturating_sub(1).max(1);
+        let step = (n / 12).max(1);
+        let (mut ins, mut tot) = (0, 0);
+        for k in (0..n).step_by(step) {
+            // midpoints of edges are safer than corners
+            let a = probe[k];
+            let b = probe[(k + 1) % n];
+            if inside(rings, rule, a.lerp(b, 0.5)) {
+                ins += 1;
+            }
+            tot += 1;
+        }
+        let sign = if ins * 2 > tot { -1.0 } else { 1.0 };
+        cur = ring[0];
+        out.push((ring, sign));
+    }
+    out
+}
+
+/// Zigzag between two parallel lines `d - w/2` and `d + w/2` mm out of the
+/// piece, `spacing` mm from one point on a side to the next on that side.
+fn applique_zigzag(path: &[Pt], sign: f64, d: f64, w: f64, spacing: f64) -> Vec<Pt> {
+    let c = resample(path, (spacing / 2.0).max(0.3));
+    let a = shift_path(&c, sign * (d + w / 2.0));
+    let b = shift_path(&c, sign * (d - w / 2.0));
+    a.iter()
+        .zip(b.iter())
+        .enumerate()
+        .map(|(i, (p, q))| if i % 2 == 0 { *p } else { *q })
+        .collect()
+}
+
+/// E-stitch (blanket): a run along `base` mm out of the piece with a prong
+/// `prong` mm onto the piece every `spacing` mm.
+fn applique_estitch(path: &[Pt], sign: f64, base: f64, prong: f64, spacing: f64) -> Vec<Pt> {
+    let c = resample(path, spacing.max(0.8));
+    let a = shift_path(&c, sign * base);
+    let b = shift_path(&c, sign * (base - prong));
+    let mut out = Vec::with_capacity(a.len() * 3);
+    for (i, (p, q)) in a.iter().zip(b.iter()).enumerate() {
+        out.push(*p);
+        // no prong on the closing point (it repeats the first)
+        if i + 1 < a.len() {
+            out.push(*q);
+            out.push(*p);
+        }
+    }
+    out
+}
+
+/// One appliqué stage: placement line, tack-down or cover.
+fn applique_stage(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Needle> {
+    use crate::applique::{Cover, Method, Tack};
+    let (Some(a), ShapeKind::Area { rings, rule }) = (&p.opts.applique, &p.shape) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Needle> = Vec::new();
+    let mut cur = from;
+    let run_len = 2.0;
+    for (path, sign) in applique_rings(rings, *rule, cur) {
+        let pts: Vec<Pt> = match p.applique_stage {
+            1 => {
+                let d = if a.method == Method::PreCut { a.cut_offset } else { 0.0 };
+                resample(&shift_path(&path, sign * d), run_len)
+            }
+            2 => {
+                let d = -a.tack_inset;
+                match a.tack {
+                    Tack::Zigzag => applique_zigzag(&path, sign, d, a.tack_width.max(0.3), 1.8),
+                    Tack::EStitch => applique_estitch(&path, sign, d + a.tack_width / 2.0, a.tack_width.max(0.3), 2.0),
+                    Tack::DoubleRun => {
+                        let mut f = resample(&shift_path(&path, sign * d), run_len);
+                        let back: Vec<Pt> = f.iter().rev().skip(1).copied().collect();
+                        f.extend(back);
+                        f
+                    }
+                    Tack::None => Vec::new(),
+                }
+            }
+            _ => match a.cover {
+                Cover::Satin => {
+                    // a satin column along the edge, reusing the satin engine
+                    let w = a.cover_width.max(0.5);
+                    // tiny outline segments (common in fonts) make ragged
+                    // mitres: smooth them out first
+                    let simple = crate::geom::simplify(&path, 0.08);
+                    let centre = shift_path(&simple, sign * (a.cover_outside - w / 2.0));
+                    let mut q = p.clone();
+                    q.applique_stage = 0;
+                    q.kind = StitchType::SatinColumn;
+                    q.shape = ShapeKind::Line { paths: vec![centre], width: w };
+                    q.knockouts.clear();
+                    q.opts.column_width = Some(w);
+                    q.opts.satin_offset = 0.0;
+                    q.opts.density = Some(a.cover_spacing.clamp(0.25, 1.0));
+                    // the tack-down already holds the piece
+                    q.opts.no_underlay = a.tack != Tack::None;
+                    let n = generate_top(&q, r, profile, cur);
+                    if let Some(l) = n.last() {
+                        cur = l.p;
+                    }
+                    out.extend(n);
+                    continue;
+                }
+                Cover::EStitch => applique_estitch(&path, sign, a.cover_outside, a.cover_width.max(0.5), a.cover_spacing.max(0.8)),
+                Cover::Zigzag => {
+                    let w = a.cover_width.max(0.5);
+                    applique_zigzag(&path, sign, a.cover_outside - w / 2.0, w, a.cover_spacing.max(0.4))
+                }
+                Cover::DoubleRun => {
+                    let mut f = resample(&shift_path(&path, sign * a.cover_outside), a.cover_spacing.clamp(1.0, 4.0));
+                    let back: Vec<Pt> = f.iter().rev().skip(1).copied().collect();
+                    f.extend(back);
+                    f
+                }
+                Cover::Bean => {
+                    let f = resample(&shift_path(&path, sign * a.cover_outside), a.cover_spacing.clamp(1.0, 4.0));
+                    let mut b = vec![f[0]];
+                    for w in f.windows(2) {
+                        b.extend([w[1], w[0], w[1]]);
+                    }
+                    b
+                }
+                Cover::None => Vec::new(),
+            },
+        };
+        if pts.len() >= 2 {
+            push_section(&mut out, &pts, Limits::MAX_STITCH.min(7.0));
+            cur = *pts.last().unwrap();
+        }
+    }
+    out
 }
 
 /// Longest travel run inside an object before a trim is used instead (mm):

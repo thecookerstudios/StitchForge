@@ -260,6 +260,12 @@ pub fn delta_e(a: [u8; 3], b: [u8; 3]) -> f64 {
     ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
 }
 
+/// A plain colour name for an RGB colour ("Red", "Navy"), from the generic chart.
+pub fn color_name(rgb: [u8; 3]) -> String {
+    let chart = generic_chart();
+    chart[nearest(&chart, rgb).0].name.clone()
+}
+
 pub fn nearest(chart: &[Thread], rgb: [u8; 3]) -> (usize, f64) {
     chart
         .iter()

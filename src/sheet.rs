@@ -21,6 +21,9 @@ pub struct JobInfo {
     /// sheet; off leaves it out.
     #[serde(default = "yes")]
     pub sequence_page: bool,
+    /// Cut files for appliqué / twill pieces (formats, mirror, kerf).
+    #[serde(default)]
+    pub cut: crate::applique::CutFiles,
 }
 
 fn yes() -> bool {
@@ -40,6 +43,7 @@ impl Default for JobInfo {
             notes: String::new(),
             garment_rgb: None,
             sequence_page: true,
+            cut: crate::applique::CutFiles::default(),
         }
     }
 }
@@ -76,6 +80,28 @@ pub fn preview_svg(d: &Design, scale: f64, fabric: &str) -> String {
     // Draw in true sewing order, in short chunks, so later stitches cover
     // earlier ones (underlay disappears under the top stitching, as on fabric).
     let mut chunks: Vec<(usize, String)> = Vec::new();
+    // appliqué pieces go on at their tack-down (usize::MAX marks a piece)
+    let piece_svg = |pc: &crate::applique::Piece| -> String {
+        let d: String = pc
+            .rings
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .enumerate()
+                    .map(|(i, q)| format!("{}{:.2} {:.2}", if i == 0 { 'M' } else { 'L' }, q.x - ox, q.y - oy))
+                    .collect::<String>()
+                    + "Z"
+            })
+            .collect();
+        format!(
+            "<path d='{d}' fill='{}' fill-rule='evenodd' stroke='{}' stroke-width='0.15'/>",
+            hex(pc.rgb),
+            shade(pc.rgb, 0.8)
+        )
+    };
+    let mut pieces: Vec<&crate::applique::Piece> = d.pieces.iter().collect();
+    pieces.sort_by_key(|p| p.from_cmd);
+    let mut next_piece = 0usize;
     let mut stop = 0usize;
     let mut last: Option<crate::geom::Pt> = None;
     let mut cur = String::new();
@@ -87,7 +113,13 @@ pub fn preview_svg(d: &Design, scale: f64, fabric: &str) -> String {
             cur.clear();
         }
     };
-    for c in &d.cmds {
+    for (ci, c) in d.cmds.iter().enumerate() {
+        while next_piece < pieces.len() && pieces[next_piece].from_cmd <= ci {
+            flush(&mut chunks, &mut cur, stop);
+            chunks.push((usize::MAX, piece_svg(pieces[next_piece])));
+            next_piece += 1;
+            last = None;
+        }
         match *c {
             Cmd::Color(i) => {
                 flush(&mut chunks, &mut cur, stop);
@@ -125,6 +157,12 @@ pub fn preview_svg(d: &Design, scale: f64, fabric: &str) -> String {
         h
     );
     for (i, p) in &chunks {
+        if *i == usize::MAX {
+            s.push_str("</g>");
+            s.push_str(p);
+            s.push_str("<g fill='none' stroke-linejoin='round' stroke-linecap='round'>");
+            continue;
+        }
         let rgb = d.stops[*i].thread.rgb;
         // strand width follows the thread weight (40 wt ≈ 0.33 mm)
         let k = d.stops[*i].weight.strand_mm() / 0.33;

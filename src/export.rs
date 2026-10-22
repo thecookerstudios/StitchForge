@@ -13,6 +13,8 @@ pub struct Written {
     pub sheet: PathBuf,
     /// The same sheet as a PDF (colours print exactly).
     pub sheet_pdf: PathBuf,
+    /// Cut files for appliqué pieces (SVG / DXF / PLT).
+    pub cut_files: Vec<PathBuf>,
     pub summary: Value,
 }
 
@@ -65,6 +67,35 @@ pub fn write_formats(
         p("preview.svg"),
         sheet::preview_svg(d, 1.0, &job.fabric_hex()).as_bytes(),
     )?;
+    // appliqué / twill cut files: one set per material colour
+    let mut cut_files: Vec<PathBuf> = Vec::new();
+    if !d.pieces.is_empty() {
+        let mut groups: Vec<(String, Vec<&crate::applique::Piece>)> = Vec::new();
+        for pc in &d.pieces {
+            let tag = crate::applique::file_tag(&pc.material, pc.rgb);
+            match groups.iter_mut().find(|(t, _)| *t == tag) {
+                Some((_, v)) => v.push(pc),
+                None => groups.push((tag, vec![pc])),
+            }
+        }
+        let o = &job.cut;
+        for (tag, ps) in groups {
+            let rings = crate::applique::cut_paths(&ps, o);
+            let title = format!("{base} {tag}{}", if o.mirror { " (mirrored)" } else { "" });
+            if o.svg {
+                write(p(&format!("cut-{tag}.svg")), crate::applique::cut_svg(&rings, &title).as_bytes())?;
+                cut_files.push(p(&format!("cut-{tag}.svg")));
+            }
+            if o.dxf {
+                write(p(&format!("cut-{tag}.dxf")), crate::applique::cut_dxf(&rings).as_bytes())?;
+                cut_files.push(p(&format!("cut-{tag}.dxf")));
+            }
+            if o.plt {
+                write(p(&format!("cut-{tag}.plt")), crate::applique::cut_plt(&rings).as_bytes())?;
+                cut_files.push(p(&format!("cut-{tag}.plt")));
+            }
+        }
+    }
     let files: Vec<String> = machine
         .iter()
         .cloned()
@@ -80,6 +111,7 @@ pub fn write_formats(
             .iter()
             .map(|e| p(e)),
         )
+        .chain(cut_files.iter().cloned())
         .map(|f| f.display().to_string())
         .collect();
     let summary = json!({
@@ -92,6 +124,7 @@ pub fn write_formats(
         "stops": d.stops,
         "objects": d.objects,
         "warnings": d.warnings,
+        "pieces": d.pieces.iter().map(|pc| json!({"label": pc.label, "material": pc.material, "rgb": pc.rgb})).collect::<Vec<_>>(),
         "files": files,
     });
     write(
@@ -102,6 +135,7 @@ pub fn write_formats(
         machine,
         sheet: p("sheet.html"),
         sheet_pdf: p("sheet.pdf"),
+        cut_files,
         summary,
     })
 }

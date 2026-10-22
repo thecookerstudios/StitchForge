@@ -1,4 +1,4 @@
-# StitchForge v0.14 — embroidery app
+# StitchForge v0.15 — embroidery app
 
 Vector art, PDFs, pictures (PNG/JPG, even mockup photos) and any-font text
 in; machine-ready DST, PES, PEC, EXP, JEF, VP3, XXX, U01 or TAP, a printable operator
@@ -113,6 +113,29 @@ height. Shift snaps to 15°.
 - **Opened stitch files** (any of those nine) open as read-only
   stitches: pick the thread for each stop, play the sew-out, print the
   sheet, or export to another format (e.g. DST → JEF).
+- **Twill / appliqué** (layer panel → Twill / appliqué → On, or tag the art
+  `sf-twill`): the shape is a fabric piece instead of a fill. StitchForge
+  sews it the way shops do: **placement line → machine stop to lay the
+  piece → tack-down → border over the edge**. *Cut in place* adds a second
+  stop to trim the fabric before the border. Choices:
+  - tack-down: zigzag (default 1.2 mm wide, 1 mm inside the edge), E-stitch
+    or double run;
+  - border: **satin** (3 mm, 0.8 mm past the cut edge), **E-stitch /
+    blanket** (2.5 mm prongs every 2.5 mm), **open zigzag** (lets the twill
+    show), **double run** or **bean** (for laser-sealed pieces), or none;
+    width, density/spacing and how far it reaches past the edge are all
+    adjustable, with ◀ ▶ nudges;
+  - material name and colour (previews draw the piece with a twill weave);
+    cut line offset.
+  The operator sheet's stop notes say what to do at each stop and which cut
+  file the pieces come from. Twill-on-twill: put the second twill on its own
+  layer above the first.
+- **Cut files** come with every export that has twill: one set per twill
+  colour (`name.cut-red-twill.svg / .dxf / .plt`), real size, with a 5 mm
+  margin. SVG and DXF (R12, mm, layer CUT) suit lasers and most cutter
+  software; PLT is HPGL for plotters and vinyl cutters. Export options:
+  **Mirror** (cutting adhesive side up) and **Kerf** (extra allowance all
+  round for the beam or blade).
 - **Convert to editable shapes** (button at the top of an opened stitch
   file): rebuilds the design as layers you can edit. Each stop's stitches
   are drawn out, the rows are joined into solid regions and outlined with
@@ -330,6 +353,10 @@ stitchforge sampler --formats dst,pes
 # Name drops from a project with a text layer for the name
 stitchforge drops team.sfg --data roster.xlsx --columns "First Name,Last Name" \
   --case upper --heads 6 --per-drop 12 --max-width-in 3.5 --formats dst,pes -o drops
+
+# Tackle twill from tagged art (sf-twill, sf-estitch-border, sf-cut-in-place…),
+# with mirrored cut files and 0.1 mm kerf
+stitchforge convert jersey.svg --width-in 8 --cut-mirror --cut-kerf 0.1
 
 # What's in any stitch file (DST, PES, PEC, EXP, JEF, VP3, XXX, U01, TAP)
 stitchforge inspect design.jef

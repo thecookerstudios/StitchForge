@@ -169,6 +169,12 @@ struct OutputArgs {
     /// Garment colour for the previews, e.g. "#111111" for a black cap
     #[arg(long)]
     garment_color: Option<String>,
+    /// Twill / appliqué cut files: mirror them (for cutting adhesive side up)
+    #[arg(long)]
+    cut_mirror: bool,
+    /// Twill / appliqué cut files: extra outward allowance for the laser or blade (mm)
+    #[arg(long, default_value = "0")]
+    cut_kerf: f64,
     #[arg(long, default_value = "")]
     notes: String,
 }
@@ -420,6 +426,11 @@ fn produce(mut art: import::Artwork, name: &str, o: &OutputArgs) -> Result<(), S
                 None => None,
             },
             sequence_page: true,
+            cut: stitchforge::applique::CutFiles {
+                mirror: o.cut_mirror,
+                kerf: o.cut_kerf,
+                ..Default::default()
+            },
         };
         let fmts: Vec<stitchforge::formats::Format> = o
             .formats

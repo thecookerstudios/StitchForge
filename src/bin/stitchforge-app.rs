@@ -324,6 +324,8 @@ struct App {
     /// Bumped whenever the design is rebuilt (vector view cache key).
     layers_rev: u64,
     vec_tex: Option<VecTex>,
+    /// Appliqué pieces drawn under the stitches: (cmd index they go on at, picture).
+    piece_tex: Vec<(usize, VecTex)>,
     /// Notes about the opened file (live text in a PDF, garment removed…).
     file_notes: Vec<String>,
     border_dist: f64,
@@ -433,6 +435,7 @@ impl App {
             trace_dlg: None,
             layers_rev: 0,
             vec_tex: None,
+            piece_tex: Vec::new(),
             file_notes: Vec::new(),
             border_dist: 1.5,
             border_round: true,
@@ -743,6 +746,49 @@ impl App {
                 size: Pt::new(w, h),
             });
         }
+    }
+
+    /// Pictures of the appliqué pieces (twill look), re-made when the design
+    /// or zoom changes.
+    fn refresh_piece_textures(&mut self, ctx: &egui::Context) {
+        use std::hash::{Hash, Hasher};
+        let Some(d) = &self.design else {
+            self.piece_tex.clear();
+            return;
+        };
+        if d.pieces.is_empty() {
+            self.piece_tex.clear();
+            return;
+        }
+        let zb = (self.zoom.max(0.05).ln() / 1.25f32.ln()).round() as i32;
+        let mut hs = std::collections::hash_map::DefaultHasher::new();
+        for p in &d.pieces {
+            p.from_cmd.hash(&mut hs);
+            p.rgb.hash(&mut hs);
+            for q in p.rings.iter().flatten() {
+                ((q.x * 100.0) as i64, (q.y * 100.0) as i64).hash(&mut hs);
+            }
+        }
+        let key = (hs.finish(), zb);
+        if self.piece_tex.first().map(|(_, v)| v.key == (key.0, key.1)).unwrap_or(false) {
+            return;
+        }
+        let ppp = ctx.pixels_per_point();
+        let mut out = Vec::new();
+        for (i, p) in d.pieces.iter().enumerate() {
+            let (svg, origin, size) = stitchforge::applique::piece_svg(p);
+            let max_px = ((size.x.max(size.y) as f32) * self.zoom * ppp).clamp(32.0, 2048.0) as u32;
+            if let Some((pw, ph, px)) = render_svg(&svg, max_px) {
+                let tex = ctx.load_texture(
+                    format!("piece-{i}"),
+                    egui::ColorImage::from_rgba_unmultiplied([pw, ph], &px),
+                    egui::TextureOptions::LINEAR,
+                );
+                out.push((p.from_cmd, VecTex { key: (key.0, key.1), tex, origin, size }));
+            }
+        }
+        out.sort_by_key(|(c, _)| *c);
+        self.piece_tex = out;
     }
 
     /// PDF/AI files and pictures: vector PDFs open like SVG; pictures (and
@@ -2517,6 +2563,23 @@ impl App {
             }
             ui.add_space(4.0);
             ui.label(RichText::new("Always included: operator sheet as a PDF (thread colours print exactly) and as a web page, color-stop CSV, PNG preview, job summary.").weak().small());
+            if self.design.as_ref().is_some_and(|d| !d.pieces.is_empty()) {
+                ui.add_space(4.0);
+                ui.label("Twill / appliqué cut files");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.job.cut.svg, "SVG");
+                    ui.checkbox(&mut self.job.cut.dxf, "DXF");
+                    ui.checkbox(&mut self.job.cut.plt, "PLT (HPGL)");
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.job.cut.mirror, "Mirror")
+                        .on_hover_text("Flip left-right, for cutting with the adhesive side up");
+                    ui.label("Kerf");
+                    ui.add(egui::DragValue::new(&mut self.job.cut.kerf).range(-1.0..=1.0).speed(0.01).suffix(" mm"))
+                        .on_hover_text("Extra allowance added all round for the laser beam or blade");
+                });
+                ui.label(RichText::new("One set per twill colour, at real size.").weak().small());
+            }
             ui.checkbox(&mut self.job.sequence_page, "Sheet: stitch list by object on page 2")
                 .on_hover_text("Page 1 is what the operator needs at the machine; the object-by-object stitch list goes on its own page. Untick to leave it out.");
             ui.add_space(6.0);
@@ -3234,6 +3297,127 @@ impl App {
                     }
                 }
             });
+            // twill / appliqué: a fabric piece instead of a fill
+            let is_area = l.shapes.iter().any(|s| matches!(s.kind, ShapeKind::Area { .. }));
+            if is_area {
+                ui.horizontal(|ui| {
+                    ui.label("Twill / appliqué");
+                    let mut on = l.opts.applique.is_some();
+                    let lbl = if on { "On" } else { "Off" };
+                    if ui
+                        .checkbox(&mut on, lbl)
+                        .on_hover_text("Sew a fabric piece (tackle twill, felt…) instead of filling the shape: placement line, stop to lay the piece, tack-down, then a border over the edge. Cut files for the pieces come with the export.")
+                        .changed()
+                    {
+                        l.opts.applique = if on {
+                            let rgb = l.custom.as_ref().map(|t| t.rgb).or(l.shapes.first().map(|s| s.rgb)).unwrap_or([200, 30, 40]);
+                            Some(stitchforge::applique::Applique { material_rgb: rgb, ..Default::default() })
+                        } else {
+                            None
+                        };
+                        if on {
+                            l.opts.puff = false;
+                        }
+                        changed = true;
+                    }
+                });
+            }
+            if let Some(a) = l.opts.applique.as_mut() {
+                use stitchforge::applique::{Cover, Method, Tack};
+                let before = a.clone();
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Material");
+                        ui.add(egui::TextEdit::singleline(&mut a.material).desired_width(90.0));
+                        ui.color_edit_button_srgb(&mut a.material_rgb)
+                            .on_hover_text("Colour of the twill or fabric (previews and the cut file name)");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Pieces");
+                        for m in [Method::PreCut, Method::CutInPlace] {
+                            ui.selectable_value(&mut a.method, m, m.label()).on_hover_text(match m {
+                                Method::PreCut => "Cut beforehand on a laser, plotter or die from the cut file; laid on the placement line",
+                                Method::CutInPlace => "Lay a larger piece, the machine tacks it down and stops so you trim it, then sews the border",
+                            });
+                        }
+                    });
+                    ui.checkbox(&mut a.placement, "Placement line first (machine stops after it)");
+                    ui.horizontal(|ui| {
+                        ui.label("Tack-down");
+                        egui::ComboBox::from_id_salt("twill-tack")
+                            .selected_text(a.tack.label())
+                            .show_ui(ui, |ui| {
+                                for t in Tack::ALL {
+                                    ui.selectable_value(&mut a.tack, t, t.label());
+                                }
+                            });
+                        if matches!(a.tack, Tack::Zigzag | Tack::EStitch) {
+                            ui.add(egui::DragValue::new(&mut a.tack_width).range(0.4..=4.0).speed(0.05).suffix(" mm wide"));
+                        }
+                        if a.tack != Tack::None {
+                            ui.add(egui::DragValue::new(&mut a.tack_inset).range(0.0..=4.0).speed(0.05).suffix(" mm in"))
+                                .on_hover_text("How far inside the piece's edge the tack-down runs (the border should cover it)");
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Border");
+                        let mut c = a.cover;
+                        egui::ComboBox::from_id_salt("twill-cover")
+                            .selected_text(c.label())
+                            .show_ui(ui, |ui| {
+                                for k in Cover::ALL {
+                                    ui.selectable_value(&mut c, k, k.label()).on_hover_text(k.hint());
+                                }
+                            });
+                        if c != a.cover {
+                            a.set_cover(c);
+                        }
+                    });
+                    match a.cover {
+                        Cover::Satin | Cover::Zigzag | Cover::EStitch => {
+                            ui.horizontal(|ui| {
+                                ui.label(if a.cover == Cover::EStitch { "Prong" } else { "Width" });
+                                ui.add(egui::DragValue::new(&mut a.cover_width).range(0.5..=10.0).speed(0.05).suffix(" mm"));
+                                ui.label(if a.cover == Cover::Satin { "Density" } else { "Spacing" });
+                                ui.add(egui::DragValue::new(&mut a.cover_spacing).range(0.25..=6.0).speed(0.02).suffix(" mm"));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Over the edge");
+                                ui.add(egui::DragValue::new(&mut a.cover_outside).range(-3.0..=3.0).speed(0.05).suffix(" mm"))
+                                    .on_hover_text("How far the border reaches past the cut edge onto the garment (the rest lies on the piece)");
+                                for (lbl, v) in [("◀ in", -0.1), ("out ▶", 0.1)] {
+                                    if ui.small_button(lbl).clicked() {
+                                        a.cover_outside = ((a.cover_outside + v) * 100.0).round() / 100.0;
+                                    }
+                                }
+                            });
+                        }
+                        Cover::DoubleRun | Cover::Bean => {
+                            ui.horizontal(|ui| {
+                                ui.label("Inside the edge");
+                                let mut v = -a.cover_outside;
+                                if ui.add(egui::DragValue::new(&mut v).range(0.0..=4.0).speed(0.05).suffix(" mm")).changed() {
+                                    a.cover_outside = -v;
+                                }
+                                ui.label("Stitch");
+                                ui.add(egui::DragValue::new(&mut a.cover_spacing).range(1.0..=4.0).speed(0.05).suffix(" mm"));
+                            });
+                        }
+                        Cover::None => {}
+                    }
+                    if a.method == Method::PreCut {
+                        ui.horizontal(|ui| {
+                            ui.label("Cut line");
+                            ui.add(egui::DragValue::new(&mut a.cut_offset).range(-3.0..=3.0).speed(0.05).suffix(" mm"))
+                                .on_hover_text("Cut the piece this much bigger (+) or smaller (−) than the art's outline; the placement line follows it");
+                        });
+                    }
+                    ui.label(RichText::new("Cut files (SVG, DXF, PLT) for the pieces are written with the export.").weak().small());
+                });
+                if *a != before {
+                    changed = true;
+                }
+            }
             ui.horizontal(|ui| {
                 ui.label("Under layers above");
                 let mut keep = l.opts.keep_under;
@@ -4656,6 +4840,8 @@ impl App {
         let rect = resp.rect;
         if self.view == View::Vector {
             self.refresh_vector_texture(ui.ctx());
+        } else {
+            self.refresh_piece_textures(ui.ctx());
         }
         // view switcher floating at the top left of the canvas
         // (hidden while a dialog is open so it never sits on top of one)
@@ -4971,7 +5157,20 @@ impl App {
                 painter.image(vt.tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             }
         }
+        // appliqué pieces go on the garment at their tack-down
+        let mut next_piece = 0usize;
+        let draw_pieces_until = |upto: usize, next: &mut usize, painter: &egui::Painter| {
+            while *next < self.piece_tex.len() && self.piece_tex[*next].0 <= upto {
+                let (at, vt) = &self.piece_tex[*next];
+                if *at < end {
+                    let r = Rect::from_two_pos(to_screen(vt.origin), to_screen(vt.origin.add(vt.size)));
+                    painter.image(vt.tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                }
+                *next += 1;
+            }
+        };
         for o in d.objects.iter().filter(|_| !vector_view) {
+            draw_pieces_until(o.cmd_range.0, &mut next_piece, &painter);
             if moving.is_some() && moving_set.contains(&o.layer) {
                 continue;
             }
@@ -4984,6 +5183,9 @@ impl App {
                 }
             }
             draw_obj(o, Pt::new(0.0, 0.0), &painter);
+        }
+        if !vector_view {
+            draw_pieces_until(usize::MAX, &mut next_piece, &painter);
         }
         if let Some(m) = moving {
             // while moving, the moved layers show as stitches in every view

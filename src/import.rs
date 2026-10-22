@@ -209,6 +209,9 @@ pub struct ShapeOpts {
     /// Foam thickness for puff (mm); None = 3 mm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foam_mm: Option<f64>,
+    /// Appliqué / tackle twill: a fabric piece sewn on instead of a fill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applique: Option<crate::applique::Applique>,
 }
 
 fn is_default<T: Default + PartialEq>(v: &T) -> bool {
@@ -555,6 +558,10 @@ pub fn load_svg_str(svg: &str, opt: &usvg::Options) -> Result<Artwork, String> {
     // sf-triple, sf-angle-45. Lets designers set stitching in their art app.
     for sh in &mut art.shapes {
         apply_id_tags(&mut sh.opts, &sh.label);
+        // the piece is the colour the art shows
+        if let Some(a) = sh.opts.applique.as_mut() {
+            a.material_rgb = sh.rgb;
+        }
     }
     if art.shapes.is_empty() {
         return Err("no stitchable shapes found in the artwork".into());
@@ -820,6 +827,39 @@ pub fn apply_id_tags(opts: &mut ShapeOpts, id: &str) {
         if opts.stitch == StitchChoice::Auto {
             opts.stitch = StitchChoice::Satin;
         }
+    }
+    // appliqué / tackle twill: sf-twill (or sf-applique), with
+    // sf-cut-in-place, sf-estitch-border, sf-zigzag-border, sf-bean-border,
+    // sf-run-border, sf-no-placement, sf-tack-estitch, sf-tack-run
+    if id.contains("sf-twill") || id.contains("sf-applique") {
+        use crate::applique::{Applique, Cover, Method, Tack};
+        let mut a = Applique::default();
+        if id.contains("sf-applique") && !id.contains("sf-twill") {
+            a.material = "Fabric".into();
+        }
+        if id.contains("sf-cut-in-place") {
+            a.method = Method::CutInPlace;
+        }
+        for (tag, c) in [
+            ("sf-estitch-border", Cover::EStitch),
+            ("sf-zigzag-border", Cover::Zigzag),
+            ("sf-bean-border", Cover::Bean),
+            ("sf-run-border", Cover::DoubleRun),
+            ("sf-no-border", Cover::None),
+        ] {
+            if id.contains(tag) {
+                a.set_cover(c);
+            }
+        }
+        if id.contains("sf-tack-estitch") {
+            a.tack = Tack::EStitch;
+        } else if id.contains("sf-tack-run") {
+            a.tack = Tack::DoubleRun;
+        }
+        if id.contains("sf-no-placement") {
+            a.placement = false;
+        }
+        opts.applique = Some(a);
     }
     if id.contains("sf-no-underlay") {
         opts.no_underlay = true;

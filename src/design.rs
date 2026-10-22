@@ -117,6 +117,8 @@ pub struct Design {
     /// `cmds` ranges that are underlay (start, end), for showing it apart.
     #[serde(skip)]
     pub underlay_cmds: Vec<(usize, usize)>,
+    /// Appliqué / twill pieces sewn on, with their cut lines.
+    pub pieces: Vec<crate::applique::Piece>,
 }
 
 impl Design {
@@ -137,6 +139,7 @@ impl Design {
             warnings: Vec::new(),
             layer_needles: Default::default(),
             underlay_cmds: Vec::new(),
+            pieces: Vec::new(),
         }
     }
 }
@@ -302,6 +305,10 @@ pub fn build_with(
     let mut last_layer: Option<usize> = None;
     let mut layer_needles: std::collections::BTreeMap<usize, Vec<Needle>> = Default::default();
     let mut underlay_cmds: Vec<(usize, usize)> = Vec::new();
+    // appliqué: (layer, stage) that already got its stop; where each layer's
+    // pieces go on (cmd index)
+    let mut app_stops: std::collections::HashSet<(usize, u8)> = Default::default();
+    let mut piece_at: std::collections::BTreeMap<usize, usize> = Default::default();
     // thinnest satin stroke per layer, for one weight warning per layer
     let mut thin: std::collections::BTreeMap<usize, (String, ThreadWeight, f64)> =
         Default::default();
@@ -331,7 +338,30 @@ pub fn build_with(
         let wt = o.opts.weight.unwrap_or(recipe.weight);
         let differs = cur_thread != Some((o.thread, wt));
         let foam_here = Some(oi) == foam_at && !needles.is_empty();
-        let new_stop = if cur_thread.is_none() || foam_here {
+        // appliqué: stop to lay the piece before its tack-down, and (cut in
+        // place) to trim it before the cover
+        let mut app_note: Option<String> = None;
+        if let Some(a) = &o.opts.applique
+            && o.applique_stage >= 2
+            && app_stops.insert((o.layer, o.applique_stage))
+        {
+            let what = format!("{} {}", crate::thread::color_name(a.material_rgb), a.material.to_lowercase());
+            let first_stage = o.applique_stage == 2 || (o.applique_stage == 3 && a.tack == crate::applique::Tack::None);
+            if first_stage {
+                piece_at.entry(o.layer).or_insert(cmds.len());
+                app_note = Some(match (a.placement, a.method) {
+                    (true, crate::applique::Method::PreCut) => format!(
+                        "STOP: lay the cut {what} piece(s) on the placement line, then continue (cut file {name}.cut-{}.*)",
+                        crate::applique::file_tag(&a.material, a.material_rgb)
+                    ),
+                    (true, crate::applique::Method::CutInPlace) => format!("STOP: lay {what} over the placement line (at least 6 mm extra all round), then continue"),
+                    (false, _) => format!("STOP: lay the {what} piece(s) in position, then continue"),
+                });
+            } else if a.method == crate::applique::Method::CutInPlace && o.applique_stage == 3 {
+                app_note = Some(format!("STOP: trim the {what} close to the tack-down (about 1 mm outside it), then continue"));
+            }
+        }
+        let new_stop = if cur_thread.is_none() || foam_here || app_note.is_some() {
             true
         } else if layer_start && o.stop.is_some() {
             o.stop.unwrap()
@@ -362,7 +392,9 @@ pub fn build_with(
                 needle,
                 stitches: 0,
                 objects: Vec::new(),
-                note: if foam_here {
+                note: if let Some(n) = &app_note {
+                    n.clone()
+                } else if foam_here {
                     format!(
                         "STOP: place {:.0} mm puff foam over the puff area, then continue",
                         o.opts.foam_mm.unwrap_or(3.0)
@@ -576,6 +608,35 @@ pub fn build_with(
             ));
         }
     }
+    // the fabric pieces, once each (every stage repeats them)
+    let mut first_stage: std::collections::BTreeMap<usize, u8> = Default::default();
+    for o in objs.iter().filter(|o| o.applique_stage > 0) {
+        let e = first_stage.entry(o.layer).or_insert(o.applique_stage);
+        *e = (*e).min(o.applique_stage);
+    }
+    let pieces: Vec<crate::applique::Piece> = objs
+        .iter()
+        .filter(|o| o.applique_stage > 0 && first_stage.get(&o.layer) == Some(&o.applique_stage))
+        .filter_map(|o| {
+            let (Some(a), crate::import::ShapeKind::Area { rings, rule }) = (&o.opts.applique, &o.shape) else {
+                return None;
+            };
+            let cut = if a.cut_offset.abs() > 1e-6 {
+                crate::vector::offset(rings, *rule, a.cut_offset, false)
+            } else {
+                rings.clone()
+            };
+            Some(crate::applique::Piece {
+                layer: o.layer,
+                label: o.label.clone(),
+                material: a.material.clone(),
+                rgb: a.material_rgb,
+                rings: rings.clone(),
+                cut,
+                from_cmd: piece_at.get(&o.layer).copied().unwrap_or(0),
+            })
+        })
+        .collect();
     Ok(Design {
         name: name.into(),
         profile,
@@ -588,6 +649,7 @@ pub fn build_with(
         warnings,
         layer_needles,
         underlay_cmds,
+        pieces,
     })
 }
 
@@ -717,6 +779,7 @@ pub fn from_machine(
         warnings: Vec::new(),
         layer_needles: Default::default(),
         underlay_cmds: Vec::new(),
+        pieces: Vec::new(),
     })
 }
 
