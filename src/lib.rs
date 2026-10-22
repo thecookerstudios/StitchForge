@@ -25,3 +25,4 @@ pub mod sheet;
 pub mod stitch;
 pub mod thread;
 pub mod trace;
+pub mod unstitch;

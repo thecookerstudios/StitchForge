@@ -317,8 +317,19 @@ pub fn compose(layers: &[Layer], chart: &[Thread]) -> (Artwork, Vec<Thread>) {
         // direction lines move, scale and turn with the layer
         opts.guides = l.opts.guides.iter().map(|(a, b)| (l.tf(*a), l.tf(*b))).collect();
         if let Some(t) = &l.custom {
-            chart.push(t.clone());
-            opts.thread = Some(chart.len() - 1);
+            // layers sharing one typed-in thread share one chart entry, so
+            // they sew in the same stop
+            let i = match chart
+                .iter()
+                .position(|c| c.code == t.code && c.name == t.name && c.rgb == t.rgb && c.brand == t.brand)
+            {
+                Some(i) => i,
+                None => {
+                    chart.push(t.clone());
+                    chart.len() - 1
+                }
+            };
+            opts.thread = Some(i);
         }
         for mut s in l.transformed() {
             s.opts = opts.clone();

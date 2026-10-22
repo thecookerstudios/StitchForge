@@ -715,7 +715,7 @@ fn merge_colors(mut cs: Vec<([f32; 3], usize)>, min_de: f32, max: usize) -> Vec<
 
 /// Sub-pixel outline of a mask: marching squares on a lightly blurred copy,
 /// returning closed loops in pixel coordinates.
-fn contours(mask: &[bool], w: usize, h: usize, sigma: f64) -> Vec<Vec<Pt>> {
+pub(crate) fn contours(mask: &[bool], w: usize, h: usize, sigma: f64) -> Vec<Vec<Pt>> {
     // padded, blurred field: the blur evens out pixel steps and noisy
     // colour edges so the outline comes out smooth
     let rad = (sigma * 3.0).ceil().max(1.0) as usize;
@@ -1135,7 +1135,7 @@ fn as_circle(pts: &[Pt]) -> Option<(Pt, f64)> {
 
 /// Curve segments that are straight to within `tol` become straight lines,
 /// and corners that the edge smoothing rounded off are made sharp again.
-fn straighten(v: &mut VPath, tol: f64) {
+pub(crate) fn straighten(v: &mut VPath, tol: f64) {
     let n = v.nodes.len();
     let segs = if v.closed { n } else { n.saturating_sub(1) };
     for i in 0..segs {

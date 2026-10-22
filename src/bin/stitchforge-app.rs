@@ -287,7 +287,7 @@ struct App {
     title: String,
     machine: Option<MachineDoc>,
     show_export: bool,
-    export_fmts: [bool; 3],
+    export_fmts: [bool; 6],
 
     // name drops
     tab: Tab,
@@ -396,7 +396,7 @@ impl App {
             title: String::new(),
             machine: None,
             show_export: false,
-            export_fmts: [true, false, false],
+            export_fmts: [true, false, false, false, false, false],
             tab: Tab::Design,
             drops: DropSetup::default(),
             drop_view: 0,
@@ -1959,12 +1959,12 @@ impl App {
             &[
                 (
                     "Everything StitchForge opens",
-                    &["sfg", "json", "svg", "pdf", "ai", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "dst", "exp", "pes"],
+                    &["sfg", "json", "svg", "pdf", "ai", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "dst", "exp", "pes", "pec", "jef", "tap"],
                 ),
                 ("StitchForge project", &["sfg", "json"]),
                 ("Artwork (SVG, PDF, AI)", &["svg", "pdf", "ai"]),
                 ("Pictures and mockups (auto-traced)", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"]),
-                ("Stitch files", &["dst", "exp", "pes"]),
+                ("Stitch files (DST, PES, PEC, EXP, JEF, TAP)", &formats::READ_EXTS),
             ],
             self.last_dir.as_ref(),
         );
@@ -2030,7 +2030,7 @@ impl App {
                 self.clean_after_regen = true;
                 self.sequence_tip();
             }
-            "dst" | "exp" | "pes" => self.open_machine(path),
+            e if formats::READ_EXTS.contains(&e) => self.open_machine(path),
             e if ART_EXT.contains(&e) => self.open_art_file(path, false),
             _ => self.error = Some(format!("StitchForge can't open .{ext} files")),
         }
@@ -2080,6 +2080,48 @@ impl App {
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Turn the open stitch file into editable layers (a new, unsaved design).
+    fn convert_machine(&mut self) {
+        let Some(m) = self.machine.take() else { return };
+        let colors: Vec<[u8; 3]> = m.threads.iter().map(|t| t.rgb).collect();
+        let (art, sum) = stitchforge::unstitch::unstitch(&m.file.cmds, &colors);
+        if art.shapes.is_empty() {
+            self.machine = Some(m);
+            self.error = Some("No stitched areas or lines were found to convert".into());
+            return;
+        }
+        self.hard_checkpoint();
+        let mut layers = self.layers_from_art(art);
+        // keep the exact thread each stop had
+        for l in &mut layers {
+            let rgb = l.shapes.first().map(|s| s.rgb);
+            if let Some(t) = m.threads.iter().find(|t| Some(t.rgb) == rgb) {
+                l.custom = Some(t.clone());
+            }
+        }
+        self.layers = layers;
+        self.project_path = None;
+        self.file_notes.clear();
+        self.selected = None;
+        self.keep_order = true;
+        self.fit = true;
+        self.dirty = true;
+        self.modified = true;
+        self.tab = Tab::Design;
+        self.error = None;
+        let mut parts = Vec::new();
+        for (n, w) in [(sum.fills, "fill"), (sum.satins, "satin"), (sum.runs, "run line")] {
+            if n > 0 {
+                parts.push(format!("{n} {w}{}", if n == 1 { "" } else { "s" }));
+            }
+        }
+        self.status = format!(
+            "Converted {} into {}. Shapes are rebuilt from the stitches: check edges, angles and densities before sewing.",
+            m.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+            parts.join(", ")
+        );
     }
 
     fn load_sampler(&mut self) {
@@ -2152,10 +2194,23 @@ impl App {
 
     /// Stitch-file mode: each stop with its thread.
     fn machine_panel(&mut self, ui: &mut egui::Ui) {
+        let convert;
+        {
+            let Some(m) = &self.machine else { return };
+            ui.label(RichText::new(format!("Stitch file · {}", m.file.format)).strong());
+            ui.label(RichText::new("Stitches are read-only here. Pick the thread for each stop, play the sew-out, print the operator sheet, or export to another format.").weak().small());
+            ui.add_space(4.0);
+            convert = ui
+                .button(RichText::new("Convert to editable shapes").strong())
+                .on_hover_text("Rebuild fills, satins and run lines from the stitches, as layers you can reshape, re-angle and re-stitch. The stitch file itself is left as it is.")
+                .clicked();
+            ui.separator();
+        }
+        if convert {
+            self.convert_machine();
+            return;
+        }
         let Some(m) = &mut self.machine else { return };
-        ui.label(RichText::new(format!("Stitch file · {}", m.file.format)).strong());
-        ui.label(RichText::new("Stitches are read-only. Pick the thread for each stop, play the sew-out, print the operator sheet, or export to another format.").weak().small());
-        ui.separator();
         let counts: Vec<usize> = self
             .design
             .as_ref()
@@ -2280,7 +2335,7 @@ impl App {
                     ui.close();
                     self.guard(Pending::New, &ctx);
                 }
-                if ui.button("Open…  (project, art, picture, DST/EXP/PES)").clicked() {
+                if ui.button("Open…  (project, art, picture, stitch file)").clicked() {
                     ui.close();
                     self.guard(Pending::Open, &ctx);
                 }

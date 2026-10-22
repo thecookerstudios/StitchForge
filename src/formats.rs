@@ -1,6 +1,7 @@
-//! Machine formats besides DST: Melco EXP and Brother PES (with its PEC
-//! section), plus readers for DST, EXP and PES so existing stitch files can
-//! be viewed, re-coloured, documented and converted.
+//! Machine formats besides DST: Melco EXP, Brother PES and PEC, Janome JEF
+//! and Happy TAP, plus readers for all of them so existing stitch files can
+//! be viewed, re-coloured, documented, converted, and turned back into
+//! editable shapes.
 //!
 //! Written from public descriptions of these formats. Machine units are
 //! 0.1 mm. Inside StitchForge, y runs down (screen convention).
@@ -24,15 +25,31 @@ pub enum Format {
     Dst,
     Exp,
     Pes,
+    Pec,
+    Jef,
+    Tap,
 }
 
+/// File extensions StitchForge can open as stitch files.
+pub const READ_EXTS: [&str; 6] = ["dst", "exp", "pes", "pec", "jef", "tap"];
+
 impl Format {
-    pub const ALL: [Format; 3] = [Format::Dst, Format::Pes, Format::Exp];
+    pub const ALL: [Format; 6] = [
+        Format::Dst,
+        Format::Pes,
+        Format::Exp,
+        Format::Jef,
+        Format::Tap,
+        Format::Pec,
+    ];
     pub fn ext(&self) -> &'static str {
         match self {
             Format::Dst => "dst",
             Format::Exp => "exp",
             Format::Pes => "pes",
+            Format::Pec => "pec",
+            Format::Jef => "jef",
+            Format::Tap => "tap",
         }
     }
     pub fn label(&self) -> &'static str {
@@ -40,6 +57,9 @@ impl Format {
             Format::Dst => "DST (Tajima, most commercial machines)",
             Format::Exp => "EXP (Melco / Bernina)",
             Format::Pes => "PES (Brother / Babylock)",
+            Format::Pec => "PEC (older Brother / Babylock)",
+            Format::Jef => "JEF (Janome / Elna / Kenmore)",
+            Format::Tap => "TAP (Happy)",
         }
     }
     pub fn from_ext(ext: &str) -> Option<Format> {
@@ -47,6 +67,9 @@ impl Format {
             "dst" => Some(Format::Dst),
             "exp" => Some(Format::Exp),
             "pes" => Some(Format::Pes),
+            "pec" => Some(Format::Pec),
+            "jef" => Some(Format::Jef),
+            "tap" => Some(Format::Tap),
             _ => None,
         }
     }
@@ -57,6 +80,21 @@ pub fn write(d: &Design, f: Format) -> Vec<u8> {
         Format::Dst => dst::write(d),
         Format::Exp => write_exp(d),
         Format::Pes => write_pes(d),
+        Format::Pec => write_pec(d),
+        Format::Jef => write_jef(d),
+        Format::Tap => write_tap(d),
+    }
+}
+
+/// Read stitch-file bytes in the given format.
+pub fn read_bytes(bytes: &[u8], f: Format) -> Result<MachineFile, String> {
+    match f {
+        Format::Dst => read_dst(bytes),
+        Format::Exp => read_exp(bytes),
+        Format::Pes => read_pes(bytes),
+        Format::Pec => read_pec(bytes),
+        Format::Jef => read_jef(bytes),
+        Format::Tap => read_tap(bytes),
     }
 }
 
@@ -171,13 +209,31 @@ pub fn read_exp(bytes: &[u8]) -> Result<MachineFile, String> {
 /// jumps), all converted to mm with y down.
 pub fn read_dst(bytes: &[u8]) -> Result<MachineFile, String> {
     let info = dst::read(bytes)?;
+    Ok(dst_records(&bytes[512..], info.label, "DST"))
+}
+
+// ------------------------------------------------------------------ TAP
+
+/// Happy TAP: the same 3-byte stitch records as DST, with no header.
+pub fn write_tap(d: &Design) -> Vec<u8> {
+    dst::write(d)[512..].to_vec()
+}
+
+pub fn read_tap(bytes: &[u8]) -> Result<MachineFile, String> {
+    if bytes.len() < 3 {
+        return Err("file too short to be TAP".into());
+    }
+    Ok(dst_records(bytes, String::new(), "TAP"))
+}
+
+fn dst_records(recs: &[u8], label: String, format: &'static str) -> MachineFile {
     let mut cmds = vec![Cmd::Color(0)];
     let mut stops = 1usize;
     let (mut x, mut y) = (0i32, 0i32);
     let at = |x: i32, y: i32| Pt::new(x as f64 / 10.0, -y as f64 / 10.0);
     // Machines trim on a run of consecutive jump records; read it the same way.
     let mut jump_run = 0;
-    for r in bytes[512..].chunks_exact(3) {
+    for r in recs.chunks_exact(3) {
         let b = [r[0], r[1], r[2]];
         if b[2] == 0xF3 {
             break;
@@ -206,12 +262,12 @@ pub fn read_dst(bytes: &[u8]) -> Result<MachineFile, String> {
         }
     }
     cmds.push(Cmd::End);
-    Ok(MachineFile {
+    MachineFile {
         cmds,
         stop_colors: vec![None; stops],
-        label: info.label,
-        format: "DST",
-    })
+        label,
+        format,
+    }
 }
 
 // ------------------------------------------------------------------ PES / PEC
@@ -549,6 +605,273 @@ pub fn read_pes(bytes: &[u8]) -> Result<MachineFile, String> {
     })
 }
 
+// ------------------------------------------------------------------ PEC
+
+/// A bare PEC file: the PEC section of a PES file behind its own signature.
+pub fn write_pec(d: &Design) -> Vec<u8> {
+    let pes = write_pes(d);
+    let mut out = b"#PEC0001".to_vec();
+    out.extend_from_slice(&pes[22..]);
+    out
+}
+
+pub fn read_pec(bytes: &[u8]) -> Result<MachineFile, String> {
+    if bytes.len() < 8 || &bytes[0..4] != b"#PEC" {
+        return Err("not a PEC file".into());
+    }
+    // wrap it as a PES file whose PEC section starts right after the header
+    let mut pes = b"#PES0001".to_vec();
+    pes.extend_from_slice(&12u32.to_le_bytes());
+    pes.extend_from_slice(&bytes[8..]);
+    let mut f = read_pes(&pes)?;
+    f.format = "PEC";
+    Ok(f)
+}
+
+// ------------------------------------------------------------------ JEF
+
+/// Janome's basic colour numbers (1-based). Like PEC, the number only picks
+/// the colour the machine shows; the operator threads what the sheet says.
+pub const JEF_PALETTE: [(&str, [u8; 3]); 30] = [
+    ("Black", [0, 0, 0]),
+    ("White", [255, 255, 255]),
+    ("Yellow", [255, 255, 23]),
+    ("Orange", [255, 102, 0]),
+    ("Olive Green", [47, 89, 51]),
+    ("Green", [35, 115, 54]),
+    ("Sky", [101, 194, 200]),
+    ("Purple", [171, 90, 150]),
+    ("Pink", [246, 105, 160]),
+    ("Red", [255, 0, 0]),
+    ("Brown", [177, 112, 78]),
+    ("Blue", [11, 47, 132]),
+    ("Gold", [228, 195, 93]),
+    ("Dark Brown", [72, 26, 5]),
+    ("Pale Violet", [172, 156, 199]),
+    ("Pale Yellow", [252, 242, 148]),
+    ("Pale Pink", [249, 153, 183]),
+    ("Peach", [250, 179, 129]),
+    ("Beige", [201, 164, 128]),
+    ("Wine Red", [151, 5, 51]),
+    ("Pale Sky", [160, 184, 204]),
+    ("Yellow Green", [127, 194, 28]),
+    ("Silver Grey", [229, 229, 229]),
+    ("Grey", [136, 155, 155]),
+    ("Pale Aqua", [152, 214, 189]),
+    ("Baby Blue", [178, 225, 227]),
+    ("Powder Blue", [54, 139, 160]),
+    ("Bright Blue", [79, 131, 171]),
+    ("Slate Blue", [56, 106, 145]),
+    ("Navy Blue", [7, 22, 80]),
+];
+
+fn jef_index(rgb: [u8; 3]) -> u32 {
+    let d = |c: [u8; 3]| -> i32 { (0..3).map(|k| (c[k] as i32 - rgb[k] as i32).pow(2)).sum() };
+    JEF_PALETTE
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (_, c))| d(*c))
+        .map(|(i, _)| i as u32 + 1)
+        .unwrap_or(1)
+}
+
+/// "YYYYMMDDHHMMSS" for the file header (a fixed date on the web, where
+/// there's no clock to ask).
+fn jef_date() -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Ok(t) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            let secs = t.as_secs() as i64;
+            let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+            // civil date from days since 1970-01-01
+            let z = days + 719468;
+            let era = z.div_euclid(146097);
+            let doe = z - era * 146097;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = doy - (153 * mp + 2) / 5 + 1;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+            return format!(
+                "{year:04}{month:02}{day:02}{:02}{:02}{:02}",
+                rem / 3600,
+                rem / 60 % 60,
+                rem % 60
+            );
+        }
+    }
+    "20260101120000".into()
+}
+
+pub fn write_jef(d: &Design) -> Vec<u8> {
+    let moves = machine_moves(d, true);
+    // ---- stitch block first, so the header can count it
+    let mut body = Vec::new();
+    let (mut cx, mut cy) = (0i32, 0i32);
+    let (mut minx, mut miny, mut maxx, mut maxy) = (0i32, 0i32, 0i32, 0i32);
+    let mut first_color = true;
+    for (cmd, x, y) in moves {
+        match cmd {
+            Cmd::Stitch(_) | Cmd::Jump(_) => {
+                minx = minx.min(x);
+                maxx = maxx.max(x);
+                miny = miny.min(y);
+                maxy = maxy.max(y);
+                let jump = matches!(cmd, Cmd::Jump(_));
+                loop {
+                    let dx = (x - cx).clamp(-127, 127);
+                    let dy = (y - cy).clamp(-127, 127);
+                    let done = cx + dx == x && cy + dy == y;
+                    if jump || !done {
+                        if dx == 0 && dy == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&[0x80, 0x02, dx as i8 as u8, dy as i8 as u8]);
+                    } else {
+                        body.extend_from_slice(&[dx as i8 as u8, dy as i8 as u8]);
+                    }
+                    cx += dx;
+                    cy += dy;
+                    if done {
+                        break;
+                    }
+                }
+            }
+            Cmd::Trim => body.extend_from_slice(&[0x80, 0x02, 0, 0]),
+            Cmd::Color(_) => {
+                if first_color {
+                    first_color = false;
+                } else {
+                    body.extend_from_slice(&[0x80, 0x01, 0, 0]);
+                }
+            }
+            Cmd::End => {}
+        }
+    }
+    body.extend_from_slice(&[0x80, 0x10]);
+
+    // ---- header
+    let colors: Vec<u32> = d.stops.iter().map(|s| jef_index(s.thread.rgb)).collect();
+    let n = colors.len().max(1);
+    let mut out = Vec::new();
+    let put = |out: &mut Vec<u8>, v: i32| out.extend_from_slice(&v.to_le_bytes());
+    put(&mut out, (116 + 8 * n) as i32);
+    put(&mut out, 0x14);
+    out.extend_from_slice(jef_date().as_bytes());
+    out.extend_from_slice(&[0, 0]);
+    put(&mut out, n as i32);
+    put(&mut out, (body.len() / 2) as i32);
+    // design extents from the centre: left, top, right, bottom
+    let ext = [-minx, maxy, maxx, -miny];
+    let (w, h) = (ext[0].max(ext[2]), ext[1].max(ext[3]));
+    // smallest standard hoop it fits (codes: 0 = 126×110, 1 = 110×110,
+    // 2 = 50×50, 3 = 140×200, 4 = 230×200)
+    let hoop = [(2, 250, 250), (1, 550, 550), (0, 630, 550), (3, 700, 1000), (4, 1150, 1000)]
+        .iter()
+        .find(|(_, hx, hy)| w <= *hx && h <= *hy)
+        .map(|(c, _, _)| *c)
+        .unwrap_or(4);
+    put(&mut out, hoop);
+    for v in ext {
+        put(&mut out, v);
+    }
+    for (hx, hy) in [(550, 550), (250, 250), (700, 1000), (1150, 1000)] {
+        if w <= hx && h <= hy {
+            for v in [hx - ext[0], hy - ext[1], hx - ext[2], hy - ext[3]] {
+                put(&mut out, v);
+            }
+        } else {
+            for _ in 0..4 {
+                put(&mut out, -1);
+            }
+        }
+    }
+    debug_assert_eq!(out.len(), 116);
+    for i in 0..n {
+        put(&mut out, colors.get(i).copied().unwrap_or(1) as i32);
+    }
+    for _ in 0..n {
+        put(&mut out, 0x0D);
+    }
+    out.extend(body);
+    out
+}
+
+pub fn read_jef(bytes: &[u8]) -> Result<MachineFile, String> {
+    if bytes.len() < 116 {
+        return Err("file too short to be JEF".into());
+    }
+    let u = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]) as usize;
+    let start = u(0);
+    let n = u(24);
+    if start > bytes.len() || n > 255 || 116 + 4 * n > bytes.len() {
+        return Err("not a JEF file (header doesn't add up)".into());
+    }
+    let table: Vec<Option<[u8; 3]>> = (0..n)
+        .map(|i| {
+            let idx = u(116 + 4 * i);
+            JEF_PALETTE.get(idx.wrapping_sub(1)).map(|(_, c)| *c)
+        })
+        .collect();
+    let mut cmds = vec![Cmd::Color(0)];
+    let mut stops = 1usize;
+    let (mut x, mut y) = (0i32, 0i32);
+    let at = |x: i32, y: i32| Pt::new(x as f64 / 10.0, -y as f64 / 10.0);
+    let mut i = start;
+    let mut jump_run = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0x80 {
+            let ctrl = bytes[i + 1];
+            if ctrl == 0x10 || i + 3 >= bytes.len() {
+                break;
+            }
+            let (dx, dy) = (bytes[i + 2] as i8 as i32, bytes[i + 3] as i8 as i32);
+            i += 4;
+            match ctrl {
+                0x01 => {
+                    x += dx;
+                    y += dy;
+                    if !matches!(cmds.last(), Some(Cmd::Trim)) {
+                        cmds.push(Cmd::Trim);
+                    }
+                    cmds.push(Cmd::Color(stops));
+                    stops += 1;
+                    jump_run = 0;
+                }
+                0x02 => {
+                    x += dx;
+                    y += dy;
+                    jump_run += 1;
+                    // a move of nothing, or a run of moves, is a trim
+                    if (dx == 0 && dy == 0 || jump_run == 2) && !matches!(cmds.last(), Some(Cmd::Trim)) {
+                        cmds.push(Cmd::Trim);
+                    }
+                    if dx != 0 || dy != 0 {
+                        cmds.push(Cmd::Jump(at(x, y)));
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            x += bytes[i] as i8 as i32;
+            y += bytes[i + 1] as i8 as i32;
+            i += 2;
+            jump_run = 0;
+            cmds.push(Cmd::Stitch(at(x, y)));
+        }
+    }
+    cmds.push(Cmd::End);
+    let mut stop_colors = table;
+    stop_colors.resize(stops, None);
+    Ok(MachineFile {
+        cmds,
+        stop_colors,
+        label: String::new(),
+        format: "JEF",
+    })
+}
+
 /// Read any supported stitch file by its extension.
 pub fn read_file(path: &std::path::Path) -> Result<MachineFile, String> {
     let bytes = crate::vfs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -557,10 +880,13 @@ pub fn read_file(path: &std::path::Path) -> Result<MachineFile, String> {
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_default();
     let mut f = match Format::from_ext(&ext) {
-        Some(Format::Dst) => read_dst(&bytes)?,
-        Some(Format::Exp) => read_exp(&bytes)?,
-        Some(Format::Pes) => read_pes(&bytes)?,
-        None => return Err(format!("{}: not a DST, EXP or PES file", path.display())),
+        Some(fmt) => read_bytes(&bytes, fmt)?,
+        None => {
+            return Err(format!(
+                "{}: not a stitch file StitchForge reads (DST, PES, PEC, EXP, JEF, TAP)",
+                path.display()
+            ))
+        }
     };
     if f.label.is_empty() {
         f.label = path
@@ -608,11 +934,7 @@ mod tests {
     fn check_round_trip(f: Format) {
         let d = sample();
         let bytes = write(&d, f);
-        let back = match f {
-            Format::Dst => read_dst(&bytes).unwrap(),
-            Format::Exp => read_exp(&bytes).unwrap(),
-            Format::Pes => read_pes(&bytes).unwrap(),
-        };
+        let back = read_bytes(&bytes, f).unwrap();
         let c = d.bbox.center();
         let want: Vec<(i32, i32)> = d
             .cmds
@@ -656,5 +978,31 @@ mod tests {
     #[test]
     fn pes_round_trip() {
         check_round_trip(Format::Pes);
+    }
+    #[test]
+    fn pec_round_trip() {
+        check_round_trip(Format::Pec);
+    }
+    #[test]
+    fn jef_round_trip() {
+        check_round_trip(Format::Jef);
+    }
+    #[test]
+    fn tap_round_trip() {
+        check_round_trip(Format::Tap);
+    }
+
+    #[test]
+    fn jef_header_adds_up() {
+        let d = sample();
+        let b = write_jef(&d);
+        let u = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as usize;
+        let colors = u(24);
+        assert_eq!(colors, d.stops.len());
+        assert_eq!(u(0), 116 + 8 * colors, "stitch data offset");
+        // the stitch block ends with the end code
+        assert_eq!(&b[b.len() - 2..], &[0x80, 0x10]);
+        // point count matches the 2-byte units after the header
+        assert_eq!(u(28), (b.len() - u(0)) / 2);
     }
 }

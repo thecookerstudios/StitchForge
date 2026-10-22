@@ -110,7 +110,7 @@ enum Command {
     },
     /// List installed font families
     Fonts,
-    /// Read a DST file and report what is in it
+    /// Read a stitch file (DST, PES, PEC, EXP, JEF, TAP) and report what is in it
     Inspect { file: PathBuf },
 }
 
@@ -146,7 +146,7 @@ struct OutputArgs {
     /// Base file name (defaults to the input name)
     #[arg(long)]
     name: Option<String>,
-    /// Machine formats to write, comma separated: dst, pes, exp
+    /// Machine formats to write, comma separated: dst, pes, exp, jef, tap, pec
     #[arg(long, default_value = "dst")]
     formats: String,
     /// Print a JSON summary (for scripts and AI agents)
@@ -426,7 +426,7 @@ fn produce(mut art: import::Artwork, name: &str, o: &OutputArgs) -> Result<(), S
             .split(',')
             .map(|f| {
                 stitchforge::formats::Format::from_ext(f.trim())
-                    .ok_or(format!("unknown format '{f}' (use dst, pes, exp)"))
+                    .ok_or(format!("unknown format '{f}' (use dst, pes, exp, jef, tap, pec)"))
             })
             .collect::<Result<_, _>>()?;
         let summary = export::write_formats(&d, &job, &o.out_dir, &generated, &fmts)?.summary;
