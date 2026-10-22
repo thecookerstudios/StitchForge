@@ -2882,6 +2882,7 @@ dependencies = [
  "i_overlay",
  "image",
  "lopdf",
+ "miniz_oxide 0.8.9",
  "resvg",
  "rfd",
  "serde",
