@@ -28,17 +28,23 @@ pub enum Format {
     Pec,
     Jef,
     Tap,
+    Vp3,
+    Xxx,
+    U01,
 }
 
 /// File extensions StitchForge can open as stitch files.
-pub const READ_EXTS: [&str; 6] = ["dst", "exp", "pes", "pec", "jef", "tap"];
+pub const READ_EXTS: [&str; 9] = ["dst", "exp", "pes", "pec", "jef", "tap", "vp3", "xxx", "u01"];
 
 impl Format {
-    pub const ALL: [Format; 6] = [
+    pub const ALL: [Format; 9] = [
         Format::Dst,
         Format::Pes,
         Format::Exp,
         Format::Jef,
+        Format::Vp3,
+        Format::Xxx,
+        Format::U01,
         Format::Tap,
         Format::Pec,
     ];
@@ -50,6 +56,9 @@ impl Format {
             Format::Pec => "pec",
             Format::Jef => "jef",
             Format::Tap => "tap",
+            Format::Vp3 => "vp3",
+            Format::Xxx => "xxx",
+            Format::U01 => "u01",
         }
     }
     pub fn label(&self) -> &'static str {
@@ -60,6 +69,9 @@ impl Format {
             Format::Pec => "PEC (older Brother / Babylock)",
             Format::Jef => "JEF (Janome / Elna / Kenmore)",
             Format::Tap => "TAP (Happy)",
+            Format::Vp3 => "VP3 (Husqvarna Viking / Pfaff)",
+            Format::Xxx => "XXX (Singer)",
+            Format::U01 => "U01 (Barudan)",
         }
     }
     pub fn from_ext(ext: &str) -> Option<Format> {
@@ -70,6 +82,9 @@ impl Format {
             "pec" => Some(Format::Pec),
             "jef" => Some(Format::Jef),
             "tap" => Some(Format::Tap),
+            "vp3" => Some(Format::Vp3),
+            "xxx" => Some(Format::Xxx),
+            "u01" => Some(Format::U01),
             _ => None,
         }
     }
@@ -83,6 +98,9 @@ pub fn write(d: &Design, f: Format) -> Vec<u8> {
         Format::Pec => write_pec(d),
         Format::Jef => write_jef(d),
         Format::Tap => write_tap(d),
+        Format::Vp3 => write_vp3(d),
+        Format::Xxx => write_xxx(d),
+        Format::U01 => write_u01(d),
     }
 }
 
@@ -95,6 +113,9 @@ pub fn read_bytes(bytes: &[u8], f: Format) -> Result<MachineFile, String> {
         Format::Pec => read_pec(bytes),
         Format::Jef => read_jef(bytes),
         Format::Tap => read_tap(bytes),
+        Format::Vp3 => read_vp3(bytes),
+        Format::Xxx => read_xxx(bytes),
+        Format::U01 => read_u01(bytes),
     }
 }
 
@@ -872,6 +893,583 @@ pub fn read_jef(bytes: &[u8]) -> Result<MachineFile, String> {
     })
 }
 
+// ------------------------------------------------------------------ shared
+
+/// Split a move into equal steps no longer than `max` units on either axis.
+fn steps(dx: i32, dy: i32, max: i32) -> Vec<(i32, i32)> {
+    let n = ((dx.abs().max(dy.abs()) + max - 1) / max).max(1);
+    let mut out = Vec::with_capacity(n as usize);
+    let (mut px, mut py) = (0, 0);
+    for k in 1..=n {
+        let x = (dx as f64 * k as f64 / n as f64).round() as i32;
+        let y = (dy as f64 * k as f64 / n as f64).round() as i32;
+        out.push((x - px, y - py));
+        px = x;
+        py = y;
+    }
+    out
+}
+
+/// Extents of the stitched and moved-to points (machine units, as given).
+fn extents(moves: &[(Cmd, i32, i32)]) -> (i32, i32, i32, i32) {
+    let (mut minx, mut miny, mut maxx, mut maxy) = (0, 0, 0, 0);
+    for (c, x, y) in moves {
+        if matches!(c, Cmd::Stitch(_) | Cmd::Jump(_)) {
+            minx = minx.min(*x);
+            miny = miny.min(*y);
+            maxx = maxx.max(*x);
+            maxy = maxy.max(*y);
+        }
+    }
+    (minx, miny, maxx, maxy)
+}
+
+// ------------------------------------------------------------------ U01
+
+/// Barudan U01: 3-byte records (control, |dy|, |dx|) after a 256-byte header.
+pub fn write_u01(d: &Design) -> Vec<u8> {
+    let moves = machine_moves(d, true);
+    let mut recs: Vec<[u8; 3]> = vec![[0xE9, 0, 0]]; // needle 1
+    let (mut cx, mut cy) = (0i32, 0i32);
+    let mut stop = 0usize;
+    let rec = |dx: i32, dy: i32, jump: bool| -> [u8; 3] {
+        let mut c = 0x80u8;
+        if dy <= 0 {
+            c |= 0x40;
+        }
+        if dx < 0 || (dx == 0 && dy == 0) {
+            c |= 0x20;
+        }
+        if jump {
+            c |= 0x01;
+        }
+        [c, dy.unsigned_abs() as u8, dx.unsigned_abs() as u8]
+    };
+    for (cmd, x, y) in &moves {
+        match cmd {
+            Cmd::Stitch(_) | Cmd::Jump(_) => {
+                let jump = matches!(cmd, Cmd::Jump(_));
+                if jump && *x == cx && *y == cy {
+                    continue;
+                }
+                let st = steps(x - cx, y - cy, 127);
+                let n = st.len();
+                for (i, (dx, dy)) in st.into_iter().enumerate() {
+                    recs.push(rec(dx, dy, jump || i + 1 < n));
+                }
+                cx = *x;
+                cy = *y;
+            }
+            Cmd::Trim => recs.push([0xE7, 0, 0]),
+            Cmd::Color(i) => {
+                if *i > 0 && stop != *i {
+                    stop = *i;
+                    recs.push([0xE8 + (stop % 7) as u8 + 1, 0, 0]);
+                }
+            }
+            Cmd::End => {}
+        }
+    }
+    recs.push([0xF8, 0, 0]);
+    let (minx, miny, maxx, maxy) = extents(&moves);
+    let mut out = vec![0x30u8; 0x80];
+    for v in [minx, miny, maxx, maxy] {
+        out.extend_from_slice(&(v as i16).to_le_bytes());
+    }
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(recs.len() as u32 + 1).to_le_bytes());
+    out.extend_from_slice(&(cx as i16).to_le_bytes());
+    out.extend_from_slice(&(cy as i16).to_le_bytes());
+    out.resize(0x100, 0);
+    for r in recs {
+        out.extend_from_slice(&r);
+    }
+    out
+}
+
+pub fn read_u01(bytes: &[u8]) -> Result<MachineFile, String> {
+    if bytes.len() < 0x100 {
+        return Err("file too short to be U01".into());
+    }
+    let mut cmds = vec![Cmd::Color(0)];
+    let mut stops = 1usize;
+    let (mut x, mut y) = (0i32, 0i32);
+    let at = |x: i32, y: i32| Pt::new(x as f64 / 10.0, -y as f64 / 10.0);
+    let mut seen_needle = false;
+    let mut jump_run = 0;
+    for r in bytes[0x100..].chunks_exact(3) {
+        let c = r[0];
+        if c == 0xF8 {
+            break;
+        }
+        let code = c & 0x0F;
+        if code >= 0x08 {
+            // needle change: the first one just picks the starting needle
+            if seen_needle || cmds.iter().any(|c| matches!(c, Cmd::Stitch(_))) {
+                if !matches!(cmds.last(), Some(Cmd::Trim)) {
+                    cmds.push(Cmd::Trim);
+                }
+                cmds.push(Cmd::Color(stops));
+                stops += 1;
+            }
+            seen_needle = true;
+            jump_run = 0;
+            continue;
+        }
+        if code == 0x07 {
+            if !matches!(cmds.last(), Some(Cmd::Trim)) {
+                cmds.push(Cmd::Trim);
+            }
+            continue;
+        }
+        let mut dy = r[1] as i32;
+        let mut dx = r[2] as i32;
+        if c & 0x40 != 0 {
+            dy = -dy;
+        }
+        if c & 0x20 != 0 {
+            dx = -dx;
+        }
+        x += dx;
+        y += dy;
+        if code == 0x01 {
+            jump_run += 1;
+            if jump_run == 3 && !matches!(cmds.last(), Some(Cmd::Trim)) {
+                cmds.push(Cmd::Trim);
+            }
+            cmds.push(Cmd::Jump(at(x, y)));
+        } else {
+            jump_run = 0;
+            cmds.push(Cmd::Stitch(at(x, y)));
+        }
+    }
+    cmds.push(Cmd::End);
+    Ok(MachineFile {
+        cmds,
+        stop_colors: vec![None; stops],
+        label: String::new(),
+        format: "U01",
+    })
+}
+
+// ------------------------------------------------------------------ XXX
+
+/// Singer XXX: byte-pair stitches after a 256-byte header, 0x7F escapes,
+/// with a colour table at the end.
+pub fn write_xxx(d: &Design) -> Vec<u8> {
+    let moves = machine_moves(d, true);
+    let mut body = Vec::new();
+    let mut count = 0u32;
+    let (mut cx, mut cy) = (0i32, 0i32);
+    let mut first_color = true;
+    for (cmd, x, y) in &moves {
+        match cmd {
+            Cmd::Stitch(_) | Cmd::Jump(_) => {
+                let jump = matches!(cmd, Cmd::Jump(_));
+                if jump && *x == cx && *y == cy {
+                    continue;
+                }
+                let st = steps(x - cx, y - cy, 126);
+                let n = st.len();
+                for (i, (dx, dy)) in st.into_iter().enumerate() {
+                    if jump || i + 1 < n {
+                        body.extend_from_slice(&[0x7F, 0x01, dx as i8 as u8, dy as i8 as u8]);
+                    } else {
+                        body.extend_from_slice(&[dx as i8 as u8, dy as i8 as u8]);
+                    }
+                    count += 1;
+                }
+                cx = *x;
+                cy = *y;
+            }
+            Cmd::Trim => {
+                body.extend_from_slice(&[0x7F, 0x03, 0, 0]);
+                count += 1;
+            }
+            Cmd::Color(_) => {
+                if first_color {
+                    first_color = false;
+                } else {
+                    body.extend_from_slice(&[0x7F, 0x08, 0, 0]);
+                    count += 1;
+                }
+            }
+            Cmd::End => {}
+        }
+    }
+    let (minx, miny, maxx, maxy) = extents(&moves);
+    let n = d.stops.len().max(1);
+    let mut out = vec![0u8; 0x17];
+    out.extend_from_slice(&count.to_le_bytes());
+    out.resize(0x27, 0);
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    out.resize(0x2D, 0);
+    // width, height, last position, distance left of and below the start
+    for v in [maxx - minx, maxy - miny, cx, cy, -minx, -miny] {
+        out.extend_from_slice(&(v as i16).to_le_bytes());
+    }
+    out.resize(0xF2, 0);
+    out.extend_from_slice(&0x20u16.to_le_bytes());
+    out.resize(0xFC, 0);
+    let table = 0x100 + body.len();
+    out.extend_from_slice(&(table as u32).to_le_bytes());
+    out.extend(body);
+    out.extend_from_slice(&[0x7F, 0x7F, 0x02, 0x14, 0, 0]);
+    for i in 0..n.max(21) {
+        match d.stops.get(i) {
+            Some(s) => out.extend_from_slice(&[0, s.thread.rgb[0], s.thread.rgb[1], s.thread.rgb[2]]),
+            None => out.extend_from_slice(&[0, 0, 0, 0]),
+        }
+    }
+    out.extend_from_slice(&[0, 0xFF, 0xFF, 0xFF, 0, 1]);
+    out
+}
+
+pub fn read_xxx(bytes: &[u8]) -> Result<MachineFile, String> {
+    if bytes.len() < 0x100 {
+        return Err("file too short to be XXX".into());
+    }
+    let n = u16::from_le_bytes([bytes[0x27], bytes[0x28]]) as usize;
+    let table = u32::from_le_bytes([bytes[0xFC], bytes[0xFD], bytes[0xFE], bytes[0xFF]]) as usize;
+    let end = if table > 0x100 && table <= bytes.len() { table } else { bytes.len() };
+    let mut cmds = vec![Cmd::Color(0)];
+    let mut stops = 1usize;
+    let (mut x, mut y) = (0i32, 0i32);
+    let at = |x: i32, y: i32| Pt::new(x as f64 / 10.0, -y as f64 / 10.0);
+    let mut i = 0x100;
+    let mut jump_run = 0;
+    while i + 1 < end {
+        if bytes[i] == 0x7F {
+            let ctrl = bytes[i + 1];
+            if ctrl == 0x7F || i + 3 >= bytes.len() {
+                break;
+            }
+            let (dx, dy) = (bytes[i + 2] as i8 as i32, bytes[i + 3] as i8 as i32);
+            i += 4;
+            match ctrl {
+                0x01 => {
+                    x += dx;
+                    y += dy;
+                    jump_run += 1;
+                    if jump_run == 3 && !matches!(cmds.last(), Some(Cmd::Trim)) {
+                        cmds.push(Cmd::Trim);
+                    }
+                    cmds.push(Cmd::Jump(at(x, y)));
+                }
+                0x03 => {
+                    if !matches!(cmds.last(), Some(Cmd::Trim)) {
+                        cmds.push(Cmd::Trim);
+                    }
+                }
+                0x08 | 0x0A..=0x17 => {
+                    if !matches!(cmds.last(), Some(Cmd::Trim)) {
+                        cmds.push(Cmd::Trim);
+                    }
+                    cmds.push(Cmd::Color(stops));
+                    stops += 1;
+                    jump_run = 0;
+                }
+                _ => {}
+            }
+        } else {
+            x += bytes[i] as i8 as i32;
+            y += bytes[i + 1] as i8 as i32;
+            i += 2;
+            jump_run = 0;
+            cmds.push(Cmd::Stitch(at(x, y)));
+        }
+    }
+    cmds.push(Cmd::End);
+    // colour table: end code, two bytes, then 00 rr gg bb per colour
+    let mut stop_colors: Vec<Option<[u8; 3]>> = Vec::new();
+    if table + 6 + 4 * n <= bytes.len() && bytes[table] == 0x7F {
+        for k in 0..n {
+            let o = table + 6 + 4 * k;
+            stop_colors.push(Some([bytes[o + 1], bytes[o + 2], bytes[o + 3]]));
+        }
+    }
+    stop_colors.resize(stops, None);
+    Ok(MachineFile {
+        cmds,
+        stop_colors,
+        label: String::new(),
+        format: "XXX",
+    })
+}
+
+// ------------------------------------------------------------------ VP3
+
+const VP3_PRODUCER: &str = "Produced by     Software Ltd";
+
+fn vp3_str16(out: &mut Vec<u8>, s: &str) {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    out.extend_from_slice(&((units.len() * 2) as u16).to_be_bytes());
+    for u in units {
+        out.extend_from_slice(&u.to_be_bytes());
+    }
+}
+
+fn vp3_str8(out: &mut Vec<u8>, s: &str) {
+    let b: Vec<u8> = s.chars().filter(|c| c.is_ascii()).map(|c| c as u8).take(255).collect();
+    out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+    out.extend(b);
+}
+
+fn be32(out: &mut Vec<u8>, v: i32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+/// Husqvarna Viking / Pfaff VP3: big-endian nested blocks, positions in
+/// 1/1000 mm (y up), stitches as byte pairs in 0.1 mm (y down), one block
+/// per colour. There is no jump code: a move is a long stitch, and after a
+/// trim the machine travels to the next stitch.
+pub fn write_vp3(d: &Design) -> Vec<u8> {
+    let moves = machine_moves(d, false); // y down, 0.1 mm
+    // ---- split into colour blocks: (start, stitch bytes, end, colour)
+    struct Block {
+        start: (i32, i32),
+        end: (i32, i32),
+        data: Vec<u8>,
+        stop: usize,
+    }
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut count = 0i32;
+    let (mut cx, mut cy) = (0i32, 0i32);
+    let mut cur: Option<Block> = None;
+    let mut pending_move = false;
+    for (cmd, x, y) in &moves {
+        match cmd {
+            Cmd::Color(i) => {
+                if let Some(b) = cur.take() {
+                    blocks.push(b);
+                }
+                count += if *i > 0 { 1 } else { 0 };
+                cur = Some(Block {
+                    start: (cx, cy),
+                    end: (cx, cy),
+                    data: vec![0x0A, 0xF6, 0x00],
+                    stop: *i,
+                });
+            }
+            Cmd::Jump(_) => pending_move = true,
+            Cmd::Stitch(_) => {
+                let Some(b) = cur.as_mut() else { continue };
+                if b.data.len() == 3 && !pending_move {
+                    b.start = (cx, cy);
+                }
+                if b.data.len() == 3 && pending_move {
+                    // a block starts where its first stitch is
+                    b.start = (*x, *y);
+                    cx = *x;
+                    cy = *y;
+                }
+                pending_move = false;
+                let (dx, dy) = (x - cx, y - cy);
+                if (-127..=127).contains(&dx) && (-127..=127).contains(&dy) {
+                    b.data.extend_from_slice(&[dx as i8 as u8, dy as i8 as u8]);
+                } else {
+                    b.data.extend_from_slice(&[0x80, 0x01]);
+                    b.data.extend_from_slice(&(dx as i16).to_be_bytes());
+                    b.data.extend_from_slice(&(dy as i16).to_be_bytes());
+                    b.data.extend_from_slice(&[0x80, 0x02]);
+                }
+                count += 1;
+                cx = *x;
+                cy = *y;
+                b.end = (cx, cy);
+            }
+            Cmd::Trim => {
+                if let Some(b) = cur.as_mut() {
+                    if b.data.len() > 3 && !b.data.ends_with(&[0x80, 0x03]) {
+                        b.data.extend_from_slice(&[0x80, 0x03]);
+                        count += 1;
+                    }
+                }
+            }
+            Cmd::End => {}
+        }
+    }
+    if let Some(b) = cur.take() {
+        blocks.push(b);
+    }
+    blocks.retain(|b| b.data.len() > 3);
+    if let Some(b) = blocks.last_mut()
+        && !b.data.ends_with(&[0x80, 0x03])
+    {
+        b.data.extend_from_slice(&[0x80, 0x03]);
+    }
+    let (minx, miny, maxx, maxy) = extents(&moves);
+    // µm, y up
+    let (right, top, left, bottom) = (maxx * 100, -miny * 100, minx * 100, -maxy * 100);
+    let (ccx, ccy) = ((left + right) / 2, (top + bottom) / 2);
+    let (w, h) = (right - left, top - bottom);
+
+    // ---- innermost: design block
+    let mut design = Vec::new();
+    be32(&mut design, ccx);
+    be32(&mut design, ccy);
+    design.extend_from_slice(&[0, 0, 0]);
+    for v in [-w / 2, w / 2, -h / 2, h / 2, w, h] {
+        be32(&mut design, v);
+    }
+    design.extend_from_slice(&[
+        0x00, 0x00, 0x64, 0x64, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x10, 0x00, 0x78, 0x78, 0x50, 0x50, 0x01, 0x00,
+    ]);
+    vp3_str16(&mut design, VP3_PRODUCER);
+    design.extend_from_slice(&(blocks.len() as u16).to_be_bytes());
+    for b in &blocks {
+        let mut blk = Vec::new();
+        let (sx, sy) = (b.start.0 * 100, -b.start.1 * 100);
+        be32(&mut blk, sx - ccx);
+        be32(&mut blk, sy - ccy);
+        let thread = d.stops.get(b.stop).map(|s| s.thread.clone());
+        let rgb = thread.as_ref().map(|t| t.rgb).unwrap_or([0, 0, 0]);
+        blk.extend_from_slice(&[1, 0, rgb[0], rgb[1], rgb[2], 0, 0, 0, 5, 0x28]);
+        vp3_str8(&mut blk, thread.as_ref().map(|t| t.code.as_str()).unwrap_or(""));
+        vp3_str8(&mut blk, thread.as_ref().map(|t| t.name.as_str()).unwrap_or(""));
+        vp3_str8(&mut blk, thread.as_ref().map(|t| t.brand.as_str()).unwrap_or(""));
+        be32(&mut blk, (b.end.0 - b.start.0) * 100);
+        be32(&mut blk, -(b.end.1 - b.start.1) * 100);
+        blk.extend_from_slice(&[0, 1, 0]);
+        be32(&mut blk, b.data.len() as i32);
+        blk.extend_from_slice(&b.data);
+        blk.push(0);
+        design.extend_from_slice(&[0, 5, 0]);
+        be32(&mut design, blk.len() as i32);
+        design.extend(blk);
+    }
+
+    // ---- middle: file block
+    let mut file = Vec::new();
+    vp3_str16(&mut file, ""); // settings
+    for v in [right, top, left, bottom, count] {
+        be32(&mut file, v);
+    }
+    file.extend_from_slice(&(blocks.len() as u16).to_be_bytes());
+    file.extend_from_slice(&[0x0C, 0x00, 0x01, 0x00, 0x03, 0x00]);
+    be32(&mut file, design.len() as i32);
+    file.extend(design);
+
+    let mut out = b"%vsm%\0".to_vec();
+    vp3_str16(&mut out, VP3_PRODUCER);
+    out.extend_from_slice(&[0, 2, 0]);
+    be32(&mut out, file.len() as i32);
+    out.extend(file);
+    out
+}
+
+pub fn read_vp3(bytes: &[u8]) -> Result<MachineFile, String> {
+    if bytes.len() < 0x60 || &bytes[0..5] != b"%vsm%" {
+        return Err("not a VP3 file".into());
+    }
+    let bad = || "VP3 file is damaged or a kind StitchForge doesn't know".to_string();
+    let u16be = |o: usize| -> Option<usize> { Some(u16::from_be_bytes([*bytes.get(o)?, *bytes.get(o + 1)?]) as usize) };
+    let i32be = |o: usize| -> Option<i32> {
+        Some(i32::from_be_bytes([*bytes.get(o)?, *bytes.get(o + 1)?, *bytes.get(o + 2)?, *bytes.get(o + 3)?]))
+    };
+    let mut p = 6;
+    p += 2 + u16be(p).ok_or_else(bad)?; // producer
+    p += 3 + 4; // file block tag and length
+    p += 2 + u16be(p).ok_or_else(bad)?; // settings
+    p += 16 + 4; // extents, count
+    p += 2 + 6 + 4; // colours, fixed bytes, design block length
+    let ccx = i32be(p).ok_or_else(bad)?;
+    let ccy = i32be(p + 4).ok_or_else(bad)?;
+    p += 8 + 3 + 24 + 26;
+    p += 2 + u16be(p).ok_or_else(bad)?; // producer again
+    let n = u16be(p).ok_or_else(bad)?;
+    p += 2;
+    let mut cmds = Vec::new();
+    let mut stop_colors = Vec::new();
+    let at = |x: i32, y: i32| Pt::new(x as f64 / 10.0, y as f64 / 10.0);
+    for k in 0..n {
+        if bytes.get(p..p + 3) != Some(&[0, 5, 0]) {
+            if k == 0 {
+                return Err(bad());
+            }
+            break;
+        }
+        let blen = i32be(p + 3).ok_or_else(bad)? as usize;
+        let b0 = p + 7;
+        let bend = (b0 + blen).min(bytes.len());
+        // start, in µm from the design centre, y up → 0.1 mm, y down
+        let sx = ((i32be(b0).ok_or_else(bad)? + ccx) as f64 / 100.0).round() as i32;
+        let sy = (-(i32be(b0 + 4).ok_or_else(bad)? + ccy) as f64 / 100.0).round() as i32;
+        let rgb = bytes.get(b0 + 10..b0 + 13).map(|c| [c[0], c[1], c[2]]);
+        stop_colors.push(rgb);
+        // the stitch data runs up to the block's last byte
+        let mut data = None;
+        for q in b0 + 8..bend.saturating_sub(8) {
+            if bytes[q..q + 3] == [0, 1, 0]
+                && let Some(len) = i32be(q + 3)
+                && q + 7 + len as usize + 1 == bend
+            {
+                data = Some((q + 7, q + 7 + len as usize));
+                break;
+            }
+        }
+        let Some((d0, d1)) = data else { return Err(bad()) };
+        cmds.push(Cmd::Color(k));
+        let (mut x, mut y) = (sx, sy);
+        cmds.push(Cmd::Jump(at(x, y)));
+        let mut i = d0 + 3; // skip 0A F6 00
+        let mut after_trim = false;
+        while i + 1 < d1 {
+            let b = bytes[i];
+            if b == 0x80 {
+                match bytes[i + 1] {
+                    0x01 if i + 5 < d1 => {
+                        let dx = i16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as i32;
+                        let dy = i16::from_be_bytes([bytes[i + 4], bytes[i + 5]]) as i32;
+                        i += 6;
+                        x += dx;
+                        y += dy;
+                        // a long move: travel there, then the stitch lands
+                        if after_trim || dx.abs().max(dy.abs()) > 127 {
+                            cmds.push(Cmd::Jump(at(x, y)));
+                        }
+                        cmds.push(Cmd::Stitch(at(x, y)));
+                        after_trim = false;
+                    }
+                    0x03 => {
+                        i += 2;
+                        if !matches!(cmds.last(), Some(Cmd::Trim)) {
+                            cmds.push(Cmd::Trim);
+                        }
+                        after_trim = true;
+                    }
+                    _ => i += 2,
+                }
+                continue;
+            }
+            x += b as i8 as i32;
+            y += bytes[i + 1] as i8 as i32;
+            i += 2;
+            if after_trim {
+                // the machine travels to the first stitch after a trim
+                cmds.push(Cmd::Jump(at(x, y)));
+                after_trim = false;
+            }
+            cmds.push(Cmd::Stitch(at(x, y)));
+        }
+        if !matches!(cmds.last(), Some(Cmd::Trim)) {
+            cmds.push(Cmd::Trim);
+        }
+        p = bend;
+    }
+    if cmds.is_empty() {
+        return Err(bad());
+    }
+    cmds.push(Cmd::End);
+    Ok(MachineFile {
+        cmds,
+        stop_colors,
+        label: String::new(),
+        format: "VP3",
+    })
+}
+
 /// Read any supported stitch file by its extension.
 pub fn read_file(path: &std::path::Path) -> Result<MachineFile, String> {
     let bytes = crate::vfs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -883,7 +1481,7 @@ pub fn read_file(path: &std::path::Path) -> Result<MachineFile, String> {
         Some(fmt) => read_bytes(&bytes, fmt)?,
         None => {
             return Err(format!(
-                "{}: not a stitch file StitchForge reads (DST, PES, PEC, EXP, JEF, TAP)",
+                "{}: not a stitch file StitchForge reads (DST, PES, PEC, EXP, JEF, VP3, XXX, U01, TAP)",
                 path.display()
             ))
         }
@@ -986,6 +1584,18 @@ mod tests {
     #[test]
     fn jef_round_trip() {
         check_round_trip(Format::Jef);
+    }
+    #[test]
+    fn vp3_round_trip() {
+        check_round_trip(Format::Vp3);
+    }
+    #[test]
+    fn xxx_round_trip() {
+        check_round_trip(Format::Xxx);
+    }
+    #[test]
+    fn u01_round_trip() {
+        check_round_trip(Format::U01);
     }
     #[test]
     fn tap_round_trip() {

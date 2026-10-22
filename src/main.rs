@@ -146,7 +146,7 @@ struct OutputArgs {
     /// Base file name (defaults to the input name)
     #[arg(long)]
     name: Option<String>,
-    /// Machine formats to write, comma separated: dst, pes, exp, jef, tap, pec
+    /// Machine formats to write, comma separated: dst, pes, exp, jef, vp3, xxx, u01, tap, pec
     #[arg(long, default_value = "dst")]
     formats: String,
     /// Print a JSON summary (for scripts and AI agents)
@@ -426,7 +426,7 @@ fn produce(mut art: import::Artwork, name: &str, o: &OutputArgs) -> Result<(), S
             .split(',')
             .map(|f| {
                 stitchforge::formats::Format::from_ext(f.trim())
-                    .ok_or(format!("unknown format '{f}' (use dst, pes, exp, jef, tap, pec)"))
+                    .ok_or(format!("unknown format '{f}' (use dst, pes, exp, jef, vp3, xxx, u01, tap, pec)"))
             })
             .collect::<Result<_, _>>()?;
         let summary = export::write_formats(&d, &job, &o.out_dir, &generated, &fmts)?.summary;

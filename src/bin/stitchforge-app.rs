@@ -287,7 +287,7 @@ struct App {
     title: String,
     machine: Option<MachineDoc>,
     show_export: bool,
-    export_fmts: [bool; 6],
+    export_fmts: [bool; 9],
 
     // name drops
     tab: Tab,
@@ -396,7 +396,7 @@ impl App {
             title: String::new(),
             machine: None,
             show_export: false,
-            export_fmts: [true, false, false, false, false, false],
+            export_fmts: [true, false, false, false, false, false, false, false, false],
             tab: Tab::Design,
             drops: DropSetup::default(),
             drop_view: 0,
@@ -1959,12 +1959,12 @@ impl App {
             &[
                 (
                     "Everything StitchForge opens",
-                    &["sfg", "json", "svg", "pdf", "ai", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "dst", "exp", "pes", "pec", "jef", "tap"],
+                    &["sfg", "json", "svg", "pdf", "ai", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "dst", "exp", "pes", "pec", "jef", "vp3", "xxx", "u01", "tap"],
                 ),
                 ("StitchForge project", &["sfg", "json"]),
                 ("Artwork (SVG, PDF, AI)", &["svg", "pdf", "ai"]),
                 ("Pictures and mockups (auto-traced)", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"]),
-                ("Stitch files (DST, PES, PEC, EXP, JEF, TAP)", &formats::READ_EXTS),
+                ("Stitch files (DST, PES, PEC, EXP, JEF, VP3, XXX, U01, TAP)", &formats::READ_EXTS),
             ],
             self.last_dir.as_ref(),
         );

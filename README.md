@@ -1,7 +1,7 @@
 # StitchForge v0.14 — embroidery app
 
 Vector art, PDFs, pictures (PNG/JPG, even mockup photos) and any-font text
-in; machine-ready DST, PES, PEC, EXP, JEF or TAP, a printable operator
+in; machine-ready DST, PES, PEC, EXP, JEF, VP3, XXX, U01 or TAP, a printable operator
 spec sheet, and a stitch preview out. Written in Rust, runs on Windows,
 macOS and Linux from the same code.
 
@@ -31,7 +31,7 @@ this folder for next time. If Windows SmartScreen warns about the .bat, click
 **Files.** File menu or the top bar:
 - **Open…** (Cmd/Ctrl+O) opens a StitchForge project (`.sfg`), artwork (SVG,
   PDF, AI), a picture (PNG, JPG, BMP, GIF, WebP, TIFF) or a machine file (DST,
-  PES, PEC, EXP, JEF, TAP). Dropping a file on the window works too (art or a picture
+  PES, PEC, EXP, JEF, VP3, XXX, U01, TAP). Dropping a file on the window works too (art or a picture
   dropped onto an open design is added as new layers).
 - **Vector PDF / AI files** open straight into layers: fills, strokes, CMYK
   and spot colours (Pantone names become the layer names). A page-sized
@@ -107,9 +107,10 @@ height. Shift snaps to 15°.
   • (unsaved changes) show in the window title. New, Open and quitting ask
   before discarding unsaved work.
 - **Export…** (Cmd/Ctrl+E): pick any of DST (Tajima), PES and PEC
-  (Brother/Babylock), EXP (Melco/Bernina), JEF (Janome/Elna) and TAP
-  (Happy); the operator sheet, stops CSV and preview always come along.
-- **Opened stitch files** (DST, PES, PEC, EXP, JEF, TAP) open as read-only
+  (Brother/Babylock), EXP (Melco/Bernina), JEF (Janome/Elna), VP3
+  (Husqvarna Viking/Pfaff), XXX (Singer), U01 (Barudan) and TAP (Happy); the
+  operator sheet, stops CSV and preview always come along.
+- **Opened stitch files** (any of those nine) open as read-only
   stitches: pick the thread for each stop, play the sew-out, print the
   sheet, or export to another format (e.g. DST → JEF).
 - **Convert to editable shapes** (button at the top of an opened stitch
@@ -330,7 +331,7 @@ stitchforge sampler --formats dst,pes
 stitchforge drops team.sfg --data roster.xlsx --columns "First Name,Last Name" \
   --case upper --heads 6 --per-drop 12 --max-width-in 3.5 --formats dst,pes -o drops
 
-# What's in any DST/PES/PEC/EXP/JEF/TAP
+# What's in any stitch file (DST, PES, PEC, EXP, JEF, VP3, XXX, U01, TAP)
 stitchforge inspect design.jef
 
 # A picture, mockup photo or PDF to stitches (auto-traced)
@@ -395,16 +396,16 @@ Options: `--profile flat|cap|both`, `--fabric pique|tshirt|fleece|twill|cap|towe
   every possible move).
 - DST output cross-checked with the independent open-source reader
   pyembroidery: stitch, colour-change and trim counts match exactly.
-- v0.14: DST, PES, PEC, EXP, JEF and TAP written by StitchForge all read back
-  in pyembroidery with the same 10,993 stitches, 6 colours and size; JEF,
-  PEC, PES and EXP files written by pyembroidery read back in StitchForge
-  the same way.
+- v0.14: all nine formats written by StitchForge read back in pyembroidery
+  with the same 10,993 stitches, 6 colours (U01: 6 needle changes) and size;
+  JEF, PEC, PES, EXP, VP3, XXX and U01 files written by pyembroidery read back
+  in StitchForge the same way.
 
 ## Not yet (next steps)
 
 - Stitch on real fabric and tune recipes — that is Gate 1 in the spec.
 - Satin that turns smoothly along curves (now: up to two angles per letter).
-- More formats on request (VP3, XXX, …).
+- Read-only formats from more machines (DSB/DSZ, Toyota 10o, Pfaff KSM…).
 - Tracing: gradients and photos with shading (now: flat colours only),
   reading text in a picture and offering it as editable lettering.
 - Desktop UI (Tauri), MCP server for AI agents, job/production database.
