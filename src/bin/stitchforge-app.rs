@@ -242,6 +242,12 @@ struct App {
     pro: bool,
     chart: Vec<thread::Thread>,
     chart_name: String,
+    /// Manufacturer and licence notes of the loaded library.
+    chart_note: String,
+    /// Library files found in the library folder.
+    libraries: Vec<PathBuf>,
+    /// Placeholder rope texture for the 3D view, made once on first use.
+    rope_tex: Option<egui::TextureHandle>,
 
     // text tool
     show_text: bool,
@@ -364,6 +370,9 @@ impl App {
             pro: false,
             chart: thread::generic_chart(),
             chart_name: "Generic 40wt".into(),
+            chart_note: "Built-in generic 40 wt palette, made for StitchForge.".into(),
+            libraries: thread::scan_libraries(&thread::library_dir()),
+            rope_tex: None,
             show_text: false,
             text: "Sunny Hill".into(),
             font: "Arial".into(),
@@ -750,6 +759,23 @@ impl App {
 
     /// Pictures of the appliqué pieces (twill look), re-made when the design
     /// or zoom changes.
+    /// The placeholder rope texture, made on first use and repeated across
+    /// the tile edges so it can be shrunk to thread size.
+    fn rope_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
+        if self.rope_tex.is_none() {
+            let n = stitchforge::texture::TILE;
+            let px = stitchforge::texture::rope_tile();
+            let img = egui::ColorImage::from_rgba_unmultiplied([n, n], &px);
+            let opts = egui::TextureOptions {
+                wrap_mode: egui::TextureWrapMode::Repeat,
+                mipmap_mode: Some(egui::TextureFilter::Linear),
+                ..egui::TextureOptions::LINEAR
+            };
+            self.rope_tex = Some(ctx.load_texture("rope-placeholder", img, opts));
+        }
+        self.rope_tex.as_ref().map(|t| t.id())
+    }
+
     fn refresh_piece_textures(&mut self, ctx: &egui::Context) {
         use std::hash::{Hash, Hasher};
         let Some(d) = &self.design else {
@@ -2028,10 +2054,17 @@ impl App {
                 }
             }
             Want::Names => self.load_names_path(p),
-            Want::Chart => match thread::load_chart_csv(&p.to_string_lossy()) {
-                Ok(c) => {
-                    self.chart_name = p.file_stem().unwrap().to_string_lossy().to_string();
-                    self.chart = c;
+            Want::Chart => match thread::load_library(&p.to_string_lossy()) {
+                Ok(lib) => {
+                    self.chart_name = lib.name.clone();
+                    self.chart_note = match (lib.manufacturer.is_empty(), lib.licence.is_empty()) {
+                        (true, true) => format!("{} threads.", lib.threads.len()),
+                        (false, true) => format!("{} · {} threads", lib.manufacturer, lib.threads.len()),
+                        (true, false) => format!("{} threads · {}", lib.threads.len(), lib.licence),
+                        (false, false) => format!("{} · {} threads · {}", lib.manufacturer, lib.threads.len(), lib.licence),
+                    };
+                    self.chart = lib.threads;
+                    self.libraries = thread::scan_libraries(&thread::library_dir());
                     for l in &mut self.layers {
                         l.opts.thread = None;
                     }
@@ -4647,12 +4680,39 @@ impl App {
                     };
                     self.dirty = true;
                 }
+                section(ui, "Thread library");
+                ui.label(egui::RichText::new(&self.chart_note).small().weak());
+                let mut chosen: Option<PathBuf> = None;
                 ui.horizontal(|ui| {
-                    ui.label(format!("Threads: {}", self.chart_name));
-                    if ui.small_button("Load chart CSV…").on_hover_text("Columns: code,name,r,g,b").clicked() {
+                    egui::ComboBox::from_id_salt("library")
+                        .width(200.0)
+                        .selected_text(self.chart_name.clone())
+                        .show_ui(ui, |ui| {
+                            for p in &self.libraries {
+                                let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                                if ui.selectable_label(false, name).clicked() {
+                                    chosen = Some(p.clone());
+                                }
+                            }
+                        });
+                    if ui.small_button("Other CSV…").on_hover_text("Columns: code,name,r,g,b").clicked() {
                         pick(Want::Chart, "Thread chart", &[("Thread chart", &["csv"])], self.last_dir.as_ref());
                     }
                 });
+                ui.horizontal(|ui| {
+                    if ui.small_button("Make my own library").on_hover_text("Creates a template CSV in your StitchForge folder").clicked() {
+                        match thread::write_template(&thread::library_dir()) {
+                            Ok(p) => {
+                                self.libraries = thread::scan_libraries(&thread::library_dir());
+                                self.error = Some(format!("Template saved to {}. Edit it, then pick it from the list.", p.display()));
+                            }
+                            Err(e) => self.error = Some(format!("Could not create the template: {e}")),
+                        }
+                    }
+                });
+                if let Some(p) = chosen {
+                    self.handle_picked(Want::Chart, p);
+                }
             }
 
             }
@@ -4836,6 +4896,7 @@ impl App {
     // ---------- canvas ----------
 
     fn canvas(&mut self, ui: &mut egui::Ui, now: f64) {
+        let rope_id = self.rope_texture(ui.ctx());
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
         if self.view == View::Vector {
@@ -5124,6 +5185,7 @@ impl App {
         };
         let view = self.view;
         let show_jumps = self.show_jumps;
+        let rope = if view == View::ThreeD { rope_id } else { None };
         let draw_obj = |o: &stitchforge::design::ObjectInfo, shift: Pt, painter: &egui::Painter| {
             let (a, z) = o.cmd_range;
             if a >= end {
@@ -5144,6 +5206,7 @@ impl App {
                 show_jumps,
                 rect.expand(20.0),
                 if o.puff { 2.2 } else { 1.0 },
+                rope,
             ));
         };
         let hide_layer = match self.edit {
@@ -7513,6 +7576,7 @@ fn stitch_shapes(
     show_jumps: bool,
     clip: Rect,
     relief: f32,
+    rope: Option<egui::TextureId>,
 ) -> Vec<EShape> {
     let col = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
     let w = (0.38 * zoom).max(1.0);
@@ -7583,9 +7647,18 @@ fn stitch_shapes(
             } else {
                 &[(1.0, 0.02), (0.0, 0.0), (-1.0, -0.3)]
             };
-            let mut mesh = egui::Mesh::default();
+            let mut mesh = egui::Mesh::with_texture(rope.unwrap_or_default());
             let px_per_mm = zoom / 1.0;
+            // texture coordinates: across the strand (u) and along it (v), so
+            // the rope tile repeats every couple of thread widths
+            let uv = |sgn: f32, dist: f32| -> egui::Pos2 {
+                match rope {
+                    Some(_) => egui::Pos2::new(0.5 + 0.5 * sgn, dist / (w * 2.0)),
+                    None => egui::epaint::WHITE_UV,
+                }
+            };
             for r in runs.iter().filter(|r| r.len() >= 2) {
+                let mut acc = 0.0_f32;
                 let unit = |i: usize, j: usize| -> Option<Vec2> {
                     let v = r[j] - r[i];
                     (v.length() > 0.2).then(|| v.normalized())
@@ -7594,6 +7667,8 @@ fn stitch_shapes(
                     let (a, b) = (r[si - 1], r[si]);
                     let v = b - a;
                     let len = v.length();
+                    let start = acc; // distance along this run before this stitch
+                    acc += len;
                     if len < 0.3
                         || (!clip.contains(a)
                             && !clip.contains(b)
@@ -7675,7 +7750,11 @@ fn stitch_shapes(
                         for &(sgn, tone) in across {
                             let g = if sgn > 0.2 && sgn < 0.8 { gloss } else if sgn > 0.0 && sgn <= 0.2 { gloss * 0.45 } else { 0.0 };
                             let p = a + dir * t + n * (sgn * half * wf);
-                            mesh.colored_vertex(p, tone_col(col, tone + dk + lift + g * (1.0 + dk * 2.0).max(0.0)));
+                            mesh.vertices.push(egui::epaint::Vertex {
+                                pos: p,
+                                uv: uv(sgn, start + t),
+                                color: tone_col(col, tone + dk + lift + g * (1.0 + dk * 2.0).max(0.0)),
+                            });
                         }
                     }
                     for si in 0..(stations.len() as u32 - 1) {
@@ -7687,7 +7766,8 @@ fn stitch_shapes(
                     }
                 }
                 if mesh.vertices.len() > 60_000 {
-                    shapes.push(EShape::mesh(std::mem::take(&mut mesh)));
+                    let full = std::mem::replace(&mut mesh, egui::Mesh::with_texture(rope.unwrap_or_default()));
+                    shapes.push(EShape::mesh(full));
                 }
             }
             if !mesh.vertices.is_empty() {

@@ -170,14 +170,42 @@ pub fn generic_chart() -> Vec<Thread> {
         .collect()
 }
 
-pub fn load_chart_csv(path: &str) -> Result<Vec<Thread>, String> {
+/// A thread library: one manufacturer's (or your own) chart, loaded from CSV.
+#[derive(Clone, Debug, Default)]
+pub struct Library {
+    /// Display name, from `# name:` or the file name.
+    pub name: String,
+    /// Who makes the threads, from `# manufacturer:`.
+    pub manufacturer: String,
+    /// Where the colour values came from and under what terms, from `# licence:`.
+    pub licence: String,
+    pub threads: Vec<Thread>,
+}
+
+/// Load a library CSV. Lines starting with `#` are notes:
+/// `# name: Madeira Polyneon`, `# manufacturer: Madeira`, `# licence: ...`.
+/// Data rows are `code,name,r,g,b`.
+pub fn load_library(path: &str) -> Result<Library, String> {
     let data = crate::vfs::read_to_string(std::path::Path::new(path)).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let brand = std::path::Path::new(path)
+    let stem = std::path::Path::new(path)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
+    let mut lib = Library { name: stem.clone(), ..Default::default() };
     let mut out = Vec::new();
     for (i, line) in data.lines().enumerate() {
+        if let Some(note) = line.trim().strip_prefix('#') {
+            if let Some((k, v)) = note.split_once(':') {
+                let v = v.trim().to_string();
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "name" if !v.is_empty() => lib.name = v,
+                    "manufacturer" => lib.manufacturer = v,
+                    "licence" | "license" => lib.licence = v,
+                    _ => {}
+                }
+            }
+            continue;
+        }
         let f: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
         if f.len() < 5 || f[0].eq_ignore_ascii_case("code") || line.trim().is_empty() {
             continue;
@@ -187,7 +215,7 @@ pub fn load_chart_csv(path: &str) -> Result<Vec<Thread>, String> {
                 .map_err(|_| format!("{path} line {}: bad color value '{s}'", i + 1))
         };
         out.push(Thread {
-            brand: brand.clone(),
+            brand: lib.name.clone(),
             code: f[0].into(),
             name: f[1].into(),
             rgb: [num(f[2])?, num(f[3])?, num(f[4])?],
@@ -198,7 +226,62 @@ pub fn load_chart_csv(path: &str) -> Result<Vec<Thread>, String> {
             "{path}: no threads found (expected code,name,r,g,b)"
         ));
     }
-    Ok(out)
+    lib.threads = out;
+    Ok(lib)
+}
+
+pub fn load_chart_csv(path: &str) -> Result<Vec<Thread>, String> {
+    Ok(load_library(path)?.threads)
+}
+
+/// Folder where thread libraries live: `StitchForge/Thread libraries` in the
+/// user's home folder. Each `.csv` in it is one library (files starting with
+/// `_` are ignored, so the template is not listed).
+pub fn library_dir() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join("StitchForge").join("Thread libraries")
+}
+
+/// Library files found in a folder, sorted by name.
+pub fn scan_libraries(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    let is_csv = p.extension().map(|e| e.eq_ignore_ascii_case("csv")).unwrap_or(false);
+                    let hidden = p.file_name().map(|n| n.to_string_lossy().starts_with('_')).unwrap_or(true);
+                    is_csv && !hidden
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// The template a user copies to make their own library. Notes are `#` lines;
+/// the example rows are placeholders and must be replaced with real values.
+pub const LIBRARY_TEMPLATE: &str = "\
+# name: My library
+# manufacturer: Your name or brand
+# licence: Where these colours came from and the terms you have to publish them
+# Data rows: code,name,r,g,b   (r, g, b are 0-255 sRGB values)
+code,name,r,g,b
+EXAMPLE-1,Replace me,200,24,40
+EXAMPLE-2,Replace me too,30,70,170
+";
+
+/// Write the template into the library folder (never overwrites a file).
+pub fn write_template(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("_template.csv");
+    if !path.exists() {
+        std::fs::write(&path, LIBRARY_TEMPLATE)?;
+    }
+    Ok(path)
 }
 
 fn lab(rgb: [u8; 3]) -> [f64; 3] {
@@ -286,6 +369,31 @@ mod tests {
         let (t, b) = usage_m(10_000.0, 2000);
         assert!(t > 10.0 && b < t);
     }
+    #[test]
+    fn library_notes_and_template() {
+        let dir = std::env::temp_dir().join(format!("sf-lib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = write_template(&dir).unwrap();
+        // the template is a valid library, with its notes read
+        let lib = load_library(t.to_str().unwrap()).unwrap();
+        assert_eq!(lib.name, "My library");
+        assert_eq!(lib.manufacturer, "Your name or brand");
+        assert!(lib.licence.starts_with("Where these colours"));
+        assert_eq!(lib.threads.len(), 2);
+        assert_eq!(lib.threads[0].code, "EXAMPLE-1");
+        // underscore files are templates, not libraries, so they are not listed
+        assert!(scan_libraries(&dir).is_empty());
+        let real = dir.join("madeira.csv");
+        std::fs::write(&real, "# name: Test chart\n# manufacturer: Test\ncode,name,r,g,b\n1,Red,200,24,40\n").unwrap();
+        let found = scan_libraries(&dir);
+        assert_eq!(found, vec![real.clone()]);
+        let lib = load_library(real.to_str().unwrap()).unwrap();
+        assert_eq!(lib.name, "Test chart");
+        assert_eq!(lib.threads[0].brand, "Test chart");
+        assert_eq!(load_chart_csv(real.to_str().unwrap()).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn matches_navy_not_black() {
         let chart = generic_chart();

@@ -6,6 +6,7 @@
 pub mod applique;
 pub mod cut;
 pub mod design;
+pub mod texture;
 pub mod drops;
 pub mod fills;
 pub mod flow;
