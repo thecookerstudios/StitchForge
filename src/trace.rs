@@ -140,7 +140,7 @@ impl TraceOptions {
         self.smooth_mm.unwrap_or(self.detail.smooth_mm()).clamp(0.0, 1.0)
     }
     pub fn eff_speck(&self) -> f64 {
-        self.speck_mm2.unwrap_or(self.detail.speck_mm2()).clamp(0.05, 50.0)
+        self.speck_mm2.unwrap_or(self.detail.speck_mm2()).clamp(0.02, 50.0)
     }
     pub fn eff_min_line(&self) -> f64 {
         self.min_line_mm
@@ -149,13 +149,13 @@ impl TraceOptions {
                 Detail::Balanced => 0.45,
                 Detail::Fine => 0.3,
             })
-            .clamp(0.05, 3.0)
+            .clamp(0.02, 3.0)
     }
     pub fn eff_merge(&self) -> f32 {
         self.merge_de.unwrap_or(self.detail.merge_de()).clamp(2.0, 60.0)
     }
     pub fn eff_fit(&self) -> f64 {
-        self.fit_tol_mm.unwrap_or(self.detail.fit_tol()).clamp(0.02, 0.5)
+        self.fit_tol_mm.unwrap_or(self.detail.fit_tol()).clamp(0.01, 0.5)
     }
 }
 

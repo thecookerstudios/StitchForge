@@ -881,6 +881,8 @@ impl App {
             changed_at: -1.0,
             src_tex: None,
             out_tex: None,
+            stitch_tex: None,
+            show_stitch: false,
             drag: None,
             notes,
         });
@@ -902,6 +904,12 @@ impl App {
                         ctx.load_texture("trace-out", egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR)
                     })
                 }
+                Err(_) => None,
+            };
+            // rough stitches from the same trace; the open design's recipe and profile
+            dlg.stitch_tex = match &r {
+                Ok(t) => stitch_preview(&t.to_svg(), t.w as f64 * t.mm_per_px, &self.chart, &self.recipe, self.profile)
+                    .map(|(w, h, px)| ctx.load_texture("trace-stitch", egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR)),
                 Err(_) => None,
             };
             dlg.result = Some(r);
@@ -1009,11 +1017,17 @@ impl App {
                     });
                     // ---- result
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Traced, ready to stitch").strong());
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut dlg.show_stitch, false, RichText::new("Traced art").strong())
+                                .on_hover_text("The traced shapes and colours");
+                            ui.selectable_value(&mut dlg.show_stitch, true, RichText::new("Rough stitches").strong())
+                                .on_hover_text("A quick stitch preview of this trace, at the width and fabric you chose. Not a sew-out.");
+                        });
                         let (r, _) = ui.allocate_exact_size(box_sz, Sense::hover());
                         let p = ui.painter_at(r);
                         p.rect_filled(r, 4.0, Color32::from_rgb(242, 239, 232));
-                        match (&dlg.result, &dlg.out_tex) {
+                        let shown = if dlg.show_stitch { dlg.stitch_tex.as_ref() } else { dlg.out_tex.as_ref() };
+                        match (&dlg.result, shown) {
                             (Some(Ok(_)), Some(tex)) => {
                                 let ts = tex.size_vec2();
                                 let k = (box_sz.x / ts.x).min(box_sz.y / ts.y) * 0.95;
@@ -1129,9 +1143,9 @@ impl App {
                             ch
                         };
                         changed |= slider(ui, "Edge smoothing", "Smooths jagged pixel edges. More = rounder, softer outlines; less = follows the picture exactly", &mut o.smooth_mm, c_sm, 0.0..=0.6, " mm", 2);
-                        changed |= slider(ui, "Curve accuracy", "How closely the vector curves follow the edge. Smaller = more points and closer fit", &mut o.fit_tol_mm, c_fit, 0.02..=0.4, " mm", 2);
-                        changed |= slider(ui, "Smallest piece", "Specks and islands smaller than this are dropped (too small to sew)", &mut o.speck_mm2, c_sp, 0.1..=10.0, " mm²", 1);
-                        changed |= slider(ui, "Thinnest line", "Lines thinner than this are absorbed into the colour around them", &mut o.min_line_mm, c_line, 0.1..=2.0, " mm", 2);
+                        changed |= slider(ui, "Curve accuracy", "How closely the vector curves follow the edge. Smaller = more points and closer fit", &mut o.fit_tol_mm, c_fit, 0.01..=0.4, " mm", 2);
+                        changed |= slider(ui, "Smallest piece", "Specks and islands smaller than this are dropped (too small to sew)", &mut o.speck_mm2, c_sp, 0.02..=10.0, " mm²", 2);
+                        changed |= slider(ui, "Thinnest line", "Lines thinner than this are absorbed into the colour around them. Lower keeps finer strokes", &mut o.min_line_mm, c_line, 0.02..=2.0, " mm", 2);
                         let mut de = o.merge_de.map(|v| v as f64);
                         if slider(ui, "Merge similar colors", "Colours closer than this (ΔE) become one thread. Higher = fewer colours", &mut de, c_de, 3.0..=40.0, "", 0) {
                             o.merge_de = de.map(|v| v as f32);
@@ -8263,8 +8277,32 @@ struct TraceDlg {
     changed_at: f64,
     src_tex: Option<egui::TextureHandle>,
     out_tex: Option<egui::TextureHandle>,
+    /// Rough stitch preview of the current trace (built with the open design's recipe).
+    stitch_tex: Option<egui::TextureHandle>,
+    /// Show the rough stitch preview in the result box instead of the traced art.
+    show_stitch: bool,
     drag: Option<(Pos2, Pos2)>,
     notes: Vec<String>,
+}
+
+/// Rough stitch preview of a traced SVG, using the same build as the
+/// stitch file and the picture the operator sheet uses. Returns RGBA pixels.
+fn stitch_preview(
+    svg: &str,
+    width_mm: f64,
+    chart: &[thread::Thread],
+    recipe: &settings::Recipe,
+    profile: Profile,
+) -> Option<(usize, usize, Vec<u8>)> {
+    let mut art = stitchforge::import::load_svg_str(svg, &usvg::Options::default()).ok()?;
+    stitchforge::import::fit(&mut art, Some(width_mm), None);
+    let d = stitchforge::design::build("trace-preview", &art, chart, recipe, profile).ok()?;
+    // about 520 px across, like the traced picture
+    let px_per_mm = (520.0 / width_mm.max(1.0)) as f32;
+    let png = stitchforge::sheet::preview_png(&d, px_per_mm, "#f2efe8").ok()?;
+    let raster = stitchforge::trace::Raster::decode(&png).ok()?;
+    let px: Vec<u8> = raster.px.iter().flatten().copied().collect();
+    Some((raster.w as usize, raster.h as usize, px))
 }
 
 /// Render SVG to RGBA pixels, longest side `max_px`.
