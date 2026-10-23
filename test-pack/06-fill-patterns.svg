@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="130mm" height="90mm" viewBox="0 0 130 90">
+<path id="circle-sf-contour" d="M5.000,25.000 A20,20 0 1 1 45.000,25.000 A20,20 0 1 1 5.000,25.000 Z" fill="#1f5e3a"/>
+<path id="blob-sf-spiral" d="M60,6 C80,2 92,16 86,28 C80,42 62,48 52,38 C44,30 46,10 60,6 Z" fill="#b8202c"/>
+<path id="octagon-sf-radial" d="M125.554,32.271 L115.271,42.554 L100.729,42.554 L90.446,32.271 L90.446,17.729 L100.729,7.446 L115.271,7.446 L125.554,17.729 Z" fill="#e0a526"/>
+<path id="leaf-sf-tatami-sf-angle-30" d="M10,82 C10,60 34,52 52,56 C50,76 30,86 10,82 Z" fill="#2f7d4f"/>
+<rect id="panel-sf-fill-sf-density-0.6-sf-len-4" x="62" y="54" width="62" height="30" fill="#1c2b4a"/>
+</svg>
