@@ -374,7 +374,7 @@ impl App {
             libraries: thread::scan_libraries(&thread::library_dir()),
             rope_tex: None,
             show_text: false,
-            text: "Sunny Hill".into(),
+            text: "Forge Co".into(),
             font: "Arial".into(),
             text_height_in: 0.75,
             text_color: [24, 36, 80],
