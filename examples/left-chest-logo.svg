@@ -6,5 +6,5 @@
   <path id="Mountain" d="M110 200 L170 110 L200 150 L225 120 L290 200 Z" fill="#2e8b57"/>
   <path id="Snowcap" d="M170 110 L186 134 L176 130 L166 138 L158 128 Z" fill="#ffffff"/>
   <rect id="Banner" x="60" y="215" width="280" height="56" rx="8" fill="#c41e3a"/>
-  <text id="BannerText" x="200" y="254" font-family="Poppins" font-weight="700" font-size="34" text-anchor="middle" fill="#ffffff">SUNNY HILL</text>
+  <text id="BannerText" x="200" y="254" font-family="Poppins" font-weight="700" font-size="34" text-anchor="middle" fill="#ffffff">FORGE CO</text>
 </svg>

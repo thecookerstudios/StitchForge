@@ -369,7 +369,7 @@ stitchforge convert mockup.jpg --width-in 4 --weight 60
 stitchforge trace logo.jpg --width-in 3.5 --colors 4 --detail clean -o logo.svg
 
 # Any installed font, no embroidery-font format
-stitchforge text "Sunny Hill" --font Poppins --height-mm 20 --color "#1b2d5c"
+stitchforge text "Forge Co" --font Poppins --height-mm 20 --color "#1b2d5c"
 stitchforge text "Team Name" --font-file MyFont.otf --profile cap
 
 stitchforge fonts              # list installed fonts

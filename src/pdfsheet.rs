@@ -597,7 +597,7 @@ mod tests {
         let chart = crate::thread::generic_chart();
         let recipe = crate::settings::recipe("pique").unwrap();
         let d = crate::design::build_with("logo", &art, &chart, &recipe, crate::settings::Profile::Flat, Default::default()).unwrap();
-        let job = JobInfo { job: "1042".into(), customer: "Sunny Hill test".into(), ..Default::default() };
+        let job = JobInfo { job: "1042".into(), customer: "Sample customer".into(), ..Default::default() };
         let two = operator_sheet_pdf(&d, &job, "today", true).unwrap();
         let one = operator_sheet_pdf(&d, &job, "today", false).unwrap();
         assert_eq!(two.pages, one.pages + 1);
