@@ -313,6 +313,8 @@ struct App {
     style: DrawStyle,
     pen: Vec<Node>,
     pen_dragging: bool,
+    /// Layer whose stitch angle is being dragged from its angle handle.
+    angle_drag: Option<usize>,
     shape_drag: Option<(Pt, Pt)>,
     snap: bool,
     text_at: Option<Pt>,
@@ -431,6 +433,7 @@ impl App {
             },
             pen: Vec::new(),
             pen_dragging: false,
+            angle_drag: None,
             shape_drag: None,
             snap: false,
             text_at: None,
@@ -5007,7 +5010,46 @@ impl App {
         if guiding {
             self.guide_input(&resp, ui, &to_mm, &to_screen, zoom);
         }
-        let object_edit = object_edit || drawing || measuring || cutting || guiding;
+        // Angle handles: the two ends of the selected layer's stitch-angle
+        // guide. Press on an end and drag to turn the stitch angle.
+        let angle_id = egui::Id::new("angle-handles");
+        if !(object_edit || drawing || measuring || cutting || guiding) {
+            if let Some((t1, t2, li)) = ui.ctx().data(|d| d.get_temp::<(Pos2, Pos2, usize)>(angle_id)) {
+                let near = |p: Pos2| p.distance(t1) < 16.0 || p.distance(t2) < 16.0;
+                if resp.hover_pos().map(near).unwrap_or(false) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                // the drag only starts after the pointer has moved, so test where the press began
+                let origin = ui.input(|i| i.pointer.press_origin());
+                if resp.drag_started_by(egui::PointerButton::Primary)
+                    && origin.map(near).unwrap_or(false)
+                {
+                    self.angle_drag = Some(li);
+                }
+            }
+        }
+        if let Some(li) = self.angle_drag {
+            if let (Some(pos), Some((t1, t2, _))) = (
+                resp.interact_pointer_pos(),
+                ui.ctx().data(|d| d.get_temp::<(Pos2, Pos2, usize)>(angle_id)),
+            ) {
+                if resp.dragged_by(egui::PointerButton::Primary) || resp.drag_started_by(egui::PointerButton::Primary) {
+                    let c = Pos2::new((t1.x + t2.x) / 2.0, (t1.y + t2.y) / 2.0);
+                    let v = pos - c;
+                    // screen y runs down, so flip it for a counter-clockwise angle
+                    let deg = (-(v.y as f64)).atan2(v.x as f64).to_degrees().rem_euclid(180.0);
+                    let deg = (deg * 10.0).round() / 10.0;
+                    if self.layers[li].opts.angle_deg.map(|a| (a - deg).abs() > 0.05).unwrap_or(true) {
+                        self.layers[li].opts.angle_deg = Some(deg);
+                        self.dirty = true;
+                    }
+                }
+            }
+            if resp.drag_stopped() {
+                self.angle_drag = None;
+            }
+        }
+        let object_edit = object_edit || drawing || measuring || cutting || guiding || self.angle_drag.is_some();
         let no_layers: Vec<Layer> = Vec::new();
         let hit_src: &[Layer] = if editing { &self.layers } else { &no_layers };
         if !object_edit && resp.drag_started() {
@@ -5451,12 +5493,16 @@ impl App {
                             }
                         }
                         let n = Vec2::new(-u.y, u.x);
+                        // round handles at the ends: drag one to turn the stitch angle
+                        painter.ctx().data_mut(|d| d.insert_temp(egui::Id::new("angle-handles"), (c + dir, c - dir, li)));
                         for tip in [c + dir, c - dir] {
+                            painter.circle_filled(tip, 6.0, accent);
+                            painter.circle_stroke(tip, 6.0, Stroke::new(1.5_f32, Color32::WHITE));
                             let back = if tip == c + dir { -u } else { u };
-                            let pts = vec![tip, tip + back * 9.0 + n * 5.0, tip + back * 9.0 - n * 5.0];
+                            let pts = vec![tip + back * 9.0, tip + back * 16.0 + n * 5.0, tip + back * 16.0 - n * 5.0];
                             painter.add(EShape::convex_polygon(pts, accent, Stroke::new(1.0_f32, Color32::WHITE)));
                         }
-                        let label = format!("Stitch angle {:.0}°", o.angle_deg);
+                        let label = format!("Stitch angle {:.0}° · drag an end", o.angle_deg);
                         let galley = painter.layout_no_wrap(label, egui::FontId::proportional(12.0), Color32::WHITE);
                         let pill = Rect::from_center_size(c, galley.size() + Vec2::new(14.0, 6.0));
                         painter.rect_filled(pill, 9.0, accent);
