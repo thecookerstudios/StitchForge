@@ -253,10 +253,17 @@ pub fn plan(
                         rule: *rule,
                     };
                     let area = rings_area(rings, *rule);
-                    if area < Limits::MIN_AREA {
-                        warnings.push(format!(
-                            "{name}: area {area:.2} mm² too small to stitch, skipped"
-                        ));
+                    if area < Limits::MIN_AREA && o.small_pieces != crate::import::SmallPieces::Fill {
+                        if o.small_pieces == crate::import::SmallPieces::Skip {
+                            warnings.push(format!(
+                                "{name}: area {area:.2} mm² too small to stitch, skipped"
+                            ));
+                            continue;
+                        }
+                        // too small to fill: run stitch around the outline instead
+                        warnings.push(format!("{name}: area {area:.2} mm² too small to fill, run stitch used"));
+                        let shape = ShapeKind::Area { rings: rings.clone(), rule: *rule };
+                        out.push(mk(name, StitchType::Run, shape, bbox, 0.0));
                         continue;
                     }
                     let thickness = 2.0 * area / rings_perimeter(rings).max(1e-9);
@@ -651,6 +658,10 @@ fn generate_top(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
                 }
             }
         }
+        // a running stitch round an area (small pieces, or a chosen outline)
+        (ShapeKind::Area { rings, rule }, StitchType::Run) => {
+            edge_run(&mut out, rings, *rule, 0.15, from);
+        }
         (ShapeKind::Area { rings, rule }, _)
             if p.opts.angle_deg.is_none() && p.knockouts.is_empty() && {
                 let pc = pc + p.opts.widen / 2.0;
@@ -877,6 +888,14 @@ fn edge_run(out: &mut Vec<Needle>, rings: &[Ring], rule: FillRule, inset: f64, m
         .into_iter()
         .filter(|r| r.len() >= 3 && r.windows(2).map(|w| w[0].dist(w[1])).sum::<f64>() > 1.0)
         .collect();
+    if left.is_empty() {
+        // a piece too small for the inset: sew its outline itself
+        left = rings
+            .iter()
+            .filter(|r| r.len() >= 3)
+            .cloned()
+            .collect();
+    }
     while !left.is_empty() {
         let (ri, vi) = left
             .iter()

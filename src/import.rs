@@ -131,12 +131,28 @@ impl FillPattern {
     }
 }
 
+/// What to do with a fill area too small to fill (under the minimum size).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmallPieces {
+    /// Run stitch around the outline (the default).
+    #[default]
+    Run,
+    /// Fill it anyway, whatever its size.
+    Fill,
+    /// Leave it out.
+    Skip,
+}
+
 /// Per-layer choices made by the user. Anything left `None`/`Auto` is decided
 /// by the engine.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShapeOpts {
     pub stitch: StitchChoice,
+    /// What to do with pieces too small to fill.
+    #[serde(default)]
+    pub small_pieces: SmallPieces,
     /// Stitch direction in degrees (0 = horizontal, counter-clockwise).
     pub angle_deg: Option<f64>,
     /// Index into the thread chart.

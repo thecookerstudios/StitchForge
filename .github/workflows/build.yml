@@ -1,0 +1,47 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [engine-rebuild]
+
+jobs:
+  windows:
+    name: Windows app (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binaries
+        run: cargo build --release --bin stitchforge-app --bin stitchforge
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stitchforge-windows
+          path: |
+            target/release/stitchforge-app.exe
+            target/release/stitchforge.exe
+
+  web:
+    name: Web demo (any browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+          VER=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/"/,"",$3); print $3; exit}' web/Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$VER" --locked
+      - name: Build web bundle
+        working-directory: web
+        run: |
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir www target/wasm32-unknown-unknown/release/stitchforge_web.wasm
+          wasm-opt -Oz -o www/stitchforge_bg.wasm www/stitchforge_bg.wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stitchforge-web
+          path: web/www

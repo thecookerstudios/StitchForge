@@ -133,6 +133,9 @@ pub struct TraceOptions {
     pub snap_circles: bool,
     /// snap straight-edged shapes to sharp corners
     pub snap_corners: bool,
+    /// Exact thread colours to use instead of finding them (empty = automatic).
+    /// Each picture pixel takes the nearest of these.
+    pub fixed_palette: Vec<[u8; 3]>,
 }
 
 impl TraceOptions {
@@ -178,6 +181,7 @@ impl Default for TraceOptions {
             fit_tol_mm: None,
             snap_circles: true,
             snap_corners: true,
+            fixed_palette: Vec::new(),
         }
     }
 }
@@ -1338,16 +1342,21 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
     let stride = (pool.len() / 40000).max(1);
     let samples: Vec<[f32; 3]> = pool.iter().step_by(stride).filter_map(|&i| labs[i]).collect();
     let max = if o.max_colors == 0 { 12 } else { o.max_colors.clamp(1, 15) };
-    let mut cs = kmeans(&samples, (max * 2).max(16));
-    // tiny clusters are noise or edge colours
-    let total: usize = cs.iter().map(|c| c.1).sum();
-    let min_share = match detail {
-        Detail::Clean => 0.006,
-        Detail::Balanced => 0.003,
-        Detail::Fine => 0.0012,
+    let mut cs = if o.fixed_palette.is_empty() {
+        let mut cs = kmeans(&samples, (max * 2).max(16));
+        // tiny clusters are noise or edge colours
+        let total: usize = cs.iter().map(|c| c.1).sum();
+        let min_share = match detail {
+            Detail::Clean => 0.006,
+            Detail::Balanced => 0.003,
+            Detail::Fine => 0.0012,
+        };
+        cs.retain(|c| c.1 as f64 >= total as f64 * min_share);
+        merge_colors(cs, o.eff_merge(), max)
+    } else {
+        // the user gave the thread colours: use them exactly
+        o.fixed_palette.iter().map(|c| (lab(*c), 1usize)).collect()
     };
-    cs.retain(|c| c.1 as f64 >= total as f64 * min_share);
-    let mut cs = merge_colors(cs, o.eff_merge(), max);
     cs.sort_by(|a, b| b.1.cmp(&a.1));
     let centers: Vec<[f32; 3]> = cs.iter().map(|c| c.0).collect();
     if centers.is_empty() {

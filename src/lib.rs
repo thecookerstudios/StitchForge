@@ -4,6 +4,7 @@
 //! and general embroidery practice.
 
 pub mod applique;
+pub mod colour_plan;
 pub mod cut;
 pub mod design;
 pub mod texture;
