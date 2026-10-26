@@ -302,7 +302,14 @@ pub fn plan(
                             }
                         }
                         satin_angle = best.1;
-                        if o.stitch == StitchChoice::Satin || o.puff || best.2 <= Limits::SATIN_MAX * 1.25 {
+                        // a curved stroke (a c, an s) never fits one straight
+                        // angle, but a turning satin follows it: a stroke of
+                        // satin width is satin whatever its shape
+                        if o.stitch == StitchChoice::Satin
+                            || o.puff
+                            || best.2 <= Limits::SATIN_MAX * 1.25
+                            || thickness <= Limits::SATIN_THICKNESS
+                        {
                             kind = StitchType::Satin;
                         }
                     }
@@ -1428,6 +1435,9 @@ fn turning_satin(
         Corner,
         /// Joins another stroke: tuck a little way under it.
         Tuck,
+        /// Joins a stroke whose satin is already sewn: stop at its edge with
+        /// only a slight overlap, or the end would lie on top of it.
+        TuckOver,
         /// Carries straight on into the next stroke as one column.
         Through,
     }
@@ -1444,7 +1454,9 @@ fn turning_satin(
         match k {
             End::Leaf => d * 1.3 + 0.3,
             End::Corner => d + 0.1,
-            End::Tuck => d * 0.7,
+            // short: a long tuck piles stitches up at the junction
+            End::Tuck => d * 0.3,
+            End::TuckOver => d * 0.1,
             End::Through => 0.0,
         }
     };
@@ -1454,7 +1466,7 @@ fn turning_satin(
         match k {
             End::Leaf => 2.4,
             End::Corner => 1.5,
-            End::Tuck => 1.15,
+            End::Tuck | End::TuckOver => 1.15,
             End::Through => 1.6,
         }
     };
@@ -1687,7 +1699,13 @@ fn turning_satin(
         if out.is_empty() {
             out.push(Needle::new(start_pt, true));
         } else {
-            start_in_shape(out, rings, rule, &[start_pt], Limits::RUN_LEN, &|q| p.covered(q));
+            // to the next piece of this letter: never run over satin it has
+            // already sewn (that would show on top); jump there instead
+            if crosses_sewn(&out[begin..], out.last().map(|n| n.p).unwrap_or(start_pt), start_pt) {
+                out.push(Needle::new(start_pt, true));
+            } else {
+                start_in_shape(out, rings, rule, &[start_pt], Limits::RUN_LEN, &|q| p.covered(q));
+            }
         }
         let mut stack: Vec<Frame> = Vec::new();
         // root level: each stroke at the root is its own column
@@ -1695,11 +1713,18 @@ fn turning_satin(
             .filter(|&k| !edge_done[k] && (g.edges[k].a == root || g.edges[k].b == root))
             .collect();
         root_edges.reverse();
-        let open = |e: usize, x: usize, edge_done: &mut Vec<bool>, out: &mut Vec<Needle>| -> Frame {
+        let open = |e: usize, x: usize, parent: Option<usize>, edge_done: &mut Vec<bool>, out: &mut Vec<Needle>| -> Frame {
+            let touches = |k: usize, n: usize| g.edges[k].a == n || g.edges[k].b == n;
+            // at the near end, strokes already finished there (not the parent,
+            // whose satin comes after and covers this end)
+            let near_sewn = (0..g.edges.len()).any(|k| k != e && Some(k) != parent && edge_done[k] && touches(k, x));
             edge_done[e] = true;
             let path = leaving(e, x);
             let y = if g.edges[e].a == x { g.edges[e].b } else { g.edges[e].a };
-            let fwd = stroke_ribs(&path, end_kind(x, e), end_kind(y, e));
+            let over = |k: End, sewn: bool| if k == End::Tuck && sewn { End::TuckOver } else { k };
+            // at the far end, the strokes branching there are sewn before this
+            // stroke's satin comes back over the junction
+            let fwd = stroke_ribs(&path, over(end_kind(x, e), near_sewn), over(end_kind(y, e), true));
             run_out(out, &path, &fwd);
             Frame { e, y, fwd, pending: Vec::new(), thru: None, owed: Vec::new(), stage: 0 }
         };
@@ -1707,7 +1732,7 @@ fn turning_satin(
             if edge_done[e] {
                 continue;
             }
-            stack.push(open(e, root, &mut edge_done, out));
+            stack.push(open(e, root, None, &mut edge_done, out));
             while let Some(top) = stack.last_mut() {
                 match top.stage {
                     0 => {
@@ -1730,15 +1755,15 @@ fn turning_satin(
                         // side strokes at y: each sewn completely, back to y
                         if let Some(k) = top.pending.pop() {
                             if !edge_done[k] {
-                                let y = top.y;
-                                let f = open(k, y, &mut edge_done, out);
+                                let (y, pe) = (top.y, top.e);
+                                let f = open(k, y, Some(pe), &mut edge_done, out);
                                 stack.push(f);
                             }
                         } else {
                             top.stage = 2;
                             if let Some(f) = top.thru.filter(|&f| !edge_done[f]) {
-                                let y = top.y;
-                                let fr = open(f, y, &mut edge_done, out);
+                                let (y, pe) = (top.y, top.e);
+                                let fr = open(f, y, Some(pe), &mut edge_done, out);
                                 stack.last_mut().unwrap().stage = 3; // wait for through
                                 stack.push(fr);
                             }
@@ -2211,6 +2236,33 @@ fn start_in_shape(
     } else {
         push_section(out, pts, max);
     }
+}
+
+/// Would a run from `a` to `b` lie on top of top stitches already sewn in
+/// `sewn`? (Underlay and jumps don't count: they are covered or not sewn.)
+fn crosses_sewn(sewn: &[Needle], a: Pt, b: Pt) -> bool {
+    let d = a.dist(b);
+    if d < 0.3 {
+        return false;
+    }
+    let n = (d / 0.25).ceil() as usize;
+    // only look at the inside of the travel: its ends touch the stitching
+    let samples: Vec<Pt> = (1..n).map(|k| a.lerp(b, k as f64 / n as f64)).collect();
+    let (lo, hi) = (Pt::new(a.x.min(b.x), a.y.min(b.y)), Pt::new(a.x.max(b.x), a.y.max(b.y)));
+    for w in sewn.windows(2) {
+        if w[1].jump || w[0].under || w[1].under {
+            continue;
+        }
+        let (p0, p1) = (w[0].p, w[1].p);
+        // quick reject: segment far from the travel line's box
+        if p0.x.max(p1.x) < lo.x - 0.5 || p0.x.min(p1.x) > hi.x + 0.5 || p0.y.max(p1.y) < lo.y - 0.5 || p0.y.min(p1.y) > hi.y + 0.5 {
+            continue;
+        }
+        if samples.iter().any(|&q| seg_dist(q, p0, p1) < 0.2) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Can the needle run from `a` to `b` without a trim and without showing?

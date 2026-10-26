@@ -310,6 +310,9 @@ struct App {
     // drawing
     tool: Tool,
     multi: std::collections::BTreeSet<u64>,
+    /// A part (one stitch object) picked in the layers list: (layer id,
+    /// object sequence). Highlighted on the canvas.
+    focus_part: Option<(u64, usize)>,
     style: DrawStyle,
     pen: Vec<Node>,
     pen_dragging: bool,
@@ -420,6 +423,7 @@ impl App {
             edit: Edit::None,
             tool: Tool::Select,
             multi: Default::default(),
+            focus_part: None,
             style: DrawStyle {
                 fill_on: true,
                 fill: [28, 43, 74],
@@ -496,6 +500,12 @@ impl App {
                 }
                 "--expand" => {
                     self.expanded = self.layers.iter().map(|l| l.id).collect();
+                }
+                "--focus" => {
+                    if let (Some(n), Some(id)) = (num(i + 1), self.selected) {
+                        self.focus_part = Some((id, n as usize));
+                    }
+                    i += 1;
                 }
                 "--move" => {
                     if let (Some(dx), Some(dy), Some(l)) = (num(i + 1), num(i + 2), self.sel_mut())
@@ -762,8 +772,8 @@ impl App {
 
     /// Pictures of the appliqué pieces (twill look), re-made when the design
     /// or zoom changes.
-    /// The placeholder rope texture, made on first use and repeated across
-    /// the tile edges so it can be shrunk to thread size.
+    /// The rope thread texture (from photos), made on first use and repeated
+    /// along the strand so it can be shrunk to thread size.
     fn rope_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
         if self.rope_tex.is_none() {
             let n = stitchforge::texture::TILE;
@@ -774,7 +784,7 @@ impl App {
                 mipmap_mode: Some(egui::TextureFilter::Linear),
                 ..egui::TextureOptions::LINEAR
             };
-            self.rope_tex = Some(ctx.load_texture("rope-placeholder", img, opts));
+            self.rope_tex = Some(ctx.load_texture("rope", img, opts));
         }
         self.rope_tex.as_ref().map(|t| t.id())
     }
@@ -2721,6 +2731,8 @@ impl App {
         let mut toggle_vis: Option<usize> = None;
         let mut toggle_stop: Option<(usize, Option<bool>)> = None;
         let mut toggle_exp: Option<u64> = None;
+        let mut focus: Option<(u64, usize)> = None;
+        let mut own_layer: Option<(usize, usize)> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (li, l) in self.layers.iter().enumerate() {
                 let open = self.expanded.contains(&l.id);
@@ -2786,9 +2798,19 @@ impl App {
                         if objs.is_empty() {
                             ui.label(RichText::new("(no stitches)").weak().small());
                         }
-                        for o in objs {
+                        let many = objs.len() > 1;
+                        for (k, o) in objs.iter().enumerate() {
                             let angle = if has_angle(o.stitch_type) { format!(" · {:.0}°", o.angle_deg) } else { String::new() };
-                            ui.label(RichText::new(format!("#{}  {}{} · {} stitches", o.sequence, o.stitch_type, angle, group(o.stitches))).small());
+                            let on = self.focus_part == Some((l.id, o.sequence));
+                            ui.horizontal(|ui| {
+                                let text = RichText::new(format!("#{}  {}{} · {} stitches", o.sequence, o.stitch_type, angle, group(o.stitches))).small();
+                                if ui.selectable_label(on, text).on_hover_text("Click to show this part on the canvas").clicked() {
+                                    focus = Some((l.id, o.sequence));
+                                }
+                                if many && ui.small_button("own layer").on_hover_text("Give this part its own layer, so its stitch type and settings can be changed on their own").clicked() {
+                                    own_layer = Some((li, k));
+                                }
+                            });
                         }
                     });
                 }
@@ -2797,6 +2819,33 @@ impl App {
         if let Some(id) = toggle_exp {
             if !self.expanded.remove(&id) {
                 self.expanded.insert(id);
+            }
+        }
+        if let Some((id, seq)) = focus {
+            // pick the part: its layer is selected (its settings show) and the
+            // part is highlighted; click it again to let go
+            if self.focus_part == Some((id, seq)) {
+                self.focus_part = None;
+            } else {
+                self.focus_part = Some((id, seq));
+                self.selected = Some(id);
+                self.multi = self.selected.into_iter().collect();
+            }
+        }
+        if let Some((li, k)) = own_layer {
+            // split the layer into its pieces, keep the others as they were
+            // (each on its own layer) and select the one asked for
+            self.selected = Some(self.layers[li].id);
+            self.multi = self.selected.into_iter().collect();
+            let before = self.layers.len();
+            self.break_apart();
+            let made = self.layers.len() + 1 - before;
+            if made >= 2 {
+                let j = li + k.min(made - 1);
+                self.selected = Some(self.layers[j].id);
+                self.multi = self.selected.into_iter().collect();
+                self.focus_part = None;
+                self.status = format!("{} is now its own layer: change its settings on the right", self.layers[j].name);
             }
         }
         if let Some(id) = select {
@@ -2811,6 +2860,7 @@ impl App {
                     self.selected = Some(id);
                 }
             } else {
+                self.focus_part = None;
                 self.selected = if self.selected == Some(id) && self.multi.len() <= 1 {
                     None
                 } else {
@@ -5305,6 +5355,38 @@ impl App {
         }
         if !vector_view {
             draw_pieces_until(usize::MAX, &mut next_piece, &painter);
+        }
+        // the part picked in the layers list: its stitches outlined in the
+        // highlight colour, and a box round it
+        if let Some((lid, seq)) = self.focus_part {
+            let li = self.layers.iter().position(|l| l.id == lid);
+            if let Some(o) = d.objects.iter().find(|o| Some(o.layer) == li && o.sequence == seq) {
+                let (a, z) = o.cmd_range;
+                let hi = Color32::from_rgb(255, 196, 0);
+                let mut pts: Vec<Pos2> = Vec::new();
+                let mut bb = Rect::NOTHING;
+                for c in &d.cmds[a..z.min(d.cmds.len())] {
+                    match c {
+                        Cmd::Stitch(p) => {
+                            let q = to_screen(*p);
+                            bb.extend_with(q);
+                            pts.push(q);
+                        }
+                        _ => {
+                            if pts.len() >= 2 {
+                                painter.add(EShape::line(std::mem::take(&mut pts), Stroke::new(1.0, hi)));
+                            }
+                            pts.clear();
+                        }
+                    }
+                }
+                if pts.len() >= 2 {
+                    painter.add(EShape::line(pts, Stroke::new(1.0, hi)));
+                }
+                if bb.is_positive() {
+                    painter.rect_stroke(bb.expand(4.0), 3.0, Stroke::new(2.0, hi), egui::StrokeKind::Outside);
+                }
+            }
         }
         if let Some(m) = moving {
             // while moving, the moved layers show as stitches in every view
