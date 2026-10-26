@@ -136,6 +136,10 @@ pub struct TraceOptions {
     /// Exact thread colours to use instead of finding them (empty = automatic).
     /// Each picture pixel takes the nearest of these.
     pub fixed_palette: Vec<[u8; 3]>,
+    /// Separate bands (rings, borders, thin lines up to this wide, mm) from
+    /// the solid shapes of the same colour they touch, so each can get its
+    /// own stitch (bands satin, solids fill). 0 = off.
+    pub split_bands_mm: f64,
 }
 
 impl TraceOptions {
@@ -182,6 +186,7 @@ impl Default for TraceOptions {
             snap_circles: true,
             snap_corners: true,
             fixed_palette: Vec::new(),
+            split_bands_mm: 4.0,
         }
     }
 }
@@ -280,6 +285,8 @@ pub struct Trace {
     pub background: Option<[u8; 3]>,
     pub mockup: bool,
     pub notes: Vec<String>,
+    /// Bands wider than this are left with the solid shapes (0 = no split).
+    pub split_bands_mm: f64,
 }
 
 const NONE: u16 = u16::MAX;
@@ -1716,6 +1723,7 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
         background,
         mockup: bg.mockup,
         notes,
+        split_bands_mm: o.split_bands_mm,
     })
 }
 
@@ -1889,10 +1897,8 @@ impl Trace {
             "<svg xmlns='http://www.w3.org/2000/svg' width='{wm:.2}mm' height='{hm:.2}mm' viewBox='0 0 {wm:.3} {hm:.3}'>\n"
         );
         let mut ids = std::collections::HashSet::new();
-        for l in &self.layers {
-            let d: String = l.paths.iter().map(|v| crate::vector::path_d(v, &|p| p)).collect::<Vec<_>>().join(" ");
-            let mut id: String = l
-                .name
+        let mut path = |s: &mut String, name: &str, rgb: [u8; 3], d: &str| {
+            let mut id: String = name
                 .chars()
                 .map(|c| if c.is_alphanumeric() || " -()".contains(c) { c } else { '-' })
                 .collect();
@@ -1901,8 +1907,38 @@ impl Trace {
             }
             s.push_str(&format!(
                 "  <path id='{id}' fill='#{:02x}{:02x}{:02x}' fill-rule='evenodd' d='{d}'/>\n",
-                l.rgb[0], l.rgb[1], l.rgb[2]
+                rgb[0], rgb[1], rgb[2]
             ));
+        };
+        let rings_d = |rings: &[crate::geom::Ring]| -> String {
+            rings
+                .iter()
+                .filter(|r| r.len() >= 3)
+                .map(|r| {
+                    let mut d = format!("M{:.3},{:.3}", r[0].x, r[0].y);
+                    for p in &r[1..] {
+                        d.push_str(&format!(" L{:.3},{:.3}", p.x, p.y));
+                    }
+                    d.push_str(" Z");
+                    d
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for l in &self.layers {
+            let d: String = l.paths.iter().map(|v| crate::vector::path_d(v, &|p| p)).collect::<Vec<_>>().join(" ");
+            if self.split_bands_mm > 0.0 {
+                // same colour, different jobs: rings and lines (satin) apart
+                // from the solid shapes they touch (fill)
+                let rings: Vec<crate::geom::Ring> = l.paths.iter().map(|v| v.flatten()).filter(|r| r.len() >= 3).collect();
+                let (bands, solids) = crate::vector::split_bands(&rings, crate::geom::FillRule::EvenOdd, self.split_bands_mm);
+                if !bands.is_empty() && !solids.is_empty() {
+                    path(&mut s, &format!("{} bands", l.name), l.rgb, &rings_d(&bands));
+                    path(&mut s, &format!("{} solid", l.name), l.rgb, &rings_d(&solids));
+                    continue;
+                }
+            }
+            path(&mut s, &l.name, l.rgb, &d);
         }
         s.push_str("</svg>\n");
         s

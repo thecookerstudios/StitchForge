@@ -1121,6 +1121,30 @@ impl App {
                         changed = true;
                     }
                     ui.end_row();
+                    ui.label("Parts");
+                    ui.horizontal(|ui| {
+                        let mut on = dlg.opts.split_bands_mm > 0.0;
+                        if ui
+                            .checkbox(&mut on, "Separate rings and lines")
+                            .on_hover_text("Rings, borders and lines become their own parts (satin), apart from the solid shapes of the same colour they touch (fill)")
+                            .changed()
+                        {
+                            dlg.opts.split_bands_mm = if on { 4.0 } else { 0.0 };
+                            changed = true;
+                        }
+                        if on {
+                            ui.label("up to");
+                            if ui
+                                .add(egui::DragValue::new(&mut dlg.opts.split_bands_mm).range(0.5..=10.0).speed(0.1).suffix(" mm"))
+                                .on_hover_text("Bands up to this wide are separated. Wider ones stay with the solid shapes")
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            ui.label("wide");
+                        }
+                    });
+                    ui.end_row();
                 });
                 // ---- fine control: each starts at what the Detail level picks
                 let tuned = dlg.opts.smooth_mm.is_some()

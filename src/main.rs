@@ -124,6 +124,10 @@ enum Command {
         /// Use these exact colours, e.g. "#38752e,#598733,#749438,#9b976a" (no colour finding)
         #[arg(long)]
         palette: Option<String>,
+        /// Separate rings, borders and lines up to this wide (mm) from the solid
+        /// shapes of the same colour they touch (bands satin, solids fill); 0 = off
+        #[arg(long, default_value_t = 4.0)]
+        bands: f64,
         /// Output SVG (a preview PNG is written next to it)
         #[arg(long, short)]
         out: PathBuf,
@@ -290,8 +294,9 @@ fn main() {
             keep_background,
             merge_de,
             palette,
+            bands,
             out,
-        } => run_trace(&input, width_in, colors, &detail, &source, keep_background, merge_de, palette, &out),
+        } => run_trace(&input, width_in, colors, &detail, &source, keep_background, merge_de, palette, bands, &out),
         Command::Fonts => {
             for f in import::list_fonts() {
                 println!("{f}");
@@ -419,6 +424,7 @@ fn run_trace(
     keep_background: bool,
     merge_de: Option<f32>,
     palette: Option<String>,
+    bands: f64,
     out: &std::path::Path,
 ) -> Result<(), String> {
     use stitchforge::trace::{self, Detail, Source, TraceOptions};
@@ -447,6 +453,7 @@ fn run_trace(
         remove_background: !keep_background,
         merge_de,
         fixed_palette: parse_palette(palette.as_deref())?,
+        split_bands_mm: bands,
         ..Default::default()
     };
     let t0 = std::time::Instant::now();
