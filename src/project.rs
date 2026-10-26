@@ -331,8 +331,15 @@ pub fn compose(layers: &[Layer], chart: &[Thread]) -> (Artwork, Vec<Thread>) {
             };
             opts.thread = Some(i);
         }
+        // parts are numbered across the layer's shapes, as they are sewn
+        let mut base = 0usize;
         for mut s in l.transformed() {
             s.opts = opts.clone();
+            s.opts.part_base = base;
+            base += match &s.kind {
+                crate::import::ShapeKind::Area { rings, rule } => crate::geom::split_islands(rings, *rule).len().max(1),
+                _ => 1,
+            };
             s.label = l.name.clone();
             shapes.push(s);
         }
@@ -995,5 +1002,34 @@ mod stays_inside {
             }
         }
         assert!(fails.is_empty(), "{} cases:\n{}", fails.len(), fails.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod part_tests {
+    use super::*;
+    use crate::import::{PartOpts, StitchChoice};
+
+    /// One layer, two separate squares: the second one gets its own stitch
+    /// type and the first keeps the layer's, without splitting the layer.
+    #[test]
+    fn a_part_can_have_its_own_stitch_type() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="20mm" viewBox="0 0 40 20">
+            <path fill="#205080" d="M2 2 H18 V18 H2 Z M22 2 H38 V18 H22 Z"/></svg>"##;
+        let art = crate::import::load_svg_str(svg, &usvg::Options::default()).unwrap();
+        let mut l = Layer::new(1, "Squares".into(), art.shapes.clone(), false);
+        let build = |l: &Layer| {
+            let (art, chart) = compose(std::slice::from_ref(l), &crate::thread::generic_chart());
+            let r = crate::settings::recipe("pique").unwrap();
+            crate::design::build("t", &art, &chart, &r, crate::settings::Profile::Flat).unwrap()
+        };
+        let kinds = |d: &crate::design::Design| d.objects.iter().map(|o| o.stitch_type).collect::<Vec<_>>();
+        let before = kinds(&build(&l));
+        assert_eq!(before.len(), 2, "{before:?}");
+        assert_eq!(before[0], before[1]);
+        l.opts.parts.push(PartOpts { index: 1, stitch: StitchChoice::Run, angle_deg: None });
+        let after = kinds(&build(&l));
+        assert_eq!(after[0], before[0], "the other part is unchanged");
+        assert_ne!(after[1], before[1], "the picked part changed: {after:?}");
     }
 }

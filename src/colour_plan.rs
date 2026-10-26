@@ -6,7 +6,7 @@
 //! Colours are chosen by the user, not matched to a thread. A close thread
 //! can be shown as a hint by the caller; nothing here depends on it.
 
-use crate::trace::{self, Detail, Raster, TraceOptions};
+use crate::trace::{self, Detail, Raster, Source, TraceOptions};
 use serde::{Deserialize, Serialize};
 
 /// How closely a colour is traced.
@@ -111,6 +111,18 @@ fn nearest(plan: &Plan, p: [u8; 4]) -> usize {
     best.1
 }
 
+/// Background: transparent, or nearer to white paper than to any picked
+/// colour. (Without this the white around the art goes to whichever picked
+/// colour is palest, and that colour swallows the background.)
+fn is_background(plan: &Plan, p: [u8; 4]) -> bool {
+    if p[3] < 128 {
+        return true;
+    }
+    let d = |c: [u8; 3]| -> f64 { (0..3).map(|k| (p[k] as f64 - c[k] as f64).powi(2)).sum() };
+    let white = d([255, 255, 255]);
+    plan.colours.iter().all(|c| white < d(c.rgb))
+}
+
 /// One traced colour, ready to write out.
 pub struct PlanLayer {
     pub name: String,
@@ -131,7 +143,7 @@ pub fn trace_plan(pic: &Raster, plan: &Plan, width_mm: f64) -> Result<Vec<PlanLa
             .px
             .iter()
             .map(|&p| {
-                if nearest(plan, p) == plan.colours.iter().position(|x| x.rgb == c.rgb).unwrap_or(usize::MAX) {
+                if !is_background(plan, p) && nearest(plan, p) == plan.colours.iter().position(|x| x.rgb == c.rgb).unwrap_or(usize::MAX) {
                     [c.rgb[0], c.rgb[1], c.rgb[2], 255]
                 } else {
                     [255, 255, 255, 255]
@@ -143,6 +155,9 @@ pub fn trace_plan(pic: &Raster, plan: &Plan, width_mm: f64) -> Result<Vec<PlanLa
         let o = TraceOptions {
             width_mm,
             detail: Detail::Balanced,
+            // a clean colour mask, never a garment photo: don't let the
+            // tracer 'remove the garment' (it took the star for one)
+            source: Source::Logo,
             remove_background: true,
             crop: Some([0, 0, w, h]),
             // white is the background: give it its own entry so it is removed
@@ -154,11 +169,15 @@ pub fn trace_plan(pic: &Raster, plan: &Plan, width_mm: f64) -> Result<Vec<PlanLa
             ..Default::default()
         };
         let t = trace::trace(&mask, &o)?;
-        // keep the non-background layers; they are written in the picked colour
+        // keep only this colour's layers. The tracer adjusts colours slightly,
+        // so the white (everything else) layer is not exactly white: judge by
+        // which of the two it is nearer, or the rest of the picture would be
+        // stitched in this colour.
+        let d2 = |a: [u8; 3], b: [u8; 3]| (0..3).map(|k| (a[k] as f64 - b[k] as f64).powi(2)).sum::<f64>();
         let paths: Vec<_> = t
             .layers
             .iter()
-            .filter(|l| l.rgb != [255, 255, 255])
+            .filter(|l| d2(l.rgb, c.rgb) < d2(l.rgb, [255, 255, 255]))
             .flat_map(|l| l.paths.clone())
             .collect();
         out.push(PlanLayer { name: c.name.clone(), rgb: c.rgb, order: c.order, stitch: c.stitch, paths });
@@ -174,14 +193,18 @@ pub fn to_svg(layers: &[PlanLayer], pic: &Raster, mm_per_px: f64) -> String {
         "<svg xmlns='http://www.w3.org/2000/svg' width='{wm:.2}mm' height='{hm:.2}mm' viewBox='0 0 {wm:.3} {hm:.3}'>\n"
     );
     for l in layers {
-        for (i, v) in l.paths.iter().enumerate() {
-            let d = crate::vector::path_d(v, &|p| p);
-            let id: String = l.name.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '-' }).collect();
-            s.push_str(&format!(
-                "  <path id='{id} {i}' fill='#{:02x}{:02x}{:02x}' fill-rule='evenodd' d='{d}'/>\n",
-                l.rgb[0], l.rgb[1], l.rgb[2]
-            ));
+        // one path per colour, even-odd: an outline inside another is a hole
+        // in it (written as separate paths, a hole would become a filled
+        // shape sitting on top). Separate pieces are still separate parts.
+        let d: String = l.paths.iter().map(|v| crate::vector::path_d(v, &|p| p)).collect::<Vec<_>>().join(" ");
+        if d.trim().is_empty() {
+            continue;
         }
+        let id: String = l.name.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '-' }).collect();
+        s.push_str(&format!(
+            "  <path id='{id}' fill='#{:02x}{:02x}{:02x}' fill-rule='evenodd' d='{d}'/>\n",
+            l.rgb[0], l.rgb[1], l.rgb[2]
+        ));
     }
     s.push_str("</svg>\n");
     s
@@ -223,5 +246,16 @@ mod tests {
         };
         assert_eq!(nearest(&p, [20, 10, 5, 255]), 0);
         assert_eq!(nearest(&p, [240, 250, 255, 255]), 1);
+    }
+
+    #[test]
+    fn white_paper_is_background_unless_white_is_picked() {
+        let col = |rgb| PlanColour { name: "c".into(), rgb, order: 1, stitch: StitchKind::Auto, fidelity: Fidelity::Mixed, small: Default::default() };
+        let greens = Plan { areas: vec![], colours: vec![col([56, 117, 46]), col([155, 151, 106])] };
+        assert!(is_background(&greens, [250, 250, 248, 255]));
+        assert!(!is_background(&greens, [150, 150, 100, 255]));
+        assert!(is_background(&greens, [150, 150, 100, 0]));
+        let with_white = Plan { areas: vec![], colours: vec![col([56, 117, 46]), col([250, 250, 250])] };
+        assert!(!is_background(&with_white, [252, 252, 252, 255]));
     }
 }

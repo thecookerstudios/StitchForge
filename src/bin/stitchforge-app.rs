@@ -2804,12 +2804,13 @@ impl App {
                             let on = self.focus_part == Some((l.id, o.sequence));
                             ui.horizontal(|ui| {
                                 let text = RichText::new(format!("#{}  {}{} · {} stitches", o.sequence, o.stitch_type, angle, group(o.stitches))).small();
-                                if ui.selectable_label(on, text).on_hover_text("Click to show this part on the canvas").clicked() {
+                                if ui.selectable_label(on, text).on_hover_text("Click to pick this part: it shows on the canvas and its own settings open on the right").clicked() {
                                     focus = Some((l.id, o.sequence));
                                 }
-                                if many && ui.small_button("own layer").on_hover_text("Give this part its own layer, so its stitch type and settings can be changed on their own").clicked() {
-                                    own_layer = Some((li, k));
+                                if l.opts.parts.iter().any(|p| p.index + 1 == o.label.rsplit(' ').next().and_then(|t| t.parse::<usize>().ok()).unwrap_or(0)) {
+                                    ui.label(RichText::new("own settings").small().color(Color32::from_rgb(90, 150, 240)));
                                 }
+                                let _ = (many, k);
                             });
                         }
                     });
@@ -2905,6 +2906,65 @@ impl App {
         let mut action: Option<&str> = None;
         let design_wt = self.recipe.weight;
         let mut open_guide = false;
+
+        // A part picked in the layers list (one letter, one piece): its own
+        // stitch type and angle, while the layer stays whole (text stays text).
+        let lid = self.layers[li].id;
+        let picked: Option<(usize, String, &'static str)> = self.focus_part.filter(|f| f.0 == lid).and_then(|(_, seq)| {
+            let d = self.design.as_ref()?;
+            let o = d.objects.iter().find(|o| o.layer == li && o.sequence == seq)?;
+            let n = o.label.rsplit(' ').next().and_then(|t| t.parse::<usize>().ok()).unwrap_or(1);
+            Some((n.saturating_sub(1), o.label.clone(), o.stitch_type))
+        });
+        if let Some((pi, label, kind)) = picked {
+            section(ui, "This part");
+            ui.label(RichText::new(format!("{label} · now {kind}")).weak().small());
+            let l = &mut self.layers[li];
+            let cur = l
+                .opts
+                .parts
+                .iter()
+                .find(|p| p.index == pi)
+                .cloned()
+                .unwrap_or(stitchforge::import::PartOpts { index: pi, ..Default::default() });
+            let mut po = cur.clone();
+            ui.horizontal(|ui| {
+                ui.label("Type");
+                let name = |c: StitchChoice| if c == StitchChoice::Auto { "Same as layer".to_string() } else { c.label().to_string() };
+                egui::ComboBox::from_id_salt("part-stitch").selected_text(name(po.stitch)).show_ui(ui, |ui| {
+                    for c in StitchChoice::ALL {
+                        ui.selectable_value(&mut po.stitch, c, name(c));
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Angle");
+                let mut own = po.angle_deg.is_some();
+                if ui.checkbox(&mut own, "own").on_hover_text("Give this part its own stitch angle").changed() {
+                    po.angle_deg = if own { Some(l.opts.angle_deg.unwrap_or(45.0)) } else { None };
+                }
+                if let Some(a) = po.angle_deg.as_mut() {
+                    ui.add(egui::DragValue::new(a).range(0.0..=180.0).speed(1.0).suffix("°"));
+                    for v in [0.0, 45.0, 90.0, 135.0] {
+                        if ui.small_button(format!("{v:.0}")).clicked() {
+                            *a = v;
+                        }
+                    }
+                }
+            });
+            let custom = po.stitch != StitchChoice::Auto || po.angle_deg.is_some();
+            if custom && ui.small_button("Use the layer's settings").clicked() {
+                po = stitchforge::import::PartOpts { index: pi, ..Default::default() };
+            }
+            if po != cur {
+                l.opts.parts.retain(|p| p.index != pi);
+                if po.stitch != StitchChoice::Auto || po.angle_deg.is_some() {
+                    l.opts.parts.push(po);
+                    l.opts.parts.sort_by_key(|p| p.index);
+                }
+                changed = true;
+            }
+        }
 
         section(ui, "Selected layer");
         {

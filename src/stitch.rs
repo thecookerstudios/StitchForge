@@ -198,7 +198,7 @@ pub fn plan(
                 rings: all_rings,
                 rule,
             } => {
-                if matches!(o.stitch, StitchChoice::Run | StitchChoice::TripleRun) {
+                if matches!(o.stitch, StitchChoice::Run | StitchChoice::TripleRun) && o.parts.is_empty() {
                     // Outline only: run around every ring.
                     let paths: Vec<Vec<Pt>> = all_rings
                         .iter()
@@ -242,8 +242,30 @@ pub fn plan(
                     continue;
                 }
                 for (k, rings) in islands.iter().enumerate() {
-                    let name = if many {
-                        format!("{name} {}", k + 1)
+                    // a part (one letter, one piece) may have its own settings
+                    let part = o.parts.iter().find(|p| p.index == o.part_base + k);
+                    let part_stitch = part.map(|p| p.stitch).filter(|s| *s != StitchChoice::Auto).unwrap_or(o.stitch);
+                    let part_angle = part.and_then(|p| p.angle_deg).map(|d| -d.to_radians()).or(user_angle);
+                    if matches!(part_stitch, StitchChoice::Run | StitchChoice::TripleRun) {
+                        // this part as an outline: run round each of its rings
+                        let paths: Vec<Vec<Pt>> = rings
+                            .iter()
+                            .map(|r| {
+                                let mut p = r.clone();
+                                p.push(r[0]);
+                                p
+                            })
+                            .collect();
+                        let kind = if part_stitch == StitchChoice::Run { StitchType::Run } else { StitchType::TripleRun };
+                        let pname = if many || o.part_base > 0 { format!("{name} {}", o.part_base + k + 1) } else { name.clone() };
+                        let mut q = mk(pname, kind, ShapeKind::Line { paths, width: 0.3 }, BBox::of(rings.iter().flatten()), 0.0);
+                        q.opts.stitch = part_stitch;
+                        out.push(q);
+                        continue;
+                    }
+                    // numbered across the whole layer, so a part can be found again
+                    let name = if many || o.part_base > 0 {
+                        format!("{name} {}", o.part_base + k + 1)
                     } else {
                         name.clone()
                     };
@@ -276,7 +298,7 @@ pub fn plan(
                     };
                     let mut satin_angle = pa + FRAC_PI_2;
                     let mut kind = StitchType::Fill;
-                    let consider_satin = match o.stitch {
+                    let consider_satin = match part_stitch {
                         _ if o.puff => true,
                         StitchChoice::Fill => false,
                         StitchChoice::Satin => true,
@@ -305,7 +327,7 @@ pub fn plan(
                         // a curved stroke (a c, an s) never fits one straight
                         // angle, but a turning satin follows it: a stroke of
                         // satin width is satin whatever its shape
-                        if o.stitch == StitchChoice::Satin
+                        if part_stitch == StitchChoice::Satin
                             || o.puff
                             || best.2 <= Limits::SATIN_MAX * 1.25
                             || thickness <= Limits::SATIN_THICKNESS
@@ -313,13 +335,21 @@ pub fn plan(
                             kind = StitchType::Satin;
                         }
                     }
-                    let angle = match (user_angle, kind, profile) {
+                    let angle = match (part_angle, kind, profile) {
                         (Some(a), _, _) => a,
                         (None, StitchType::Satin, _) => satin_angle,
                         (None, _, Profile::Cap) => 0.0, // horizontal rows, sewn bottom to top
                         _ => pa,
                     };
-                    out.push(mk(name, kind, shape, bbox, angle));
+                    let mut q = mk(name, kind, shape, bbox, angle);
+                    if let Some(po) = part {
+                        // the part's own settings carry through to sewing
+                        q.opts.stitch = part_stitch;
+                        if po.angle_deg.is_some() {
+                            q.opts.angle_deg = po.angle_deg;
+                        }
+                    }
+                    out.push(q);
                 }
             }
             ShapeKind::Line { width, .. } => {
@@ -386,12 +416,26 @@ pub fn plan(
         if out[i].opts.keep_under {
             continue; // this layer keeps sewing underneath
         }
+        let own = match &out[i].shape {
+            ShapeKind::Area { rings, rule } => Some((rings.clone(), *rule)),
+            _ => None,
+        };
         let kos: Vec<(Vec<Ring>, FillRule)> = out[i + 1..]
             .iter()
-            .filter(|u| !u.opts.overlay && u.bbox.overlaps(&out[i].bbox, 0.0))
+            // pieces of one shape never overlap each other
+            .filter(|u| !u.opts.overlay && u.stack != out[i].stack && u.bbox.overlaps(&out[i].bbox, 0.0))
             .filter_map(|u| match &u.shape {
                 ShapeKind::Area { rings, rule } => Some((rings.clone(), *rule)),
                 _ => None,
+            })
+            // only areas that really overlap this one (boxes overlap far more
+            // often: neighbouring italic letters, the rings of a spiral)
+            .filter(|k| match &own {
+                Some(a) => {
+                    let both = crate::vector::boolean(&[a.clone(), k.clone()], crate::vector::BoolOp::Intersect);
+                    both.iter().map(|r| ring_area(r).abs()).sum::<f64>() > 0.05
+                }
+                None => true,
             })
             .collect();
         out[i].knockouts = kos;
@@ -870,14 +914,15 @@ fn generate_top(p: &Planned, r: &Recipe, profile: Profile, from: Pt) -> Vec<Need
                         }
                     }
                     StitchType::TripleRun => {
-                        let pts = resample(&path, Limits::RUN_LEN);
+                        let pts = crate::geom::resample_traced(&path, Limits::RUN_LEN);
                         let mut tri = vec![pts[0]];
                         for w in pts.windows(2) {
                             tri.extend([w[1], w[0], w[1]]);
                         }
                         push_section(&mut out, &tri, Limits::RUN_LEN);
                     }
-                    _ => push_section(&mut out, &resample(&path, Limits::RUN_LEN), Limits::RUN_LEN),
+                    // running stitches: even, even along a traced (stepped) line
+                    _ => push_section(&mut out, &crate::geom::resample_traced(&path, Limits::RUN_LEN), Limits::RUN_LEN),
                 }
                 cur = out.last().map(|n| n.p).unwrap_or(cur);
             }
@@ -915,7 +960,7 @@ fn edge_run(out: &mut Vec<Needle>, rings: &[Ring], rule: FillRule, inset: f64, m
         ring.rotate_left(vi);
         let first = ring[0];
         ring.push(first);
-        let pts = resample(&ring, Limits::RUN_LEN);
+        let pts = crate::geom::resample_traced(&ring, Limits::RUN_LEN);
         start_in_shape(out, rings, rule, &pts, Limits::RUN_LEN, &|_| true);
         cur = out.last().map(|n| n.p).unwrap_or(cur);
     }
@@ -1361,15 +1406,38 @@ fn turning_satin(
 ) -> bool {
     let smax = p.satin_max();
     use crate::skeleton::{Graph, skeleton};
+    // Overlapping outlines (a font's stem and arch drawn as two shapes) are
+    // merged into one clean outline first, or the centre line would see the
+    // overlap as a hole and loop round it.
+    let clean = crate::vector::normalize(rings, rule);
+    let (rings, rule): (&[Ring], FillRule) = if clean.is_empty() { (rings, rule) } else { (&clean, FillRule::EvenOdd) };
     let b = BBox::of(rings.iter().flatten());
     let res = (b.width().max(b.height()) / 500.0).clamp(0.04, 0.12);
     let field = Field::new(rings, rule, res);
-    let g: Graph = skeleton(&field);
+    let mut g: Graph = skeleton(&field);
+    // A centre line can only loop round a hole. Loops in a shape without
+    // holes are left over from thinning (where a hairline meets a thick
+    // stem) and would be satined across the junction: drop them.
+    let signed = |r: &Ring| -> f64 {
+        (0..r.len()).map(|i| {
+            let (p, q) = (r[i], r[(i + 1) % r.len()]);
+            p.x * q.y - q.x * p.y
+        }).sum::<f64>() / 2.0
+    };
+    let holes = {
+        let main = rings.iter().map(|r| signed(r)).max_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap()).unwrap_or(0.0);
+        rings.iter().filter(|r| signed(r) * main < 0.0).count()
+    };
+    collapse_short_links(&mut g, &field);
+    // (after merging close junctions, which can turn a small cycle into a loop)
+    if holes == 0 {
+        g.edges.retain(|e| e.a != e.b);
+    }
     if std::env::var("SF_DEBUG_SKEL").is_ok() {
-        eprintln!("skeleton: {} nodes, {} edges", g.nodes.len(), g.edges.len());
+        eprintln!("skeleton: {} nodes, {} edges; {} rings, {} holes, areas {:?}", g.nodes.len(), g.edges.len(), rings.len(), holes, rings.iter().map(|r| (signed(r) * 10.0).round() / 10.0).collect::<Vec<_>>());
         for (i, e) in g.edges.iter().enumerate() {
             let l: f64 = e.pts.windows(2).map(|w| w[0].dist(w[1])).sum();
-            eprintln!("  e{i}: {}({:.1},{:.1}) -> {}({:.1},{:.1}) len {l:.2}", e.a, g.nodes[e.a].x, g.nodes[e.a].y, e.b, g.nodes[e.b].x, g.nodes[e.b].y);
+            eprintln!("  e{i}: {}({:.1},{:.1}) -> {}({:.1},{:.1}) len {l:.2} depth {:.2}/{:.2}", e.a, g.nodes[e.a].x, g.nodes[e.a].y, e.b, g.nodes[e.b].x, g.nodes[e.b].y, field.at(g.nodes[e.a]), field.at(g.nodes[e.b]));
         }
     }
     let total: f64 = g
@@ -1440,12 +1508,24 @@ fn turning_satin(
         TuckOver,
         /// Carries straight on into the next stroke as one column.
         Through,
+        /// A branch meeting a stroke that passes straight through the
+        /// junction (a crossbar meeting a stem): trimmed back to that
+        /// stroke's edge with a slight overlap, so it never sews across it.
+        Butt,
+        /// Carries straight on through a crossing (a t's stem past its
+        /// crossbar): one column, but held to its own width at the crossing,
+        /// or its stitches would run out along the crossing stroke.
+        Cross,
     }
     let end_kind = |n: usize, e: usize| -> End {
         if deg[n] == 1 {
             End::Leaf
-        } else if through.contains_key(&(n, e)) || g.edges[e].a == g.edges[e].b {
+        } else if g.edges[e].a == g.edges[e].b {
             End::Through
+        } else if through.contains_key(&(n, e)) {
+            if deg[n] >= 3 { End::Cross } else { End::Through }
+        } else if deg[n] >= 3 && through.keys().any(|&(m, _)| m == n) {
+            End::Butt
         } else {
             End::Tuck
         }
@@ -1457,7 +1537,7 @@ fn turning_satin(
             // short: a long tuck piles stitches up at the junction
             End::Tuck => d * 0.3,
             End::TuckOver => d * 0.1,
-            End::Through => 0.0,
+            End::Through | End::Cross | End::Butt => 0.0,
         }
     };
     // How far an end's stitches may reach past the stroke's own width
@@ -1466,8 +1546,9 @@ fn turning_satin(
         match k {
             End::Leaf => 2.4,
             End::Corner => 1.5,
-            End::Tuck | End::TuckOver => 1.15,
+            End::Tuck | End::TuckOver | End::Butt => 1.15,
             End::Through => 1.6,
+            End::Cross => 1.15,
         }
     };
     // Split a stroke path where it turns sharply.
@@ -1601,8 +1682,18 @@ fn turning_satin(
             (l.get(l.len() / 2).copied().unwrap_or(1.0), rr.get(rr.len() / 2).copied().unwrap_or(1.0))
         };
         let (m0, m1) = (med(i0, i0 + 15), med(i1.saturating_sub(15), i1));
+        // the stroke's typical half-widths over its whole length: no row may
+        // be far wider than that (a row swinging round a bend at a junction
+        // would sweep right across it), except at a free end's serif
+        let mall = med(0, n);
+        let cap = |m: f64| m * 2.0 + 0.2;
         raw.into_iter()
             .map(|(i, c, nrm, mut l, mut rr)| {
+                let serif = (i < i0 && k0 == End::Leaf) || (i > i1 && k1 == End::Leaf);
+                if !serif {
+                    l = l.min(cap(mall.0));
+                    rr = rr.min(cap(mall.1));
+                }
                 if i < i0 {
                     l = l.min(m0.0 * end_reach(k0) + 0.1);
                     rr = rr.min(m0.1 * end_reach(k0) + 0.1);
@@ -1631,16 +1722,32 @@ fn turning_satin(
     };
     let step = r.satin_spacing / 2.0;
     let shorten = p.short_stitches();
+    // Variable width: the satin follows the shape's width, and where the
+    // shape gets thinner than this thread can satin, it carries on as a
+    // running stitch down the middle until it is wide enough again.
+    let min_w = r.weight.min_column() * 0.9;
     let sew_back = |out: &mut Vec<Needle>, back: &[Vec<(Pt, Pt)>]| {
         for piece in back {
             if piece.len() < 2 {
                 continue;
             }
-            let mut zz = ribs_to_zigzag(piece, step);
-            if shorten {
-                zz = short_stitches(&zz, r.satin_spacing);
+            for (narrow, part) in split_by_width(piece, min_w) {
+                if narrow {
+                    let mid: Vec<Pt> = part.iter().map(|(a, b)| a.lerp(*b, 0.5)).collect();
+                    if mid.len() >= 2 {
+                        push_continue(out, &resample(&mid, Limits::RUN_LEN), Limits::RUN_LEN);
+                    }
+                    continue;
+                }
+                if part.len() < 2 {
+                    continue;
+                }
+                let mut zz = ribs_to_zigzag(&part, step);
+                if shorten {
+                    zz = short_stitches(&zz, r.satin_spacing);
+                }
+                push_continue(out, &split_long(&zz, smax), smax);
             }
-            push_continue(out, &split_long(&zz, smax), smax);
         }
     };
     // Out along a stroke: its underlay (a centre run on narrow strokes,
@@ -1719,8 +1826,18 @@ fn turning_satin(
             // whose satin comes after and covers this end)
             let near_sewn = (0..g.edges.len()).any(|k| k != e && Some(k) != parent && edge_done[k] && touches(k, x));
             edge_done[e] = true;
-            let path = leaving(e, x);
             let y = if g.edges[e].a == x { g.edges[e].b } else { g.edges[e].a };
+            // a butt end stops at the edge of the stroke passing through
+            let mut path = leaving(e, x);
+            let cut = |n: usize| (field.at(g.nodes[n]) - 0.45).max(0.0);
+            if end_kind(x, e) == End::Butt {
+                path = trim_path_start(&path, cut(x));
+            }
+            if end_kind(y, e) == End::Butt {
+                let mut r: Vec<Pt> = path.iter().rev().copied().collect();
+                r = trim_path_start(&r, cut(y));
+                path = r.into_iter().rev().collect();
+            }
             let over = |k: End, sewn: bool| if k == End::Tuck && sewn { End::TuckOver } else { k };
             // at the far end, the strokes branching there are sewn before this
             // stroke's satin comes back over the junction
@@ -1810,6 +1927,17 @@ fn turning_satin(
     }
     // Safety net: the satin must actually cover the shape. If a stroke was
     // missed (an odd centre line), use the regular satin instead.
+    // Sanity: a satin sews about one needle point per half spacing along its
+    // centre lines. Far more means the strokes were sewn over and over (a
+    // tangled centre line); use the regular satin instead.
+    let expected = total / (r.satin_spacing / 2.0);
+    if (out.len() - begin) as f64 > expected * 6.0 + 500.0 {
+        if std::env::var("SF_DEBUG_SKEL").is_ok() {
+            eprintln!("turning satin made {} points for {:.0} expected in {}; using regular satin", out.len() - begin, expected, p.label);
+        }
+        out.truncate(begin);
+        return false;
+    }
     let cov = coverage(&out[begin..], &field, b);
     if cov < 0.95 {
         if std::env::var("SF_DEBUG_SKEL").is_ok() {
@@ -2238,6 +2366,80 @@ fn start_in_shape(
     }
 }
 
+fn ring_area(r: &Ring) -> f64 {
+    (0..r.len())
+        .map(|i| {
+            let (p, q) = (r[i], r[(i + 1) % r.len()]);
+            p.x * q.y - q.x * p.y
+        })
+        .sum::<f64>()
+        / 2.0
+}
+
+/// `path` with its first `d` mm removed (at least a stub is always kept).
+fn trim_path_start(path: &[Pt], d: f64) -> Vec<Pt> {
+    let len: f64 = path.windows(2).map(|w| w[0].dist(w[1])).sum();
+    let d = d.min(len - 0.2);
+    if d <= 0.0 || path.len() < 2 {
+        return path.to_vec();
+    }
+    let mut acc = 0.0;
+    for i in 1..path.len() {
+        let l = path[i - 1].dist(path[i]);
+        if acc + l >= d {
+            let t = ((d - acc) / l.max(1e-9)).clamp(0.0, 1.0);
+            let mut out = vec![path[i - 1].lerp(path[i], t)];
+            out.extend_from_slice(&path[i..]);
+            return out;
+        }
+        acc += l;
+    }
+    path[path.len() - 2..].to_vec()
+}
+
+/// Two junctions closer together than the stroke is wide are really one
+/// junction (a t's crossbar meeting its stem often makes two, a hair apart).
+/// The short link between them would get satin across the whole junction,
+/// laid along the crossbar, so merge them into one junction first.
+fn collapse_short_links(g: &mut crate::skeleton::Graph, field: &Field) {
+    loop {
+        let deg = |g: &crate::skeleton::Graph, n: usize| g.edges.iter().filter(|e| e.a == n || e.b == n).count();
+        let short = (0..g.edges.len()).find(|&k| {
+            let e = &g.edges[k];
+            if e.a == e.b || deg(g, e.a) < 2 || deg(g, e.b) < 2 {
+                return false;
+            }
+            let len: f64 = e.pts.windows(2).map(|w| w[0].dist(w[1])).sum();
+            let width = 2.0 * field.at(g.nodes[e.a]).max(field.at(g.nodes[e.b]));
+            len < width
+        });
+        let Some(k) = short else { break };
+        let e = g.edges.remove(k);
+        let (keep, gone) = (e.a, e.b);
+        let mid = g.nodes[keep].lerp(g.nodes[gone], 0.5);
+        g.nodes[keep] = mid;
+        for f in g.edges.iter_mut() {
+            if f.a == gone {
+                f.a = keep;
+            }
+            if f.b == gone {
+                f.b = keep;
+            }
+            // paths end exactly at their nodes
+            if f.a == keep {
+                if let Some(p0) = f.pts.first_mut() {
+                    *p0 = mid;
+                }
+            }
+            if f.b == keep {
+                if let Some(p1) = f.pts.last_mut() {
+                    *p1 = mid;
+                }
+            }
+        }
+    }
+}
+
 /// Would a run from `a` to `b` lie on top of top stitches already sewn in
 /// `sewn`? (Underlay and jumps don't count: they are covered or not sewn.)
 fn crosses_sewn(sewn: &[Needle], a: Pt, b: Pt) -> bool {
@@ -2517,6 +2719,42 @@ fn cap_ribs(c: Pt, d: Pt, nl: Pt, half: f64, cap: Cap) -> Vec<(Pt, Pt)> {
 
 /// Zig-zag between the two edges, alternating sides every `step`, measured
 /// continuously along whichever edge moves more (so corners stay covered).
+/// Split a run of satin ribs into stretches that are wide enough for satin
+/// and stretches thinner than `min_w` (sewn as a running stitch instead).
+/// Thin stretches shorter than 0.6 mm stay satin (a brief pinch, not a line).
+fn split_by_width(ribs: &[(Pt, Pt)], min_w: f64) -> Vec<(bool, Vec<(Pt, Pt)>)> {
+    let thin: Vec<bool> = ribs.iter().map(|(a, b)| a.dist(*b) < min_w).collect();
+    let mut out: Vec<(bool, Vec<(Pt, Pt)>)> = Vec::new();
+    for (i, r) in ribs.iter().enumerate() {
+        match out.last_mut() {
+            Some((t, v)) if *t == thin[i] => v.push(*r),
+            _ => out.push((thin[i], vec![*r])),
+        }
+    }
+    // a short thin stretch between satin is a pinch: keep it satin
+    let len = |v: &[(Pt, Pt)]| v.windows(2).map(|w| w[0].0.lerp(w[0].1, 0.5).dist(w[1].0.lerp(w[1].1, 0.5))).sum::<f64>();
+    for k in 0..out.len() {
+        if out[k].0 && len(&out[k].1) < 0.6 && out.len() > 1 {
+            out[k].0 = false;
+        }
+    }
+    // merge neighbours of the same kind, and let each stretch share its
+    // first rib with the one before so the stitching is continuous
+    let mut merged: Vec<(bool, Vec<(Pt, Pt)>)> = Vec::new();
+    for (t, v) in out {
+        match merged.last_mut() {
+            Some((mt, mv)) if *mt == t => mv.extend(v),
+            Some((_, mv)) => {
+                let mut w = vec![*mv.last().unwrap()];
+                w.extend(v);
+                merged.push((t, w));
+            }
+            None => merged.push((t, v)),
+        }
+    }
+    merged
+}
+
 fn ribs_to_zigzag(ribs: &[(Pt, Pt)], step: f64) -> Vec<Pt> {
     if ribs.len() < 2 {
         return ribs.iter().map(|r| r.0).collect();
