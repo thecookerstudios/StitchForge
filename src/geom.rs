@@ -524,6 +524,27 @@ pub fn rotate_rings(rings: &[Ring], a: f64) -> Vec<Ring> {
 /// Resample an open polyline into even steps of at most `max_step`, keeping
 /// sharp corners (over 30°) as needle points. Dense input gets thinned, long
 /// segments get split.
+/// Even running stitches along a traced (pixel-stepped) line: the little
+/// steps are smoothed out before spacing the stitches, so they don't each
+/// make a corner (and a tiny stitch). Real corners, judged over ~0.4 mm, stay.
+pub fn resample_traced(poly: &[Pt], max_step: f64) -> Vec<Pt> {
+    if poly.len() < 3 {
+        return resample(poly, max_step);
+    }
+    // keep only points at least 0.4 mm apart (and every sharp turn among them)
+    let mut thin: Vec<Pt> = vec![poly[0]];
+    for &p in &poly[1..] {
+        if thin.last().unwrap().dist(p) >= 0.4 {
+            thin.push(p);
+        }
+    }
+    let last = *poly.last().unwrap();
+    if thin.last().unwrap().dist(last) > 1e-9 {
+        thin.push(last);
+    }
+    resample(&thin, max_step)
+}
+
 pub fn resample(poly: &[Pt], max_step: f64) -> Vec<Pt> {
     let mut pts: Vec<Pt> = Vec::with_capacity(poly.len());
     for &p in poly {

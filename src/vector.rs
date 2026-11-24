@@ -252,6 +252,67 @@ pub fn path_d(v: &VPath, tf: &dyn Fn(Pt) -> Pt) -> String {
     d
 }
 
+/// Separate the bands of a shape (rings, borders, thin lines: anything no
+/// wider than `max_band` mm) from its solid parts (a silhouette, a disc),
+/// even where they touch and are the same colour. Bands suit satin, solids
+/// suit fill.
+///
+/// Works by "opening": shrink the shape by half the band width and grow it
+/// back. Bands vanish when shrunk; solid parts come back. Bands are what the
+/// opening lost. Scraps too small to be a real band (corners the opening
+/// rounds off) stay with the solid part next to them.
+///
+/// Returns (bands, solids), both even-odd rings.
+pub fn split_bands(rings: &[Ring], rule: FillRule, max_band: f64) -> (Vec<Ring>, Vec<Ring>) {
+    let whole = normalize(rings, rule);
+    if whole.is_empty() || max_band <= 0.0 {
+        return (Vec::new(), whole);
+    }
+    let r = max_band / 2.0 + 0.05;
+    let shrunk = offset(&whole, FillRule::EvenOdd, -r, true);
+    if shrunk.is_empty() {
+        return (whole, Vec::new()); // all of it is band
+    }
+    let opened = offset(&shrunk, FillRule::EvenOdd, r, true);
+    let solids = boolean(&[(opened, FillRule::EvenOdd), (whole.clone(), FillRule::EvenOdd)], BoolOp::Intersect);
+    let rest = boolean(&[(whole.clone(), FillRule::EvenOdd), (solids.clone(), FillRule::EvenOdd)], BoolOp::Subtract);
+    // keep only pieces of `rest` long enough to be bands; scraps go back to
+    // the solids
+    let area = |rs: &[Ring]| -> f64 {
+        rs.iter()
+            .map(|r| {
+                (0..r.len())
+                    .map(|i| {
+                        let (p, q) = (r[i], r[(i + 1) % r.len()]);
+                        p.x * q.y - q.x * p.y
+                    })
+                    .sum::<f64>()
+                    / 2.0
+            })
+            .sum::<f64>()
+            .abs()
+    };
+    let mut bands: Vec<Ring> = Vec::new();
+    let mut scraps: Vec<Ring> = Vec::new();
+    for piece in crate::geom::split_islands(&rest, FillRule::EvenOdd) {
+        let a = area(&piece);
+        let b = crate::geom::BBox::of(piece.iter().flatten());
+        let span = b.width().max(b.height());
+        // a band is long for its width: at least ~3 widths long
+        if a > 0.05 && span >= 3.0 * (a / span.max(1e-6)).max(0.2) && span > max_band {
+            bands.extend(piece);
+        } else {
+            scraps.extend(piece);
+        }
+    }
+    let solids = if scraps.is_empty() {
+        solids
+    } else {
+        boolean(&[(solids, FillRule::EvenOdd), (scraps, FillRule::EvenOdd)], BoolOp::Union)
+    };
+    (bands, solids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +371,36 @@ mod tests {
         let d = path_d(&e, &|p| p);
         assert!(d.starts_with("M15.000,10.000 C"));
         assert!(d.ends_with('Z'));
+    }
+
+    #[test]
+    fn split_bands_separates_a_ring_from_a_disc_it_touches() {
+        use crate::geom::Pt;
+        // a ring 2 mm wide (radius 20 to 22) and a solid disc of radius 6
+        // sitting on it at the top: one connected shape
+        let circle = |cx: f64, cy: f64, r: f64, ccw: bool| -> Ring {
+            let n = 180;
+            let mut v: Vec<Pt> = (0..n)
+                .map(|i| {
+                    let t = i as f64 / n as f64 * std::f64::consts::TAU;
+                    Pt::new(cx + r * t.cos(), cy + r * t.sin())
+                })
+                .collect();
+            if !ccw {
+                v.reverse();
+            }
+            v
+        };
+        let ring = vec![circle(0.0, 0.0, 22.0, true), circle(0.0, 0.0, 20.0, false)];
+        let disc = vec![circle(0.0, -21.0, 6.0, true)];
+        let shape = boolean(&[(ring, FillRule::EvenOdd), (disc, FillRule::EvenOdd)], BoolOp::Union);
+        assert_eq!(crate::geom::split_islands(&shape, FillRule::EvenOdd).len(), 1, "one connected shape");
+        let (bands, solids) = split_bands(&shape, FillRule::EvenOdd, 4.0);
+        let area = |rs: &[Ring]| rs.iter().map(|r| (0..r.len()).map(|i| { let (p, q) = (r[i], r[(i + 1) % r.len()]); p.x * q.y - q.x * p.y }).sum::<f64>() / 2.0).sum::<f64>().abs();
+        let disc_area = std::f64::consts::PI * 36.0;
+        let ring_area = std::f64::consts::PI * (22.0f64.powi(2) - 20.0f64.powi(2));
+        // the solid part is about the disc; the band is about the ring
+        assert!((area(&solids) - disc_area).abs() < disc_area * 0.25, "solids {} vs disc {}", area(&solids), disc_area);
+        assert!(area(&bands) > ring_area * 0.75, "bands {} vs ring {}", area(&bands), ring_area);
     }
 }

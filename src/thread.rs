@@ -350,17 +350,34 @@ pub fn color_name(rgb: [u8; 3]) -> String {
 }
 
 pub fn nearest(chart: &[Thread], rgb: [u8; 3]) -> (usize, f64) {
-    chart
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (i, delta_e(t.rgb, rgb)))
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-        .unwrap()
+    // variegated threads (ombre, multi, astro, melange) and ones marked as
+    // unverified are never picked automatically, only by hand
+    let solid = |t: &Thread| {
+        let n = t.name.to_ascii_lowercase();
+        !["ombre", "multi", "astro", "variegated", "melange", "unverified", "discontinued"].iter().any(|w| n.contains(w))
+    };
+    let best = |only_solid: bool| {
+        chart
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !only_solid || solid(t))
+            .map(|(i, t)| (i, delta_e(t.rgb, rgb)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+    };
+    best(true).or_else(|| best(false)).unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auto_match_skips_variegated() {
+        let t = |c: &str, n: &str, rgb| Thread { brand: "x".into(), code: c.into(), name: n.into(), rgb };
+        let chart = vec![t("1", "Orange Ombre", [240, 150, 20]), t("2", "Orange", [230, 130, 30])];
+        assert_eq!(nearest(&chart, [240, 150, 20]).0, 1);
+        let only = vec![t("1", "Orange Ombre", [240, 150, 20])];
+        assert_eq!(nearest(&only, [240, 150, 20]).0, 0);
+    }
     #[test]
     fn weights() {
         assert_eq!(ThreadWeight::default(), ThreadWeight::W40);

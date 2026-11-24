@@ -133,6 +133,13 @@ pub struct TraceOptions {
     pub snap_circles: bool,
     /// snap straight-edged shapes to sharp corners
     pub snap_corners: bool,
+    /// Exact thread colours to use instead of finding them (empty = automatic).
+    /// Each picture pixel takes the nearest of these.
+    pub fixed_palette: Vec<[u8; 3]>,
+    /// Separate bands (rings, borders, thin lines up to this wide, mm) from
+    /// the solid shapes of the same colour they touch, so each can get its
+    /// own stitch (bands satin, solids fill). 0 = off.
+    pub split_bands_mm: f64,
 }
 
 impl TraceOptions {
@@ -140,7 +147,7 @@ impl TraceOptions {
         self.smooth_mm.unwrap_or(self.detail.smooth_mm()).clamp(0.0, 1.0)
     }
     pub fn eff_speck(&self) -> f64 {
-        self.speck_mm2.unwrap_or(self.detail.speck_mm2()).clamp(0.05, 50.0)
+        self.speck_mm2.unwrap_or(self.detail.speck_mm2()).clamp(0.02, 50.0)
     }
     pub fn eff_min_line(&self) -> f64 {
         self.min_line_mm
@@ -149,13 +156,13 @@ impl TraceOptions {
                 Detail::Balanced => 0.45,
                 Detail::Fine => 0.3,
             })
-            .clamp(0.05, 3.0)
+            .clamp(0.02, 3.0)
     }
     pub fn eff_merge(&self) -> f32 {
         self.merge_de.unwrap_or(self.detail.merge_de()).clamp(2.0, 60.0)
     }
     pub fn eff_fit(&self) -> f64 {
-        self.fit_tol_mm.unwrap_or(self.detail.fit_tol()).clamp(0.02, 0.5)
+        self.fit_tol_mm.unwrap_or(self.detail.fit_tol()).clamp(0.01, 0.5)
     }
 }
 
@@ -178,6 +185,8 @@ impl Default for TraceOptions {
             fit_tol_mm: None,
             snap_circles: true,
             snap_corners: true,
+            fixed_palette: Vec::new(),
+            split_bands_mm: 4.0,
         }
     }
 }
@@ -276,6 +285,8 @@ pub struct Trace {
     pub background: Option<[u8; 3]>,
     pub mockup: bool,
     pub notes: Vec<String>,
+    /// Bands wider than this are left with the solid shapes (0 = no split).
+    pub split_bands_mm: f64,
 }
 
 const NONE: u16 = u16::MAX;
@@ -1338,16 +1349,21 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
     let stride = (pool.len() / 40000).max(1);
     let samples: Vec<[f32; 3]> = pool.iter().step_by(stride).filter_map(|&i| labs[i]).collect();
     let max = if o.max_colors == 0 { 12 } else { o.max_colors.clamp(1, 15) };
-    let mut cs = kmeans(&samples, (max * 2).max(16));
-    // tiny clusters are noise or edge colours
-    let total: usize = cs.iter().map(|c| c.1).sum();
-    let min_share = match detail {
-        Detail::Clean => 0.006,
-        Detail::Balanced => 0.003,
-        Detail::Fine => 0.0012,
+    let mut cs = if o.fixed_palette.is_empty() {
+        let mut cs = kmeans(&samples, (max * 2).max(16));
+        // tiny clusters are noise or edge colours
+        let total: usize = cs.iter().map(|c| c.1).sum();
+        let min_share = match detail {
+            Detail::Clean => 0.006,
+            Detail::Balanced => 0.003,
+            Detail::Fine => 0.0012,
+        };
+        cs.retain(|c| c.1 as f64 >= total as f64 * min_share);
+        merge_colors(cs, o.eff_merge(), max)
+    } else {
+        // the user gave the thread colours: use them exactly
+        o.fixed_palette.iter().map(|c| (lab(*c), 1usize)).collect()
     };
-    cs.retain(|c| c.1 as f64 >= total as f64 * min_share);
-    let mut cs = merge_colors(cs, o.eff_merge(), max);
     cs.sort_by(|a, b| b.1.cmp(&a.1));
     let centers: Vec<[f32; 3]> = cs.iter().map(|c| c.0).collect();
     if centers.is_empty() {
@@ -1443,12 +1459,33 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
         let thick: Vec<f64> = (0..centers.len()).map(|j| 2.0 * cnt[j] as f64 / per[j].max(1) as f64 * mm_per_px).collect();
         let (comp, sizes) = components(w, h, |i, j| labels[i] == labels[j]);
         let mut votes: std::collections::BTreeMap<u32, std::collections::BTreeMap<u16, usize>> = Default::default();
+        // per piece: pixels, edge length, and whether it borders the real
+        // surroundings (the background reached from the picture's edge)
+        let mut area: std::collections::HashMap<u32, (usize, usize, bool)> = Default::default();
         for i in 0..n {
             let l = labels[i];
             if l == NONE || !like_bg[l as usize] || o.keep.contains(&(l as usize)) {
                 continue;
             }
             let (x, y) = (i % w, i / w);
+            let e = area.entry(comp[i]).or_insert((0, 0, false));
+            e.0 += 1;
+            for j in [
+                (x > 0).then(|| i - 1),
+                (x + 1 < w).then(|| i + 1),
+                (y > 0).then(|| i - w),
+                (y + 1 < h).then(|| i + w),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if comp[j] != comp[i] {
+                    e.1 += 1;
+                    if bg.mask[j] {
+                        e.2 = true;
+                    }
+                }
+            }
             for j in [
                 (x > 0).then(|| i - 1),
                 (x + 1 < w).then(|| i + 1),
@@ -1464,11 +1501,29 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
             }
         }
         let mut out: std::collections::HashSet<u32> = Default::default();
+        let px_mm2 = mm_per_px * mm_per_px;
         for (c, v) in votes {
-            let touches_bg = v.get(&NONE).copied().unwrap_or(0) > 0;
-            let (top, _) = v.iter().max_by_key(|(_, n)| **n).map(|(l, n)| (*l, *n)).unwrap();
-            let in_thin = top != NONE && thick[top as usize] < 3.5;
-            if touches_bg || in_thin {
+            let (px, edge, outside) = area.get(&c).copied().unwrap_or((0, 0, false));
+            let own_thick = 2.0 * px as f64 / edge.max(1) as f64 * mm_per_px;
+            let area_mm2 = px as f64 * px_mm2;
+            // Light areas inside the subject are part of it (a skull's
+            // highlights, a white shirt on a figure): the background flood
+            // stopped at an edge before them. Only drop what really is the
+            // surroundings showing: thin fringes against the outside, and
+            // small counters held inside thin strokes (letters).
+            let fringe = outside && (own_thick < 1.0 || area_mm2 < 2.0);
+            let (top, top_n) = v.iter().max_by_key(|(_, n)| **n).map(|(l, n)| (*l, *n)).unwrap();
+            let border_n: usize = v.values().sum();
+            // a letter's counter is held by one stroke colour all round;
+            // a light patch between several colours is part of the artwork
+            let one_holder = top_n as f64 >= 0.85 * border_n.max(1) as f64;
+            let counter = !outside && top != NONE && one_holder && thick[top as usize] < 3.5 && area_mm2 < 80.0;
+            let mockup_show = bg.mockup && outside;
+            if std::env::var("SF_DEBUG_TRACE").is_ok() && (fringe || counter || mockup_show) {
+                let tot: usize = v.values().sum();
+                eprintln!("bg-like piece {area_mm2:.1} mm² thick {own_thick:.2} outside {outside} top share {:.2} fringe {fringe} counter {counter}", v.get(&top).copied().unwrap_or(0) as f64 / tot.max(1) as f64);
+            }
+            if fringe || counter || mockup_show {
                 out.insert(c);
             }
         }
@@ -1707,6 +1762,7 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
         background,
         mockup: bg.mockup,
         notes,
+        split_bands_mm: o.split_bands_mm,
     })
 }
 
@@ -1880,10 +1936,8 @@ impl Trace {
             "<svg xmlns='http://www.w3.org/2000/svg' width='{wm:.2}mm' height='{hm:.2}mm' viewBox='0 0 {wm:.3} {hm:.3}'>\n"
         );
         let mut ids = std::collections::HashSet::new();
-        for l in &self.layers {
-            let d: String = l.paths.iter().map(|v| crate::vector::path_d(v, &|p| p)).collect::<Vec<_>>().join(" ");
-            let mut id: String = l
-                .name
+        let mut path = |s: &mut String, name: &str, rgb: [u8; 3], d: &str| {
+            let mut id: String = name
                 .chars()
                 .map(|c| if c.is_alphanumeric() || " -()".contains(c) { c } else { '-' })
                 .collect();
@@ -1892,8 +1946,38 @@ impl Trace {
             }
             s.push_str(&format!(
                 "  <path id='{id}' fill='#{:02x}{:02x}{:02x}' fill-rule='evenodd' d='{d}'/>\n",
-                l.rgb[0], l.rgb[1], l.rgb[2]
+                rgb[0], rgb[1], rgb[2]
             ));
+        };
+        let rings_d = |rings: &[crate::geom::Ring]| -> String {
+            rings
+                .iter()
+                .filter(|r| r.len() >= 3)
+                .map(|r| {
+                    let mut d = format!("M{:.3},{:.3}", r[0].x, r[0].y);
+                    for p in &r[1..] {
+                        d.push_str(&format!(" L{:.3},{:.3}", p.x, p.y));
+                    }
+                    d.push_str(" Z");
+                    d
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for l in &self.layers {
+            let d: String = l.paths.iter().map(|v| crate::vector::path_d(v, &|p| p)).collect::<Vec<_>>().join(" ");
+            if self.split_bands_mm > 0.0 {
+                // same colour, different jobs: rings and lines (satin) apart
+                // from the solid shapes they touch (fill)
+                let rings: Vec<crate::geom::Ring> = l.paths.iter().map(|v| v.flatten()).filter(|r| r.len() >= 3).collect();
+                let (bands, solids) = crate::vector::split_bands(&rings, crate::geom::FillRule::EvenOdd, self.split_bands_mm);
+                if !bands.is_empty() && !solids.is_empty() {
+                    path(&mut s, &format!("{} bands", l.name), l.rgb, &rings_d(&bands));
+                    path(&mut s, &format!("{} solid", l.name), l.rgb, &rings_d(&solids));
+                    continue;
+                }
+            }
+            path(&mut s, &l.name, l.rgb, &d);
         }
         s.push_str("</svg>\n");
         s

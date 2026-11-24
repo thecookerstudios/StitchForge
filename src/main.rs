@@ -28,6 +28,20 @@ enum Command {
         #[command(flatten)]
         out: OutputArgs,
     },
+    /// Trace a picture colour by colour, in the sew order and fidelity of a plan file
+    Plan {
+        /// Picture (PNG, JPG)
+        input: PathBuf,
+        /// Plan JSON: colours with name, rgb, order, stitch and fidelity
+        #[arg(long)]
+        plan: PathBuf,
+        /// Width the picture will sew at, inches
+        #[arg(long, default_value_t = 4.0)]
+        width_in: f64,
+        /// Output SVG (a preview PNG is written next to it)
+        #[arg(short, long)]
+        out: PathBuf,
+    },
     /// Stitch a line of text in any installed font (or a .ttf/.otf file)
     Text {
         /// The words to stitch
@@ -104,6 +118,16 @@ enum Command {
         /// Keep the background colour instead of removing it
         #[arg(long)]
         keep_background: bool,
+        /// Colours closer than this ΔE (CIE76) are merged; lower keeps more colours
+        #[arg(long)]
+        merge_de: Option<f32>,
+        /// Use these exact colours, e.g. "#38752e,#598733,#749438,#9b976a" (no colour finding)
+        #[arg(long)]
+        palette: Option<String>,
+        /// Separate rings, borders and lines up to this wide (mm) from the solid
+        /// shapes of the same colour they touch (bands satin, solids fill); 0 = off
+        #[arg(long, default_value_t = 4.0)]
+        bands: f64,
         /// Output SVG (a preview PNG is written next to it)
         #[arg(long, short)]
         out: PathBuf,
@@ -125,6 +149,13 @@ struct OutputArgs {
     /// Thread weight: 12, 30, 40 (default) or 60
     #[arg(long, default_value = "40")]
     weight: String,
+    /// Plan file: sets each colour's stitch type (see `plan`)
+    #[arg(long)]
+    plan: Option<PathBuf>,
+    /// Stitch type per colour, e.g. "#354f23=run,#607434=fill,#9c936b=satin+run"
+    /// (run, fill, satin, satin+run, triple-run). Matches shapes by their colour.
+    #[arg(long)]
+    stitch_map: Option<String>,
     /// Final design width in mm (keeps proportions)
     #[arg(long)]
     width_mm: Option<f64>,
@@ -187,6 +218,7 @@ fn main() {
             let w = out.width_mm.or(out.width_in.map(|v| v * 25.4));
             import::load_file(&input.to_string_lossy(), w).and_then(|art| produce(art, &name, &out))
         }
+        Command::Plan { input, plan, width_in, out } => run_plan(&input, &plan, width_in, &out),
         Command::Text {
             text,
             font,
@@ -260,8 +292,11 @@ fn main() {
             detail,
             source,
             keep_background,
+            merge_de,
+            palette,
+            bands,
             out,
-        } => run_trace(&input, width_in, colors, &detail, &source, keep_background, &out),
+        } => run_trace(&input, width_in, colors, &detail, &source, keep_background, merge_de, palette, bands, &out),
         Command::Fonts => {
             for f in import::list_fonts() {
                 println!("{f}");
@@ -276,6 +311,110 @@ fn main() {
     }
 }
 
+/// "#rrggbb,#rrggbb" into colours; None or empty = automatic.
+fn parse_palette(s: Option<&str>) -> Result<Vec<[u8; 3]>, String> {
+    let Some(s) = s else { return Ok(Vec::new()) };
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let h = p.trim_start_matches('#');
+            if h.len() != 6 {
+                return Err(format!("palette colour '{p}' must be six hex digits"));
+            }
+            let c = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).map_err(|e| e.to_string());
+            Ok([c(0)?, c(2)?, c(4)?])
+        })
+        .collect()
+}
+
+/// Set each shape's stitch, underlay and small-piece rule from its colour in the plan.
+
+fn run_plan(input: &std::path::Path, plan_path: &std::path::Path, width_in: f64, out: &std::path::Path) -> Result<(), String> {
+    use stitchforge::colour_plan::{to_svg, trace_plan, Plan};
+    let bytes = std::fs::read(input).map_err(|e| format!("cannot read {}: {e}", input.display()))?;
+    let pic = stitchforge::trace::Raster::decode(&bytes)?;
+    let plan = Plan::from_json(&std::fs::read_to_string(plan_path).map_err(|e| e.to_string())?)?;
+    let t0 = std::time::Instant::now();
+    let width_mm = width_in * 25.4;
+    let mm_per_px = width_mm / pic.w as f64;
+    let layers = trace_plan(&pic, &plan, width_mm)?;
+    std::fs::write(out, to_svg(&layers, &pic, mm_per_px)).map_err(|e| e.to_string())?;
+    println!("{}: {} colours in sew order · traced in {:.2}s", out.display(), layers.len(), t0.elapsed().as_secs_f64());
+    for l in &layers {
+        println!("  {} #{:02x}{:02x}{:02x} · order {} · {:?} · {} paths", l.name, l.rgb[0], l.rgb[1], l.rgb[2], l.order, l.stitch, l.paths.len());
+    }
+    Ok(())
+}
+
+/// Stitch map string ("#rrggbb=run,...") from a plan file.
+/// Apply a plan: each colour's stitch type, small-piece rule and its own
+/// thread stop (the picked colour, added to the chart), then per-area overrides.
+fn apply_plan(art: &mut import::Artwork, plan: &stitchforge::colour_plan::Plan, chart: &mut Vec<thread::Thread>) {
+    use stitchforge::colour_plan::StitchKind;
+    use import::{StitchChoice, Underlay};
+    for c in plan.sorted() {
+        let (stitch, under) = match c.stitch {
+            StitchKind::Auto => (None, None),
+            StitchKind::Fill => (Some(StitchChoice::Fill), None),
+            StitchKind::Satin => (Some(StitchChoice::Satin), None),
+            StitchKind::Run => (Some(StitchChoice::Run), None),
+            StitchKind::TripleRun => (Some(StitchChoice::TripleRun), None),
+            StitchKind::SatinRun => (Some(StitchChoice::Satin), Some(Underlay::CenterRun)),
+        };
+        chart.push(thread::Thread {
+            brand: "Picked".into(),
+            code: format!("P{}", c.order),
+            name: c.name.clone(),
+            rgb: c.rgb,
+        });
+        let idx = chart.len() - 1;
+        let near = |a: [u8; 3]| (0..3).all(|i| (a[i] as i32 - c.rgb[i] as i32).abs() <= 6);
+        for sh in art.shapes.iter_mut().filter(|sh| near(sh.rgb)) {
+            if let Some(st) = stitch {
+                sh.opts.stitch = st;
+            }
+            if let Some(u) = under {
+                sh.opts.satin_underlay = u;
+            }
+            sh.opts.small_pieces = c.small;
+            sh.opts.thread = Some(idx);
+        }
+    }
+    for a in &plan.areas {
+        for sh in art.shapes.iter_mut().filter(|sh| sh.label == a.id) {
+            sh.opts.stitch = match a.stitch {
+                StitchKind::Auto => sh.opts.stitch,
+                StitchKind::Fill => StitchChoice::Fill,
+                StitchKind::Satin | StitchKind::SatinRun => StitchChoice::Satin,
+                StitchKind::Run => StitchChoice::Run,
+                StitchKind::TripleRun => StitchChoice::TripleRun,
+            };
+            if let Some(sp) = a.small {
+                sh.opts.small_pieces = sp;
+            }
+        }
+    }
+}
+
+fn plan_stitch_map(plan_path: &std::path::Path) -> Result<String, String> {
+    use stitchforge::colour_plan::{Plan, StitchKind};
+    let plan = Plan::from_json(&std::fs::read_to_string(plan_path).map_err(|e| e.to_string())?)?;
+    let mut parts = Vec::new();
+    for c in plan.sorted() {
+        let how = match c.stitch {
+            StitchKind::Auto => continue,
+            StitchKind::Fill => "fill",
+            StitchKind::Satin => "satin",
+            StitchKind::Run => "run",
+            StitchKind::TripleRun => "triple-run",
+            StitchKind::SatinRun => "satin+run",
+        };
+        parts.push(format!("#{:02x}{:02x}{:02x}={how}", c.rgb[0], c.rgb[1], c.rgb[2]));
+    }
+    Ok(parts.join(","))
+}
+
 fn run_trace(
     input: &std::path::Path,
     width_in: f64,
@@ -283,6 +422,9 @@ fn run_trace(
     detail: &str,
     source: &str,
     keep_background: bool,
+    merge_de: Option<f32>,
+    palette: Option<String>,
+    bands: f64,
     out: &std::path::Path,
 ) -> Result<(), String> {
     use stitchforge::trace::{self, Detail, Source, TraceOptions};
@@ -309,6 +451,9 @@ fn run_trace(
             _ => Source::Auto,
         },
         remove_background: !keep_background,
+        merge_de,
+        fixed_palette: parse_palette(palette.as_deref())?,
+        split_bands_mm: bands,
         ..Default::default()
     };
     let t0 = std::time::Instant::now();
@@ -367,14 +512,56 @@ fn run_trace(
     Ok(())
 }
 
+/// Parse "#rrggbb=stitch[+underlay]" pairs and set each matching shape's stitch.
+fn apply_stitch_map(art: &mut import::Artwork, map: &str) -> Result<(), String> {
+    use stitchforge::import::{StitchChoice, Underlay};
+    for pair in map.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (hex, how) = pair.split_once('=').ok_or(format!("stitch map entry '{pair}' needs colour=stitch"))?;
+        let hex = hex.trim().trim_start_matches('#');
+        if hex.len() != 6 {
+            return Err(format!("colour '{hex}' must be six hex digits"));
+        }
+        let c = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| e.to_string());
+        let rgb = [c(0)?, c(2)?, c(4)?];
+        let (stitch, under) = match how.trim().to_lowercase().as_str() {
+            "run" => (StitchChoice::Run, None),
+            "fill" | "tatami" => (StitchChoice::Fill, None),
+            "satin" => (StitchChoice::Satin, None),
+            "satin+run" => (StitchChoice::Satin, Some(Underlay::CenterRun)),
+            "triple-run" | "triple" => (StitchChoice::TripleRun, None),
+            other => return Err(format!("unknown stitch '{other}' (run, fill, satin, satin+run, triple-run)")),
+        };
+        let near = |a: [u8; 3]| (0..3).all(|i| (a[i] as i32 - rgb[i] as i32).abs() <= 6);
+        let mut hit = 0;
+        for sh in art.shapes.iter_mut().filter(|sh| near(sh.rgb)) {
+            sh.opts.stitch = stitch;
+            if let Some(u) = under {
+                sh.opts.satin_underlay = u;
+            }
+            hit += 1;
+        }
+        if hit == 0 {
+            return Err(format!("no shape has colour #{hex}; check the colours in the traced SVG"));
+        }
+    }
+    Ok(())
+}
+
 fn produce(mut art: import::Artwork, name: &str, o: &OutputArgs) -> Result<(), String> {
     let w = o.width_mm.or(o.width_in.map(|v| v * 25.4));
     let h = o.height_mm.or(o.height_in.map(|v| v * 25.4));
     import::fit(&mut art, w, h);
-    let chart = match &o.threads {
+    if let Some(map) = &o.stitch_map {
+        apply_stitch_map(&mut art, map)?;
+    }
+    let mut chart = match &o.threads {
         Some(p) => thread::load_chart_csv(p)?,
         None => thread::generic_chart(),
     };
+    if let Some(p) = &o.plan {
+        let plan = stitchforge::colour_plan::Plan::from_json(&std::fs::read_to_string(p).map_err(|e| e.to_string())?)?;
+        apply_plan(&mut art, &plan, &mut chart);
+    }
     let profiles: Vec<Profile> = match o.profile.as_str() {
         "both" => vec![Profile::Flat, Profile::Cap],
         p => vec![

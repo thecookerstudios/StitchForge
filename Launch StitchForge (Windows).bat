@@ -5,8 +5,14 @@ cd /d "%~dp0"
 title StitchForge launcher
 echo StitchForge launcher - folder: %CD%
 echo.
+rem A ready-made app needs no build tools: use it if it is here.
+if exist "StitchForge.exe" goto runexe
+if exist "stitchforge-app.exe" (
+  copy /y "stitchforge-app.exe" "StitchForge.exe" >nul
+  goto runexe
+)
 if exist "%USERPROFILE%\.cargo\bin\cargo.exe" set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
-where cargo >/dev/null 2>nul
+where cargo >nul 2>nul
 if not errorlevel 1 goto tools
 echo Installing Rust (one time, about 5 minutes)...
 curl.exe -sSfL https://win.rustup.rs/x86_64 -o "%TEMP%\rustup-init.exe"
@@ -17,7 +23,7 @@ set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 
 :tools
 rem Rust on Windows needs the MinGW tools (dlltool) for some system libraries.
-where dlltool >/dev/null 2>nul
+where dlltool >nul 2>nul
 if not errorlevel 1 goto build
 call :finddlltool
 if defined DLLTOOLDIR goto addtools
@@ -37,6 +43,11 @@ if errorlevel 1 goto failed
 copy /y "target\release\stitchforge-app.exe" "StitchForge.exe" >nul
 echo.
 echo Done. Next time you can just double-click StitchForge.exe in this folder.
+start "" "StitchForge.exe"
+exit /b 0
+
+:runexe
+echo Starting StitchForge...
 start "" "StitchForge.exe"
 exit /b 0
 

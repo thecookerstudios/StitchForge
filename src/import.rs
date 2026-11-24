@@ -131,12 +131,47 @@ impl FillPattern {
     }
 }
 
+/// What to do with a fill area too small to fill (under the minimum size).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmallPieces {
+    /// Run stitch around the outline (the default).
+    #[default]
+    Run,
+    /// Fill it anyway, whatever its size.
+    Fill,
+    /// Leave it out.
+    Skip,
+}
+
+/// Settings for one part of a layer (a letter of a word, one piece of a
+/// shape), so it can differ from the rest without splitting the layer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PartOpts {
+    /// Part number in the layer, in sewing order from 0.
+    pub index: usize,
+    #[serde(default)]
+    pub stitch: StitchChoice,
+    #[serde(default)]
+    pub angle_deg: Option<f64>,
+}
+
 /// Per-layer choices made by the user. Anything left `None`/`Auto` is decided
 /// by the engine.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShapeOpts {
     pub stitch: StitchChoice,
+    /// Parts of the layer with their own settings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<PartOpts>,
+    /// How many parts come before this shape in its layer (set when the
+    /// layers are put together for sewing).
+    #[serde(skip)]
+    pub part_base: usize,
+    /// What to do with pieces too small to fill.
+    #[serde(default)]
+    pub small_pieces: SmallPieces,
     /// Stitch direction in degrees (0 = horizontal, counter-clockwise).
     pub angle_deg: Option<f64>,
     /// Index into the thread chart.
