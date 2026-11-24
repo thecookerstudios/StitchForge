@@ -1,0 +1,437 @@
+# name: Madeira Polyneon
+# manufacturer: Madeira
+# licence: Thread codes and colour names as published by Madeira for ordering. Screen colours (r,g,b) were sampled by StitchForge from product photos (November 2026) and are approximate: check matches against a physical Madeira colour card. Madeira and the thread line names are trademarks of their owners; StitchForge is not affiliated with or endorsed by Madeira.
+# thread: Polyester #40, #60, #75 and Polyneon Green (same numbers)
+code,name,r,g,b
+1500,Navy Black,41,41,42
+1502,Zipper,133,135,148
+1505,Polished Silver,196,202,206
+1506,Deep Steel Blue,59,64,77
+1507,Pea Coat Lining,71,76,82
+1508,Pie,193,39,63
+1509,Rhubarb,190,40,62
+1510,Multi Brown,131,90,29
+1511,Multi Beige,232,217,177
+1512,Multi Gray,130,118,100
+1513,Multi Brown,91,79,68
+1514,Multi Brown,45,37,35
+1515,Multi Brown,46,40,40
+1516,Multi Gray,79,80,85
+1517,Multi Gray,78,76,76
+1518,Multi Blue,54,55,64
+1519,Blue,62,78,98
+1521,Autumn Orange,247,162,114
+1522,Lavender Blue,135,126,209
+1526,French Vanilla,251,237,165
+1527,Teddy Bear,214,168,119
+1528,Serene Sky,118,183,245
+1529,Orchid Mist,188,176,194
+1531,Delphinium,129,168,228
+1532,Little Boy Blue,162,209,250
+1535,Tarnished Taupe,194,181,160
+1538,Tiramisu,208,179,133
+1539,Stone,101,94,92
+1540,Cobblestone,81,83,84
+1541,Chartreuse,230,231,110
+1542,Blue Heather,141,175,221
+1544,Chimney Smoke,106,118,131
+1545,Winter Mint,223,234,233
+1548,Pink Plush,253,186,216
+1549,Pink Sorbet,250,224,239
+1550,Light Periwinkle,216,232,245
+1552,Golden Green,199,192,108
+1553,Galaxy Blue,61,54,85
+1554,Beige/Pink,233,217,212
+1555,Carbon Paper,41,41,55
+1556,Taste of Honey,220,174,131
+1557,Mud Facial,75,71,66
+1558,French Roast,77,69,67
+1559,Mud Pie,78,75,72
+1560,Espresso,39,35,34
+1561,Cornmeal,242,227,167
+1562,Blue Hydrangea,182,217,238
+1563,Icy Blue,217,236,243
+1564,Dark Pewter,72,74,81
+1565,Irish Coffee,120,88,69
+1566,Brilliant Blue,22,29,103
+1567,Pickled Beet,149,70,77
+1568,Granite Green,185,180,146
+1569,Hemlock,129,133,106
+1572,Winter Gray,179,182,187
+1573,Vintage Lace,195,181,162
+1574,Dark Slate Blue,57,62,70
+1575,Iron Gray,117,124,131
+1577,Dark Blue Turquoise,38,154,213
+1578,Faded Jade,157,199,183
+1580,Green,28,97,83
+1582,White Linen,236,230,219
+1584,Deep Pink,228,83,123
+1588,Salsa,243,103,91
+1589,Ebony,74,78,80
+1592,Misty Mint,222,235,236
+1593,Blue Macaw,83,182,246
+1594,Cool Aqua,97,206,229
+1595,Fluorescent Pink,253,108,138
+1596,Fluorescent Pink,253,107,143
+1597,Fluorescent Pink,253,84,152
+1598,Fluorescent Orange,254,101,43
+1599,Fluorescent Green,193,252,66
+1600,Multi,146,95,54
+1601,Gold/Brown,92,131,147
+1602,Multi,155,193,171
+1603,Multi,191,177,155
+1604,Multi,136,119,94
+1605,Multi,168,140,117
+1606,Multi,147,160,171
+1607,Multi,120,150,157
+1608,Multi,98,151,141
+1609,Multi,146,85,64
+1610,Silver,221,229,230
+1611,Gray,173,175,190
+1612,Steel,180,201,218
+1613,Gray,162,168,177
+1614,Gray,94,90,104
+1615,Battleship,87,85,95
+1616,Conch Shell,246,147,143
+1617,Purple Gray,90,78,95
+1618,Gun Powder,118,119,138
+1619,Blue Gray,95,90,109
+1620,Light Salmon,253,178,181
+1621,Rust,169,58,25
+1622,Parchment,243,237,213
+1623,Daffodil,244,231,22
+1624,Egg Yolk,253,205,17
+1625,Butterscotch,163,85,5
+1626,Peaches 'n' Cream,254,240,156
+1627,Dusty Lilac,142,140,166
+1628,Worn Denim,153,199,230
+1629,Ice,211,212,231
+1630,Lavendula,187,187,234
+1631,Velvet Violet,161,129,201
+1632,Purple,11,6,20
+1633,Purple Passion,107,67,129
+1634,Grape Jelly,86,78,143
+1635,Burgundy,53,20,23
+1637,Cinnamon Candy,150,22,22
+1638,Barn Red,135,50,54
+1639,Cinnabar,184,107,101
+1640,Gray,95,91,106
+1641,Obsidian,72,77,78
+1642,Lapis,29,57,124
+1643,Navy,38,41,55
+1645,Light Mint,149,234,226
+1647,Mantis,175,224,193
+1648,Celery,161,180,110
+1649,Granny Smith,80,145,25
+1650,Fresh Pine,84,150,76
+1651,Green,23,114,65
+1652,Mermaid,93,153,151
+1653,Beige Pink,241,207,186
+1654,Cocoa,128,107,99
+1656,Brown Beige,207,170,155
+1657,Golden Oak,105,69,45
+1658,Mocha,124,72,53
+1659,Coffee Bean,44,23,23
+1660,Gray,184,165,165
+1661,Moonbeam,237,237,209
+1662,Slate,165,162,145
+1663,Clove,143,139,124
+1664,Graphite,107,110,103
+1665,Coal,52,52,50
+1666,Cornsilk,251,246,192
+1668,Silver Sage,128,148,133
+1669,Rosemary,41,44,40
+1670,Yellow Beige,225,181,94
+1671,Country Kitchen Blue,116,160,208
+1672,Toasted Almond,143,98,25
+1673,Khaki,158,124,75
+1674,Light Denim,171,214,244
+1675,Nordic Blue,130,170,213
+1676,Blue,32,55,124
+1677,Mallard Teal,34,65,76
+1678,Pumpkin,240,97,50
+1680,Purple Heart,71,49,76
+1681,Pink,179,38,69
+1682,Tusk,225,214,199
+1683,Lemon Drop,239,201,14
+1684,Wheat,200,172,109
+1685,Tree Frog,31,146,155
+1686,Mist,226,226,228
+1687,Sterling Silver,209,203,203
+1689,Shark,88,82,83
+1690,Green,34,52,61
+1692,Limestone,192,228,228
+1694,Caribbean Blue,26,152,180
+1695,Cyan,66,161,220
+1701,Spring Green,26,163,23
+1702,Spearmint,135,213,157
+1703,Fir,22,43,32
+1704,Evergreen,41,59,56
+1705,Fresh Oregono,45,48,42
+1706,Guacamole,145,143,44
+1707,Honeysuckle,206,109,112
+1709,Shocking Pink,208,58,160
+1710,Magenta,174,115,154
+1711,Lavender,179,156,204
+1712,Lilac,180,126,180
+1713,Peach Blush,243,223,224
+1718,Overcast Gray,179,187,198
+1719,Purple,89,35,84
+1720,Purple,82,35,67
+1721,Flamingo Pink,245,104,149
+1722,Royal Purple,77,71,180
+1723,Flan,248,221,173
+1724,Gold Nugget,230,196,36
+1725,Liquid Gold,218,160,34
+1726,Light Brown Sugar,207,157,112
+1727,Baby Chick,241,224,107
+1728,Bark,159,133,110
+1729,Buckskin,128,103,85
+1730,Cumin,148,117,80
+1731,Purple Pearl,168,133,159
+1733,Blue Jay,50,101,168
+1734,Electric Red,252,104,105
+1735,Lemonade,248,230,116
+1736,Dark Taupe,150,137,126
+1738,Champagne,206,191,160
+1739,Gray,59,53,57
+1740,Weimaraner,138,141,144
+1741,Gun Metal,101,94,94
+1742,Blue Ink,36,51,92
+1743,Oxford Blue,58,63,96
+1744,Siamese Cat,103,93,83
+1745,Toasted Marshmallow,143,120,108
+1746,Teal Green,94,205,200
+1747,Candy Apple Red,153,27,30
+1748,Margarita Lime,194,236,125
+1749,Green Thumb,26,141,38
+1750,Christmas Green,32,120,83
+1751,Emerald Isle,23,76,48
+1752,Cantalope,248,191,143
+1753,Penny,214,126,72
+1754,Raspberry Punch,216,60,59
+1755,Marmalade,240,166,50
+1756,Pea Green,80,83,39
+1757,Dark Olive,58,49,25
+1758,Grizzly Bear,113,88,72
+1759,Medium Camo Green,149,124,48
+1760,Antique Blue,118,153,173
+1761,Dolphin,170,203,221
+1762,Deep Ocean,64,102,136
+1763,Copper,247,160,70
+1764,Denim,65,83,109
+1765,Tiger,245,125,35
+1766,Blue,22,23,85
+1767,Ultramarine,22,23,79
+1768,Bamboo Green,195,214,147
+1769,Clover,116,149,71
+1770,Light Emerald Green,102,141,90
+1771,Whipped Butterscotch,233,181,23
+1772,Military Gold,216,162,25
+1773,Autumn Gold,209,125,73
+1775,Dark Federal Blue,99,151,204
+1776,Independence Blue,63,91,132
+1777,Bright Peach,252,178,162
+1778,Carrot,244,119,86
+1779,Sweet Potato,181,67,41
+1780,Rain Forest,56,139,111
+1781,Radish,95,22,23
+1782,Mulberry,139,67,77
+1783,Purple Pink,116,22,67
+1784,Merlot,59,22,22
+1785,Bordeaux,86,32,48
+1786,Hibiscus,169,36,63
+1787,Fuchsia,169,59,102
+1788,Dark Magenta,146,80,133
+1789,Purple,78,41,67
+1790,Green,128,114,32
+1791,Brass,165,111,37
+1792,Old Gold,158,117,25
+1793,Bullfrog,107,87,40
+1794,Field Gear,69,64,42
+1795,Dark Camo Green,64,64,48
+1796,Aged Moss,69,62,25
+1797,Calypso Blue,23,68,140
+1798,Bass Green,42,43,38
+1799,Green Turquoise,25,176,175
+1800,Emerald Black,28,28,29
+1801,Super White,231,231,239
+1802,White,236,235,234
+1803,Cream White,234,231,221
+1804,Natural White,238,238,237
+1805,Fluorescent White,235,236,244
+1809,Brushed Bronze,199,177,76
+1810,Gray Haze,172,171,175
+1811,Gray,185,183,193
+1812,Cement,190,189,188
+1815,Baby Pink,251,221,231
+1816,Rustic Pink,253,205,214
+1817,Pleasant Peach,250,207,186
+1818,Powder Pink,236,211,207
+1819,Blush Pink,251,204,198
+1820,Peach Tea,251,185,161
+1821,Terra Cotta,166,45,33
+1822,Coconut Cream,240,238,224
+1823,Fluorescent Yellow Green,245,242,22
+1824,Fluorescent Yellow Orange,251,210,9
+1825,Summer Sun,249,197,23
+1826,Yellow Orange,253,209,62
+1827,Swimming Pool,122,206,239
+1828,Work Shirt,80,146,208
+1829,Blue Bird,25,64,135
+1830,Blue,118,142,207
+1831,Purple Pansy,171,107,182
+1832,Purple,92,65,145
+1833,Purple,91,22,85
+1834,Amethyst,162,127,177
+1835,Cranberry,125,34,52
+1836,Cappuccino,78,66,66
+1837,Red Orange,252,73,25
+1838,Brick Red,129,22,22
+1839,Christmas Red,157,34,35
+1840,Cadet Gray,120,127,143
+1841,Pewter,74,80,90
+1842,True Blue,36,69,185
+1843,Persian Blue,33,58,141
+1844,Blue,34,31,44
+1845,Mint,132,219,185
+1846,Dark Teal,31,157,171
+1847,Sea Foam Green,102,185,168
+1848,Lime Green,90,150,66
+1849,Tropical Teal,44,111,99
+1850,Fluorescent Green,132,236,91
+1851,Cadmium Green,23,54,34
+1852,Cobalt,57,118,159
+1853,Light Apricot,245,220,186
+1854,Brown,172,142,137
+1855,Brown,186,153,113
+1856,Burnt Orange,189,104,79
+1857,Chocolate Lab,155,97,72
+1858,Chestnut,124,67,56
+1859,Brown,55,43,45
+1860,Pussy Willow,195,187,175
+1861,Palomino,252,240,154
+1862,Rhino,177,177,163
+1863,Chamois,237,235,209
+1866,Buff,239,226,143
+1867,Green,237,249,173
+1868,Bottle Green,58,193,137
+1869,Pumkin Spice,231,144,39
+1870,Brown Orange,233,160,61
+1871,Porcelain Blue,166,217,243
+1872,Brunette,80,65,53
+1874,Baby Blue,171,199,235
+1878,Tomato Red,159,22,22
+1879,Oregon Green,31,120,110
+1880,Deep Lilac,115,54,144
+1882,Beige,248,213,188
+1883,Fluorescent Yellow,250,231,5
+1884,Burly Wood,222,198,161
+1885,Camel,136,103,77
+1886,Light Steel,226,224,225
+1887,Purple,53,32,38
+1888,Deep Sky Blue,70,191,199
+1890,Midnight Green,32,117,134
+1891,Teal Velvet,39,81,98
+1892,Robin's Egg,163,222,231
+1893,Sky Blue,110,213,243
+1895,Teal Blue,35,153,210
+1896,Liberty,31,106,156
+1898,Auburn,182,93,76
+1899,Henna,159,77,69
+1900,Celadon,189,219,185
+1901,Fluorescent Green,73,185,37
+1902,Hunter Green,33,48,38
+1903,Spruce Green,50,67,62
+1904,Dark Sage,58,77,57
+1905,Moss Green,70,81,64
+1906,Antique Bronze,73,54,37
+1907,Pink,249,40,55
+1908,Pink,252,40,26
+1909,Electric Pink,254,119,136
+1910,Electric Magenta,224,94,124
+1911,Evening Mist,228,212,237
+1915,Bermuda Sand,248,207,213
+1917,Dusty Rose,221,124,139
+1918,Polished Pewter,143,146,155
+1919,English Rose,197,105,120
+1920,Yellow Green,223,211,156
+1921,Bubble Gum Pink,251,176,208
+1922,Regal Purple,68,41,137
+1923,Apricot,252,200,93
+1924,Lemon Tart,243,226,22
+1925,Fluorescent Yellow Orange,254,205,24
+1926,Dark Champagne,201,166,135
+1927,Shiny Penny,229,195,150
+1928,Natural Suede,144,127,113
+1929,Brown Hare,100,87,81
+1930,Bahamas Blue,64,68,167
+1931,Brown,49,41,46
+1932,Summer Sky,169,231,247
+1933,Lavender Lilac,119,110,167
+1934,Royal Blue,24,77,180
+1935,Fluorescent Yellow Green,238,247,34
+1936,Mink,144,136,120
+1937,Fluorescent Orange,253,169,35
+1938,Beige,197,178,168
+1939,Peanut Brittle,163,144,101
+1940,Key Lime,223,226,47
+1941,Mauve,218,176,176
+1942,Rose Gold,146,94,90
+1943,Dark Periwinkle,127,146,233
+1944,Blueberry Smash,25,25,43
+1945,Sienna,102,68,54
+1946,Orange,253,120,22
+1947,Orange Pink,249,45,23
+1948,Pink Carnation,252,170,185
+1949,Ivory,246,239,223
+1950,Green,130,226,23
+1951,Pumpkin Chiffon,246,170,28
+1952,Orange Pink,246,128,43
+1953,Powder Blue,186,214,237
+1954,Orange Pink,253,79,23
+1955,Gold,239,158,23
+1956,Olive Green,144,133,79
+1957,Burnt Taupe,51,45,36
+1958,Cedar Bark,59,35,35
+1959,Burnished Gold,193,167,48
+1960,Dusty Blue,121,146,179
+1961,Blue Spruce,101,128,155
+1962,Admiral Blue,62,87,103
+1963,Dusty Plum,94,106,131
+1964,Storm Sky Blue,76,89,119
+1965,Orange Peel,244,115,44
+1966,Pea Coat,31,41,76
+1967,Dark Denim,32,43,71
+1968,Green Tea,139,183,117
+1969,Army Green,100,98,81
+1970,Emerald Ink,45,62,45
+1971,Saffron,252,210,22
+1972,Fluorescent Yellow Orange,251,204,44
+1973,Bronze,147,87,41
+1974,Cinnamon Stick,149,86,81
+1975,Colonial Blue,52,74,119
+1976,Night Sky,66,71,79
+1977,Peacock Blue,23,109,181
+1978,Fluorescent Orange,254,143,46
+1979,Dark Amazon,25,85,62
+1980,Sunflower,246,219,18
+1981,Carmine,75,22,22
+1982,Red,116,22,29
+1983,Purple,55,35,48
+1984,Orchid,187,42,85
+1985,Deep Rain Forest,46,110,93
+1986,Ripe Raspberry,166,48,68
+1987,Paprika,227,65,46
+1988,Kelly Green,34,149,71
+1989,Leaf,62,193,125
+1990,Pink Rose,226,88,141
+1991,Malachite,24,106,132
+1992,Rough Caribbean Sea,49,120,154
+1993,Pink,210,25,58
+1994,Lipstick Rose,215,60,79
+1995,Yellow Green,252,237,22
+1996,Deep Emerald,60,77,73
+1997,Plum Pudding,35,31,37
+1998,Dark Mauve,145,118,122
+1999,Raisin,86,43,45

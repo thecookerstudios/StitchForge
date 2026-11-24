@@ -11,6 +11,10 @@ screens were used or examined.
 
 ## What's new in v0.20
 
+- **Madeira thread libraries built in:** 10 lines, 1,667 colours (Classic
+  Rayon, Polyneon, Frosted Matt, Fire Fighter, Sensa Green, Burmilana,
+  BurmilanaCo, Supertwist, FS Metallic, CR Metallic). Screen colours are
+  approximate; see thread-libraries/README.md.
 - **Several thread libraries at once.** In the Threads panel, tick every
   library you stock (for example Madeira Polyneon and Classic Rayon).
   Colours are matched from all ticked libraries, the thread picker groups
@@ -494,4 +498,4 @@ Options: `--profile flat|cap|both`, `--fabric pique|tshirt|fleece|twill|cap|towe
 - Tracing: gradients and photos with shading (now: flat colours only),
   reading text in a picture and offering it as editable lettering.
 - Desktop UI (Tauri), MCP server for AI agents, job/production database.
-- More brand thread charts (Madeira is available as a separate pack).
+- More brand thread charts (Madeira is built in; see thread-libraries/).

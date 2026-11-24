@@ -8339,6 +8339,16 @@ impl App {
                 self.libs.push(LoadedLib::from_library(key, lib, on));
             }
         }
+        // libraries that ship with StitchForge (a copy in the folder wins)
+        for (file, data) in thread::BUILT_IN {
+            if self.libs.iter().any(|l| l.key == *file) {
+                continue;
+            }
+            if let Ok(lib) = thread::parse_library(file, data, file) {
+                let on = on.iter().any(|k| k == file);
+                self.libs.push(LoadedLib::from_library(file.to_string(), lib, on));
+            }
+        }
         if !self.libs.iter().any(|l| l.on) {
             self.libs[0].on = true;
         }

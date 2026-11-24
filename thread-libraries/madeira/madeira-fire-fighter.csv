@@ -1,0 +1,35 @@
+# name: Madeira Fire Fighter
+# manufacturer: Madeira
+# licence: Thread codes and colour names as published by Madeira for ordering. Screen colours (r,g,b) were sampled by StitchForge from product photos (November 2026) and are approximate: check matches against a physical Madeira colour card. Madeira and the thread line names are trademarks of their owners; StitchForge is not affiliated with or endorsed by Madeira.
+# thread: Flame-resistant #40
+code,name,r,g,b
+N1511,Light Gray,223,223,223
+N1518,Light Gray,125,127,140
+N1523,Fluorescent Yellow,211,217,68
+N1537,Fluorescent Orange,234,130,20
+N1550,Fluorescent Green,153,189,78
+N1566,Blue,66,81,122
+N1610,Light Gray,228,231,231
+N1624,Yellow,253,216,22
+N1640,Dark Gray,119,119,111
+N1643,Dark Blue,52,54,81
+N1651,Green,22,168,60
+N1682,Light Beige,236,225,202
+N1725,Gold,236,188,22
+N1747,Red,197,20,20
+N1784,Red,171,22,25
+N1800,Black,71,66,69
+N1803,White,246,245,243
+N1815,Pink,249,229,235
+N1838,Red Orange,221,20,22
+N1842,Blue,22,93,178
+N1845,Light Green,156,212,183
+N1851,Dark Green,23,110,67
+N1859,Brown,72,46,38
+N1874,Light Blue,189,205,230
+N1884,Beige,242,213,133
+N1918,Gray,160,151,142
+N1924,Yellow,252,231,25
+N1957,Light Brown,97,65,22
+N1965,Orange,253,151,22
+N1977,Blue,22,153,203

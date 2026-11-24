@@ -1,0 +1,148 @@
+# name: Madeira Sensa Green
+# manufacturer: Madeira
+# licence: Thread codes and colour names as published by Madeira for ordering. Screen colours (r,g,b) were sampled by StitchForge from product photos (November 2026) and are approximate: check matches against a physical Madeira colour card. Madeira and the thread line names are trademarks of their owners; StitchForge is not affiliated with or endorsed by Madeira.
+# thread: Lyocell #40
+code,name,r,g,b
+010,Gray Haze (colour unverified),255,255,255
+011,Chrome Gray,178,178,180
+012,Smoke,170,170,170
+013,Peach Blush,251,224,214
+021,Rust,199,97,43
+023,Lemon,253,237,124
+024,Gold,255,202,35
+027,Dolphin,183,207,224
+028,Country Kitchen Blue,114,151,187
+029,Blue Jay,101,180,255
+032,Velvet Violet,163,135,173
+033,Purple Pansy,112,89,158
+035,Burgundy,105,59,72
+037,Tango,191,61,34
+039,Brick Red,155,59,49
+040,Weimaraner Gray,126,121,120
+041,Polished Pewter,116,114,117
+042,Lapis,53,81,121
+043,Navy,59,61,67
+044,Indigo,59,57,63
+045,Light Mint,169,216,217
+048,Aloe,120,154,75
+049,Lime Green,141,183,89
+050,Green Thumb,108,169,83
+051,Bell Pepper,71,146,77
+055,Latte,211,178,133
+056,Golden Oak,174,113,72
+058,Sienna,108,71,61
+059,Dark Chocolate,65,61,59
+060,Pussy Willow,191,180,169
+064,Goldenrod,253,219,68
+065,Copper,245,130,34
+066,Cornmeal,249,236,199
+069,Sunshine Yellow,255,255,71
+070,Tawny Tan,214,175,100
+071,Baby's Breath,243,240,240
+072,Coconut Cream,236,225,204
+075,Baby Blue,159,176,219
+076,True Blue,61,91,174
+078,Pumpkin,244,108,38
+079,Celtic Green,63,141,98
+084,Sandy Shores,206,190,158
+085,Cement,167,166,166
+086,Sterling Silver,211,211,211
+087,Gray,180,180,180
+094,Caribbean Blue,106,182,220
+095,Larimar,80,176,219
+097,Honeydew Melon,210,224,220
+099,Leek,176,187,135
+100,Emerald Black,51,51,51
+101,White,235,236,235
+102,Snow White,233,233,233
+103,Hunter Green,67,72,68
+105,Fluorescent White,229,229,229
+106,Guacamole,146,139,73
+108,Pink Carnation,232,134,159
+110,Fuchsia,202,63,109
+112,Majestic Purple,80,72,125
+116,Cotton Candy,235,171,187
+118,Overcast Gray,146,146,146
+120,Baby Pink,249,199,210
+122,Deep Lilac,89,67,114
+124,Buttercup,251,223,59
+125,Saffron,247,207,79
+127,Loofah,225,178,145
+128,Taupe,163,147,138
+132,Clear Blue,154,184,214
+133,Forget-Me-Not,75,121,204
+134,Royal Blue,49,83,169
+137,Citrus Burst,255,175,34
+138,Doe Skin,220,204,174
+144,Bark,121,104,84
+145,Coffee Bean,93,69,61
+147,Christmas Red,247,68,57
+149,Tusk,239,232,228
+153,Frosted Glass,251,206,176
+158,Chestnut,110,77,67
+164,Twister Gray,77,77,80
+166,Hanukkah Blue,55,68,124
+167,Blue Ink,53,75,114
+170,Fern,96,125,42
+172,Egg Yolk,229,170,35
+173,Autumn Gold,206,124,61
+175,Dark Federal Blue,76,110,159
+177,Blue Bird,57,126,198
+179,Sweet Potato,192,77,49
+181,Candy Apple Red,133,47,49
+182,Mulberry,124,55,61
+188,Chokecherry,112,71,122
+192,Honey Mustard,171,128,35
+195,Color 195,170,199,178
+212,Stainless Steel,159,161,163
+225,Liquid Gold,211,166,49
+236,Plum Brandy,77,53,63
+239,Charcoal,87,84,85
+241,Gray,63,63,64
+242,Dark Denim,53,69,93
+243,Star-kissed Night,63,64,77
+246,Teal Green,55,146,167
+248,Margarita Lime,187,225,129
+250,Christmas Green,53,106,80
+251,Kelly Green,75,154,100
+255,Khaki,186,154,101
+258,Grizzly Bear,141,92,64
+263,Dusty Lilac,116,126,170
+266,Regal Blue (colour unverified),245,231,159
+270,Sawdust,227,204,124
+273,Peanut Brittle,166,150,85
+274,Porcelain Blue,154,186,228
+278,Orange Icing,255,122,35
+280,Oregon Green,55,130,124
+281,Radish,170,57,68
+288,Shark Gray,114,114,114
+293,Malachite,55,104,110
+295,Cyan,55,142,202
+299,Green Turquoise,112,191,196
+308,Army Fatigues,105,105,100
+309,Dahlia,228,158,199
+310,Magenta,151,64,113
+321,Bubble Gum Pink,227,114,166
+344,Camel,150,112,79
+348,Antique Bronze,134,104,55
+357,Dark Seaweed,75,73,67
+359,Gold Nugget,231,192,72
+361,Moody Gray,97,97,97
+367,Black Pearl,57,57,61
+370,Fir,64,81,73
+373,Cerulean Frost,135,191,227
+378,Paprika,225,79,39
+379,Mandarin,248,141,108
+381,Ripe Raspberry,141,49,65
+384,Red/Purple,105,49,61
+397,Evergreen,63,68,69
+415,Battleship,112,110,113
+428,Rice,162,132,104
+434,French Blue,46,87,166
+440,Cobblestone,72,72,72
+445,Cappuccino,79,64,63
+449,Key Lime,207,204,108
+467,Pea Coat,55,63,83
+469,Granny Smith,116,162,49
+495,Safari,105,112,57
+497,Peacock Blue,83,142,207

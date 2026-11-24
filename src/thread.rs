@@ -191,6 +191,27 @@ pub fn load_library(path: &str) -> Result<Library, String> {
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
+    parse_library(&stem, &data, path)
+}
+
+/// Thread libraries that ship inside StitchForge (file name, contents).
+pub const BUILT_IN: &[(&str, &str)] = &[
+    ("madeira-polyneon.csv", include_str!("../thread-libraries/madeira/madeira-polyneon.csv")),
+    ("madeira-classic-rayon.csv", include_str!("../thread-libraries/madeira/madeira-classic-rayon.csv")),
+    ("madeira-frosted-matt.csv", include_str!("../thread-libraries/madeira/madeira-frosted-matt.csv")),
+    ("madeira-fire-fighter.csv", include_str!("../thread-libraries/madeira/madeira-fire-fighter.csv")),
+    ("madeira-sensa-green.csv", include_str!("../thread-libraries/madeira/madeira-sensa-green.csv")),
+    ("madeira-burmilana.csv", include_str!("../thread-libraries/madeira/madeira-burmilana.csv")),
+    ("madeira-burmilanaco.csv", include_str!("../thread-libraries/madeira/madeira-burmilanaco.csv")),
+    ("madeira-supertwist.csv", include_str!("../thread-libraries/madeira/madeira-supertwist.csv")),
+    ("madeira-fs-metallic.csv", include_str!("../thread-libraries/madeira/madeira-fs-metallic.csv")),
+    ("madeira-cr-metallic.csv", include_str!("../thread-libraries/madeira/madeira-cr-metallic.csv")),
+];
+
+/// Read a library from CSV text (`source` is only used in error messages).
+pub fn parse_library(stem: &str, data: &str, source: &str) -> Result<Library, String> {
+    let path = source;
+    let stem = stem.to_string();
     let mut lib = Library { name: stem.clone(), ..Default::default() };
     let mut out = Vec::new();
     for (i, line) in data.lines().enumerate() {
@@ -370,6 +391,14 @@ pub fn nearest(chart: &[Thread], rgb: [u8; 3]) -> (usize, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn built_in_libraries_load() {
+        for (file, data) in BUILT_IN {
+            let lib = parse_library(file, data, file).unwrap();
+            assert!(lib.threads.len() >= 30, "{file}");
+            assert!(lib.name.starts_with("Madeira"), "{file}");
+        }
+    }
     #[test]
     fn auto_match_skips_variegated() {
         let t = |c: &str, n: &str, rgb| Thread { brand: "x".into(), code: c.into(), name: n.into(), rgb };
