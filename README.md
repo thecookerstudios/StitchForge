@@ -1,4 +1,4 @@
-# StitchForge v0.15 — embroidery app
+# StitchForge v0.20 — embroidery app
 
 Vector art, PDFs, pictures (PNG/JPG, even mockup photos) and any-font text
 in; machine-ready DST, PES, PEC, EXP, JEF, VP3, XXX, U01 or TAP, a printable operator
@@ -8,6 +8,64 @@ macOS and Linux from the same code.
 Built clean-room from the StitchForge spec, public format documentation
 and general embroidery practice. No Wilcom or Pulse code, files, fonts or
 screens were used or examined.
+
+## What's new in v0.20
+
+- **Several thread libraries at once.** In the Threads panel, tick every
+  library you stock (for example Madeira Polyneon and Classic Rayon).
+  Colours are matched from all ticked libraries, the thread picker groups
+  them by library and searches library names too, and your ticks are
+  remembered. "Add library…" copies a CSV into your Thread libraries folder;
+  "Open folder" shows that folder. A design you open keeps the threads it
+  was saved with, shown as its own library.
+- **Automatic matching skips variegated threads** (ombre, multi, astro,
+  melange) and ones marked discontinued or "colour unverified". You can
+  still pick them by hand.
+- **Tracing keeps the whole subject.** Light parts inside the subject
+  (highlights on a skull, a white shirt on a figure) are no longer treated as
+  background just because they're a similar colour; only the real
+  surroundings, thin fringes and letter counters are removed.
+
+## What's new in v0.19: the new interface
+
+The whole window was redesigned in the style of a modern vector editor.
+Same engine and every stitch setting as v0.18, in new places:
+
+- **Themes**: Dark, Neutral grey (60% grey work area) and Light. Click the
+  half-circle at the top right to cycle them, or Window > Theme. Your choice
+  is remembered.
+- **Menu bar**: File, Edit, Object, Type, Stitch, Select, View, Window, Help.
+  The old Path menu is now Object; Add text is under Type; Underlay, Jumps
+  and the thread weight guide are under Stitch.
+- **Workspaces** (drop-down at the top right): Design, Lettering, Name drops,
+  Production and Simple. Simple is the old Simple mode; the others are the
+  old Pro mode with different panels in front. Name drops replaces the old
+  Design / Name drops tabs.
+- **Document bar**: file name, zoom and view, the Vector / Stitches 3D /
+  Flat lines switch, garment colour, Jumps and Underlay.
+- **Panel dock on the right** with an icon strip (click an icon to open or
+  close its panel):
+  - Properties: the selected object's settings, exactly as before. With
+    nothing selected: the design (size, sewing on, fabric, thread, sewing
+    order, stitch settings).
+  - Layers (Stitch file for DST/EXP/PES files, Drops in Name drops).
+  - Threads: thread library and colour stops.
+  - Production: stitch counts, run time, per-cone count, backing, checks
+    and the job details for the operator sheet.
+- **Canvas**: the hoop (or cap frame) is drawn in the garment colour on a
+  pasteboard, with rulers in mm from the design centre. The hoop is picked
+  to fit the design (4×4, 5×7, 6×10, 8×8, 12×8 or 15×15 in). View > Rulers
+  and View > Hoop turn them off.
+- **Task bar under the selection**: stitch type, Shape, Stitches,
+  Direction, Duplicate, Delete and more shape tools.
+- **Hint bar** at the bottom says what the pointer does with the current
+  tool; the sew-out player sits on its right. **Status bar**: zoom, pointer
+  position, tool, stitches, stops, trims, run time and checks (click the
+  warning to open Production).
+- **Keys**: Window > Keyboard shortcuts switches between StitchForge keys
+  and vector-editor style keys (A edit points, M rectangle, L ellipse,
+  \ line). Help > Keyboard shortcuts (or ?) lists them. New: Ctrl/⌘ +/−
+  zoom, Ctrl/⌘ 1 actual size, Ctrl/⌘ A select all.
 
 ## Open the app
 
@@ -436,4 +494,4 @@ Options: `--profile flat|cap|both`, `--fabric pique|tshirt|fleece|twill|cap|towe
 - Tracing: gradients and photos with shading (now: flat colours only),
   reading text in a picture and offering it as editable lettering.
 - Desktop UI (Tauri), MCP server for AI agents, job/production database.
-- Brand thread charts (load your shop's CSV for now).
+- More brand thread charts (Madeira is available as a separate pack).

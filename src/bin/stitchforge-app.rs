@@ -25,6 +25,157 @@ use stitchforge::settings::{self, Limits, Profile, Recipe};
 use stitchforge::sheet::JobInfo;
 use stitchforge::{export, sampler, thread};
 
+#[path = "../app_ui/theme.rs"]
+mod theme;
+use theme::ThemeKind;
+use eframe::egui::CornerRadius;
+
+/// Screen points per mm at 100% (96 per inch).
+const MM_PX: f32 = 96.0 / 25.4;
+/// Ruler thickness on the canvas.
+const RULER: f32 = 18.0;
+/// Flat hoops: name, width and height in mm (largest last).
+const HOOPS: &[(&str, f64, f64)] = &[
+    ("4 × 4 in", 100.0, 100.0),
+    ("5 × 7 in", 130.0, 180.0),
+    ("6 × 10 in", 150.0, 250.0),
+    ("8 × 8 in", 200.0, 200.0),
+    ("12 × 8 in", 300.0, 200.0),
+    ("15 × 15 in", 380.0, 380.0),
+];
+
+/// A thread library as shown in the Threads panel.
+struct LoadedLib {
+    /// File name in the library folder, a full path, "generic", or
+    /// "design:…" for the threads saved inside an opened design.
+    key: String,
+    name: String,
+    note: String,
+    threads: Vec<thread::Thread>,
+    on: bool,
+}
+
+impl LoadedLib {
+    fn from_library(key: String, lib: thread::Library, on: bool) -> Self {
+        let note = match (lib.manufacturer.is_empty(), lib.licence.is_empty()) {
+            (true, true) => format!("{} threads.", lib.threads.len()),
+            (false, true) => format!("{} · {} threads", lib.manufacturer, lib.threads.len()),
+            (true, false) => format!("{} threads · {}", lib.threads.len(), lib.licence),
+            (false, false) => format!("{} · {} threads · {}", lib.manufacturer, lib.threads.len(), lib.licence),
+        };
+        LoadedLib { key, name: lib.name, note, threads: lib.threads, on }
+    }
+}
+
+/// A workspace: which panels lead, and Simple or full controls.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Workspace {
+    Design,
+    Lettering,
+    NameDrops,
+    Production,
+    Simple,
+}
+
+impl Workspace {
+    const ALL: [Workspace; 5] = [Workspace::Design, Workspace::Lettering, Workspace::NameDrops, Workspace::Production, Workspace::Simple];
+    fn label(&self) -> &'static str {
+        match self {
+            Workspace::Design => "Design",
+            Workspace::Lettering => "Lettering",
+            Workspace::NameDrops => "Name drops",
+            Workspace::Production => "Production",
+            Workspace::Simple => "Simple",
+        }
+    }
+    fn hint(&self) -> &'static str {
+        match self {
+            Workspace::Design => "Every tool and stitch setting",
+            Workspace::Lettering => "Text tool ready, text settings first",
+            Workspace::NameDrops => "Logo on every head, one name per head, from a sheet",
+            Workspace::Production => "Stitch counts, run time, checks and the job sheet",
+            Workspace::Simple => "Only the essentials: fewer settings on screen",
+        }
+    }
+    fn key(&self) -> &'static str {
+        match self {
+            Workspace::Design => "design",
+            Workspace::Lettering => "lettering",
+            Workspace::NameDrops => "drops",
+            Workspace::Production => "production",
+            Workspace::Simple => "simple",
+        }
+    }
+    fn from_key(s: &str) -> Option<Workspace> {
+        Workspace::ALL.into_iter().find(|w| w.key() == s.trim())
+    }
+}
+
+/// Panels in the right-hand dock.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Dock {
+    Properties,
+    Layers,
+    Threads,
+    Production,
+}
+
+/// A shortcut as the platform writes it: ⌘S on a Mac, Ctrl+S elsewhere.
+fn kb(k: &str) -> String {
+    let shift = k.starts_with('⇧');
+    let k = k.trim_start_matches('⇧');
+    if cfg!(target_os = "macos") {
+        format!("{}⌘{k}", if shift { "⇧" } else { "" })
+    } else {
+        format!("Ctrl+{}{k}", if shift { "Shift+" } else { "" })
+    }
+}
+
+/// Line icons for the dock strip.
+fn dock_icon(p: &egui::Painter, r: Rect, d: Dock, ink: Color32) {
+    let s = Stroke::new(1.5_f32, ink);
+    let (l, t, w, h) = (r.left(), r.top(), r.width(), r.height());
+    let at = |x: f32, y: f32| Pos2::new(l + x * w, t + y * h);
+    match d {
+        Dock::Properties => {
+            // three sliders
+            for (i, k) in [0.25_f32, 0.7, 0.45].iter().enumerate() {
+                let y = 0.2 + i as f32 * 0.3;
+                p.line_segment([at(0.0, y), at(1.0, y)], s);
+                p.circle_filled(at(*k, y), 2.6, ink);
+            }
+        }
+        Dock::Layers => {
+            for (i, y) in [0.25_f32, 0.5, 0.75].iter().enumerate() {
+                let pts = vec![at(0.5, y - 0.2), at(1.0, *y), at(0.5, y + 0.2), at(0.0, *y)];
+                if i == 0 {
+                    p.add(EShape::convex_polygon(pts, Color32::TRANSPARENT, s));
+                } else {
+                    p.line_segment([at(0.0, *y), at(0.5, y + 0.2)], s);
+                    p.line_segment([at(0.5, y + 0.2), at(1.0, *y)], s);
+                }
+            }
+        }
+        Dock::Threads => {
+            // a thread spool
+            p.line_segment([at(0.2, 0.08), at(0.8, 0.08)], Stroke::new(2.0_f32, ink));
+            p.line_segment([at(0.2, 0.92), at(0.8, 0.92)], Stroke::new(2.0_f32, ink));
+            p.rect_stroke(Rect::from_min_max(at(0.3, 0.14), at(0.7, 0.86)), 1.0, s, egui::StrokeKind::Middle);
+            for y in [0.32_f32, 0.5, 0.68] {
+                p.line_segment([at(0.3, y), at(0.7, y + 0.08)], Stroke::new(1.0_f32, ink));
+            }
+        }
+        Dock::Production => {
+            // a clipboard
+            p.rect_stroke(Rect::from_min_max(at(0.12, 0.12), at(0.88, 1.0)), 2.0, s, egui::StrokeKind::Middle);
+            p.rect_filled(Rect::from_min_max(at(0.35, 0.02), at(0.65, 0.2)), 1.0, ink);
+            for y in [0.42_f32, 0.6, 0.78] {
+                p.line_segment([at(0.28, y), at(0.72, y)], Stroke::new(1.0_f32, ink));
+            }
+        }
+    }
+}
+
 const SAMPLE_SVG: &str = include_str!("../../examples/left-chest-logo.svg");
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -152,6 +303,55 @@ impl Tool {
     fn draws(&self) -> bool {
         matches!(self, Tool::Pen | Tool::Rect | Tool::Ellipse | Tool::Polygon | Tool::Line | Tool::Text)
     }
+    fn name(&self) -> &'static str {
+        match self {
+            Tool::Select => "Select",
+            Tool::Nodes => "Edit shape points",
+            Tool::Stitches => "Edit stitch points",
+            Tool::Pen => "Pen",
+            Tool::Rect => "Rectangle",
+            Tool::Ellipse => "Ellipse",
+            Tool::Polygon => "Polygon and star",
+            Tool::Line => "Line",
+            Tool::Text => "Text",
+            Tool::Measure => "Measure",
+            Tool::Knife => "Knife",
+            Tool::Eraser => "Eraser",
+            Tool::Guides => "Direction lines",
+        }
+    }
+    /// Keys in the vector-editor style preset.
+    fn ai_key(&self) -> egui::Key {
+        match self {
+            Tool::Select => egui::Key::V,
+            Tool::Nodes => egui::Key::A,
+            Tool::Stitches => egui::Key::S,
+            Tool::Pen => egui::Key::P,
+            Tool::Rect => egui::Key::M,
+            Tool::Ellipse => egui::Key::L,
+            Tool::Polygon => egui::Key::G,
+            Tool::Line => egui::Key::Backslash,
+            Tool::Text => egui::Key::T,
+            Tool::Measure => egui::Key::I,
+            Tool::Knife => egui::Key::K,
+            Tool::Eraser => egui::Key::E,
+            Tool::Guides => egui::Key::J,
+        }
+    }
+    fn key_for(&self, ai: bool) -> egui::Key {
+        if ai { self.ai_key() } else { self.key() }
+    }
+    fn key_label(&self, ai: bool) -> &'static str {
+        match self.key_for(ai) {
+            egui::Key::Backslash => "\\",
+            k => k.symbol_or_name(),
+        }
+    }
+    /// Tooltip with the key of the preset in use.
+    fn tip(&self, ai: bool) -> String {
+        let rest = self.hint().split_once('\n').map(|x| x.1).unwrap_or("");
+        format!("{} ({})\n{}", self.name(), self.key_label(ai), rest)
+    }
 }
 
 /// Look of the next shape drawn.
@@ -246,6 +446,8 @@ struct App {
     chart_note: String,
     /// Library files found in the library folder.
     libraries: Vec<PathBuf>,
+    /// Every thread library known this session; the ticked ones make up `chart`.
+    libs: Vec<LoadedLib>,
     /// Placeholder rope texture for the 3D view, made once on first use.
     rope_tex: Option<egui::TextureHandle>,
 
@@ -346,6 +548,22 @@ struct App {
     st_sel: std::collections::BTreeSet<usize>,
     node_sel: Option<NodeRef>,
     edit_drag: Option<EditDrag>,
+
+    // interface shell
+    theme: ThemeKind,
+    workspace: Workspace,
+    dock: Dock,
+    dock_open: bool,
+    /// Vector-editor style tool keys instead of StitchForge's own.
+    ai_keys: bool,
+    show_rulers: bool,
+    show_hoop: bool,
+    /// Chosen flat hoop (index into HOOPS); None picks one to fit.
+    hoop: Option<usize>,
+    show_keys: bool,
+    show_about: bool,
+    /// Pointer position on the canvas, in mm.
+    cursor_mm: Option<Pt>,
 }
 
 use stitchforge::import::font_options;
@@ -356,6 +574,12 @@ impl App {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(9.0, 4.0);
         cc.egui_ctx.set_style(style);
+        let prefs = theme::load_prefs();
+        theme::apply(&cc.egui_ctx, prefs.theme);
+        let workspace = match Workspace::from_key(&prefs.workspace).unwrap_or(Workspace::Design) {
+            Workspace::NameDrops => Workspace::Design,
+            w => w,
+        };
         let fabric = Profile::Flat.default_recipe().to_string();
         App {
             layers: Vec::new(),
@@ -377,6 +601,7 @@ impl App {
             chart_name: "Generic 40wt".into(),
             chart_note: "Built-in generic 40 wt palette, made for StitchForge.".into(),
             libraries: thread::scan_libraries(&thread::library_dir()),
+            libs: Vec::new(),
             rope_tex: None,
             show_text: false,
             text: "Forge Co".into(),
@@ -460,7 +685,19 @@ impl App {
             st_sel: Default::default(),
             node_sel: None,
             edit_drag: None,
+            theme: prefs.theme,
+            workspace,
+            dock: if workspace == Workspace::Production { Dock::Production } else { Dock::Properties },
+            dock_open: true,
+            ai_keys: prefs.keys == "illustrator",
+            show_rulers: true,
+            show_hoop: true,
+            hoop: None,
+            show_keys: false,
+            show_about: false,
+            cursor_mm: None,
         }
+        .with_libraries(&prefs.libs)
         .with_launch_args()
     }
 
@@ -483,7 +720,23 @@ impl App {
                         r
                     };
                 }
-                "--pro" => self.pro = true,
+                "--pro" => self.workspace = Workspace::Design,
+                "--simple" => self.workspace = Workspace::Simple,
+                "--theme" => {
+                    if let Some(k) = args.get(i + 1).and_then(|v| ThemeKind::from_key(v)) {
+                        self.theme = k;
+                    }
+                    i += 1;
+                }
+                "--dock" => {
+                    self.dock = match args.get(i + 1).map(|s| s.as_str()) {
+                        Some("layers") => Dock::Layers,
+                        Some("threads") => Dock::Threads,
+                        Some("production") => Dock::Production,
+                        _ => Dock::Properties,
+                    };
+                    i += 1;
+                }
                 "--garment" => {
                     if let Some(rgb) = args.get(i + 1).and_then(|v| parse_hex(v)) {
                         self.job.garment_rgb = Some(rgb);
@@ -1754,8 +2007,19 @@ impl App {
         self.recipe = p.recipe;
         self.keep_order = p.keep_order;
         self.auto_stops = p.auto_stops;
-        self.chart_name = p.chart_name;
-        self.chart = p.chart;
+        self.chart_name = p.chart_name.clone();
+        self.chart = p.chart.clone();
+        // the threads saved with the design are shown as their own library
+        // (ticked alone), so its colours stay exactly as saved
+        self.libs.retain(|l| !l.key.starts_with("design:"));
+        for l in self.libs.iter_mut() {
+            l.on = false;
+        }
+        let name = if p.chart_name.is_empty() { "Threads in this design".to_string() } else { format!("{} (in this design)", p.chart_name) };
+        let threads: Vec<thread::Thread> = p.chart.clone();
+        let n = threads.len();
+        self.libs.push(LoadedLib { key: format!("design:{}", self.design_name), name, note: format!("{n} threads saved with this design."), threads, on: true });
+        self.chart_note = format!("{n} threads saved with this design.");
         self.job = p.job;
         self.drops = p.drops;
         self.tab = Tab::Design;
@@ -2105,24 +2369,7 @@ impl App {
                 }
             }
             Want::Names => self.load_names_path(p),
-            Want::Chart => match thread::load_library(&p.to_string_lossy()) {
-                Ok(lib) => {
-                    self.chart_name = lib.name.clone();
-                    self.chart_note = match (lib.manufacturer.is_empty(), lib.licence.is_empty()) {
-                        (true, true) => format!("{} threads.", lib.threads.len()),
-                        (false, true) => format!("{} · {} threads", lib.manufacturer, lib.threads.len()),
-                        (true, false) => format!("{} threads · {}", lib.threads.len(), lib.licence),
-                        (false, false) => format!("{} · {} threads · {}", lib.manufacturer, lib.threads.len(), lib.licence),
-                    };
-                    self.chart = lib.threads;
-                    self.libraries = thread::scan_libraries(&thread::library_dir());
-                    for l in &mut self.layers {
-                        l.opts.thread = None;
-                    }
-                    self.dirty = true;
-                }
-                Err(e) => self.error = Some(e),
-            },
+            Want::Chart => self.add_library_file(&p),
             Want::Font => match stitchforge::vfs::read(&p)
                 .map_err(|e| e.to_string())
                 .and_then(import::add_font_data)
@@ -2440,199 +2687,6 @@ impl App {
     }
 
     // ---------- top bar ----------
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        let mode_art = self.machine.is_none();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("StitchForge").strong().size(17.0));
-            ui.separator();
-            let can_drops = mode_art && !self.layers.is_empty();
-            let mut tab = self.tab;
-            ui.selectable_value(&mut tab, Tab::Design, "Design");
-            ui.add_enabled_ui(can_drops, |ui| {
-                ui.selectable_value(&mut tab, Tab::Drops, "Name drops")
-                    .on_hover_text(
-                        "Logo on every head, then one name per head, from an Excel/CSV sheet",
-                    );
-            });
-            if tab != self.tab {
-                self.set_tab(tab);
-            }
-            ui.separator();
-            ui.menu_button("File", |ui| {
-                if ui.button("New").clicked() {
-                    ui.close();
-                    self.guard(Pending::New, &ctx);
-                }
-                if ui.button("Open…  (project, art, picture, stitch file)").clicked() {
-                    ui.close();
-                    self.guard(Pending::Open, &ctx);
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(
-                        mode_art && !self.layers.is_empty(),
-                        egui::Button::new("Save"),
-                    )
-                    .clicked()
-                {
-                    ui.close();
-                    self.save();
-                }
-                if ui
-                    .add_enabled(
-                        mode_art && !self.layers.is_empty(),
-                        egui::Button::new("Save As…"),
-                    )
-                    .clicked()
-                {
-                    ui.close();
-                    self.save_as();
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(
-                        mode_art && !self.layers.is_empty(),
-                        egui::Button::new("Export artwork as SVG…"),
-                    )
-                    .on_hover_text("The vector art (not stitches), for Inkscape, Illustrator or a customer proof")
-                    .clicked()
-                {
-                    ui.close();
-                    self.export_art_svg();
-                }
-                if ui
-                    .add_enabled(
-                        mode_art && !self.layers.is_empty(),
-                        egui::Button::new("Add art…"),
-                    )
-                    .clicked()
-                {
-                    ui.close();
-                    self.pick_svg(true);
-                }
-                if ui
-                    .add_enabled(mode_art, egui::Button::new("Trace a picture…"))
-                    .on_hover_text("PNG, JPG, a mockup photo or a PDF: turned into stitch-ready layers automatically")
-                    .clicked()
-                {
-                    ui.close();
-                    pick(
-                        if self.layers.is_empty() { Want::Open } else { Want::AddSvg },
-                        "Trace a picture",
-                        &[("Pictures, mockups, PDF", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "pdf", "ai"])],
-                        self.last_dir.as_ref(),
-                    );
-                }
-                if ui
-                    .add_enabled(mode_art, egui::Button::new("Add text…"))
-                    .clicked()
-                {
-                    ui.close();
-                    self.show_text = true;
-                }
-                ui.separator();
-                if ui
-                    .button("Calibration sampler (Gate 1 test sew-out)")
-                    .clicked()
-                {
-                    ui.close();
-                    self.guard(Pending::Sampler, &ctx);
-                }
-                if ui.button("Sample logo").clicked() {
-                    ui.close();
-                    self.guard(Pending::Sample, &ctx);
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(self.design.is_some(), egui::Button::new("Export…"))
-                    .clicked()
-                {
-                    ui.close();
-                    self.show_export = true;
-                }
-            });
-            if mode_art && self.tab == Tab::Design {
-                ui.menu_button("Path", |ui| {
-                    self.path_tools(ui, true);
-                });
-            }
-            if ui
-                .button("Open…")
-                .on_hover_text("Project, SVG art, or a DST/EXP/PES stitch file (Cmd/Ctrl+O)")
-                .clicked()
-            {
-                self.guard(Pending::Open, &ctx);
-            }
-            if ui
-                .add_enabled(
-                    mode_art && !self.layers.is_empty(),
-                    egui::Button::new("Save"),
-                )
-                .on_hover_text("Cmd/Ctrl+S")
-                .clicked()
-            {
-                self.save();
-            }
-            if ui
-                .add_enabled(
-                    mode_art && !self.layers.is_empty(),
-                    egui::Button::new("Add art…"),
-                )
-                .on_hover_text("Add another SVG as new layers")
-                .clicked()
-            {
-                self.pick_svg(true);
-            }
-            if ui
-                .add_enabled(mode_art, egui::Button::new("Add text…"))
-                .on_hover_text("Lettering in any installed font")
-                .clicked()
-            {
-                self.show_text = true;
-            }
-            ui.separator();
-            if ui
-                .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
-                .on_hover_text("Cmd/Ctrl+Z")
-                .clicked()
-            {
-                self.do_undo();
-            }
-            if ui
-                .add_enabled(!self.redo.is_empty(), egui::Button::new("Redo"))
-                .on_hover_text("Shift+Cmd/Ctrl+Z")
-                .clicked()
-            {
-                self.do_redo();
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        self.design.is_some(),
-                        egui::Button::new(RichText::new("Export…").strong()),
-                    )
-                    .on_hover_text("Machine files + operator sheet (Cmd/Ctrl+E)")
-                    .clicked()
-                {
-                    self.show_export = true;
-                }
-                ui.separator();
-                ui.selectable_value(&mut self.pro, true, "Pro");
-                ui.selectable_value(&mut self.pro, false, "Simple");
-                ui.separator();
-                let name = self.display_name();
-                let dot = if self.modified { "  •" } else { "" };
-                ui.label(RichText::new(format!("{name}{dot}")).weak())
-                    .on_hover_text(if self.modified {
-                        "Unsaved changes"
-                    } else {
-                        "All changes saved"
-                    });
-            });
-        });
-    }
 
     fn export_window(&mut self, ctx: &egui::Context) {
         if !self.show_export {
@@ -3291,12 +3345,20 @@ impl App {
                             changed = true;
                         }
                         ui.separator();
+                        let several = chart.first().map(|f| chart.iter().any(|t| t.brand != f.brand)).unwrap_or(false);
+                        let mut last_brand = "";
                         for (i, t) in chart.iter().enumerate() {
                             if !ql.is_empty()
                                 && !t.code.to_lowercase().contains(&ql)
                                 && !t.name.to_lowercase().contains(&ql)
+                                && !t.brand.to_lowercase().contains(&ql)
                             {
                                 continue;
+                            }
+                            if several && t.brand != last_brand {
+                                last_brand = &t.brand;
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(&t.brand).small().strong().weak());
                             }
                             ui.horizontal(|ui| {
                                 swatch(ui, t.rgb);
@@ -4630,13 +4692,7 @@ impl App {
         self.dirty = true;
     }
 
-    fn right_panel(&mut self, ui: &mut egui::Ui, now: f64) {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if self.tab == Tab::Drops && self.machine.is_none() {
-                self.drops_setup(ui);
-                ui.add_space(6.0);
-                ui.separator();
-            } else {
+    fn props_selection(&mut self, ui: &mut egui::Ui, now: f64) {
                 self.edit_panel(ui);
                 if self.tool.draws() && self.machine.is_none() {
                     self.draw_options(ui);
@@ -4654,12 +4710,10 @@ impl App {
                     ui.add_space(4.0);
                 }
                 self.layer_props(ui, now);
-            }
-            if self.selected.is_some() {
-                ui.add_space(6.0);
-                ui.separator();
-            }
+    }
 
+    /// The design itself: size, garment, fabric, thread, order, stitch settings.
+    fn props_document(&mut self, ui: &mut egui::Ui) {
             if self.machine.is_none() && self.tab == Tab::Design {
             section(ui, "Design size");
             if let Some(d) = &self.design {
@@ -4831,42 +4885,36 @@ impl App {
                     };
                     self.dirty = true;
                 }
-                section(ui, "Thread library");
-                ui.label(egui::RichText::new(&self.chart_note).small().weak());
-                let mut chosen: Option<PathBuf> = None;
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("library")
-                        .width(200.0)
-                        .selected_text(self.chart_name.clone())
-                        .show_ui(ui, |ui| {
-                            for p in &self.libraries {
-                                let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                                if ui.selectable_label(false, name).clicked() {
-                                    chosen = Some(p.clone());
-                                }
-                            }
-                        });
-                    if ui.small_button("Other CSV…").on_hover_text("Columns: code,name,r,g,b").clicked() {
-                        pick(Want::Chart, "Thread chart", &[("Thread chart", &["csv"])], self.last_dir.as_ref());
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui.small_button("Make my own library").on_hover_text("Creates a template CSV in your StitchForge folder").clicked() {
-                        match thread::write_template(&thread::library_dir()) {
-                            Ok(p) => {
-                                self.libraries = thread::scan_libraries(&thread::library_dir());
-                                self.error = Some(format!("Template saved to {}. Edit it, then pick it from the list.", p.display()));
-                            }
-                            Err(e) => self.error = Some(format!("Could not create the template: {e}")),
-                        }
-                    }
-                });
-                if let Some(p) = chosen {
-                    self.handle_picked(Want::Chart, p);
-                }
             }
+            }
+    }
 
-            }
+    /// Thread library and the machine's colour stops.
+    fn threads_panel(&mut self, ui: &mut egui::Ui) {
+        if self.machine.is_none() && self.tab == Tab::Design && self.pro {
+                self.libraries_ui(ui);
+        }
+        if let Some(d) = &self.design {
+                section(ui, "Color stops");
+                for (i, st) in d.stops.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        swatch(ui, st.thread.rgb);
+                        ui.label(format!("{} · needle {}", i + 1, st.needle));
+                        ui.label(RichText::new(format!("{} {}", st.thread.code, st.thread.name)).strong());
+                        if st.weight != thread::ThreadWeight::W40 {
+                            ui.label(RichText::new(st.weight.label()).color(Color32::from_rgb(214, 60, 120)))
+                                .on_hover_text(format!("Load {} on this needle (needle size {})", st.weight.label(), st.weight.needle()));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(group(st.stitches)).weak());
+                        });
+                    });
+                }
+        }
+    }
+
+    /// Stitch counts, run time, checks and the job sheet.
+    fn production_panel(&mut self, ui: &mut egui::Ui) {
             if let Some(d) = &self.design {
                 section(ui, "Production");
                 let s = &d.stats;
@@ -4891,23 +4939,6 @@ impl App {
                     kv(ui, "Backing", &d.recipe.backing);
                     kv(ui, "Topping", &d.recipe.topping);
                 });
-
-                section(ui, "Color stops");
-                for (i, st) in d.stops.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        swatch(ui, st.thread.rgb);
-                        ui.label(format!("{} · needle {}", i + 1, st.needle));
-                        ui.label(RichText::new(format!("{} {}", st.thread.code, st.thread.name)).strong());
-                        if st.weight != thread::ThreadWeight::W40 {
-                            ui.label(RichText::new(st.weight.label()).color(Color32::from_rgb(214, 60, 120)))
-                                .on_hover_text(format!("Load {} on this needle (needle size {})", st.weight.label(), st.weight.needle()));
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(group(st.stitches)).weak());
-                        });
-                    });
-                }
-
                 if !d.warnings.is_empty() || !self.file_notes.is_empty() {
                     section(ui, "Check before running");
                     for w in self.file_notes.iter().chain(d.warnings.iter()) {
@@ -4915,7 +4946,6 @@ impl App {
                     }
                 }
             }
-
             let job_before = self.job.clone();
             section(ui, "Job (for the operator sheet)");
             egui::Grid::new("job").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
@@ -4939,109 +4969,6 @@ impl App {
             if self.job != job_before && self.machine.is_none() {
                 self.modified = true;
             }
-            ui.add_space(12.0);
-        });
-    }
-
-    // ---------- bottom bar ----------
-
-    fn bottom_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let total = self.design.as_ref().map(|d| d.cmds.len()).unwrap_or(0);
-            let enabled = total > 0;
-            let play_label = if self.playing {
-                "⏸ Pause"
-            } else {
-                "▶ Play sew-out"
-            };
-            if ui
-                .add_enabled(enabled, egui::Button::new(play_label))
-                .clicked()
-            {
-                if !self.playing && self.progress >= total {
-                    self.progress = 0;
-                }
-                self.playing = !self.playing;
-            }
-            if ui
-                .add_enabled(enabled, egui::Button::new("⏮"))
-                .on_hover_text("Back to start")
-                .clicked()
-            {
-                self.progress = 0;
-                self.playing = false;
-            }
-            if ui
-                .add_enabled(enabled, egui::Button::new("⏭"))
-                .on_hover_text("Show everything")
-                .clicked()
-            {
-                self.progress = total;
-                self.playing = false;
-            }
-            ui.add_enabled(
-                enabled,
-                egui::Slider::new(&mut self.progress, 0..=total.max(1)).show_value(false),
-            );
-            if let Some(d) = &self.design {
-                let n = d.cmds[..self.progress.min(d.cmds.len())]
-                    .iter()
-                    .filter(|c| matches!(c, Cmd::Stitch(_)))
-                    .count();
-                ui.label(format!("{} / {}", group(n), group(d.stats.stitches)));
-            }
-            ui.label("Speed");
-            ui.add(
-                egui::Slider::new(&mut self.speed, 50.0..=8000.0)
-                    .logarithmic(true)
-                    .show_value(false),
-            );
-            ui.separator();
-            for v in View::ALL {
-                ui.selectable_value(&mut self.view, v, v.label()).on_hover_text(match v {
-                    View::Vector => "The artwork: shapes and text to draw and edit (1)",
-                    View::ThreeD => "Stitches as thread on fabric (2)",
-                    View::Flat => "Stitches as plain lines (3)",
-                });
-            }
-            ui.toggle_value(&mut self.show_jumps, "Jumps");
-            ui.toggle_value(&mut self.show_underlay, "Underlay")
-                .on_hover_text("Show the underlay in orange with the top stitches faded");
-            // garment colour the design is shown on (also used on the sheet)
-            let cur = self.job.garment_rgb.unwrap_or(CANVAS);
-            let name = GARMENTS.iter().find(|g| g.1 == cur).map(|g| g.0).unwrap_or("Custom");
-            let before = self.job.garment_rgb;
-            ui.label("Garment");
-            egui::ComboBox::from_id_salt("garment")
-                .width(110.0)
-                .selected_text(name)
-                .show_ui(ui, |ui| {
-                    for (n, rgb) in GARMENTS {
-                        ui.horizontal(|ui| {
-                            swatch(ui, *rgb);
-                            if ui.selectable_label(cur == *rgb, *n).clicked() {
-                                self.job.garment_rgb = if *rgb == CANVAS { None } else { Some(*rgb) };
-                            }
-                        });
-                    }
-                });
-            let mut c = cur;
-            if ui.color_edit_button_srgb(&mut c).on_hover_text("Any garment colour").changed() {
-                self.job.garment_rgb = Some(c);
-            }
-            if self.job.garment_rgb != before {
-                self.modified = true;
-            }
-            if ui
-                .button("Fit")
-                .on_hover_text("Fit design to view (F)")
-                .clicked()
-            {
-                self.fit = true;
-            }
-            ui.separator();
-            ui.label(RichText::new(&self.status).weak());
-        });
     }
 
     // ---------- canvas ----------
@@ -5055,29 +4982,8 @@ impl App {
         } else {
             self.refresh_piece_textures(ui.ctx());
         }
-        // view switcher floating at the top left of the canvas
-        // (hidden while a dialog is open so it never sits on top of one)
-        if (self.machine.is_none() || self.view != View::Vector) && self.trace_dlg.is_none() && !self.show_export {
-            egui::Area::new(egui::Id::new("view-pill"))
-                .fixed_pos(rect.left_top() + Vec2::new(10.0, 10.0))
-                .order(egui::Order::Foreground)
-                .show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for (k, v) in View::ALL.iter().enumerate() {
-                                if self.machine.is_some() && *v == View::Vector {
-                                    continue;
-                                }
-                                ui.selectable_value(&mut self.view, *v, v.label())
-                                    .on_hover_text(format!("Press {}", k + 1));
-                            }
-                        });
-                    });
-                });
-        }
         let g = self.job.garment_rgb.unwrap_or(CANVAS);
         let fabric = Color32::from_rgb(g[0], g[1], g[2]);
-        painter.rect_filled(rect, 0.0, fabric);
         let dark_garment = (g[0] as u32 * 299 + g[1] as u32 * 587 + g[2] as u32 * 114) / 1000 < 110;
 
         // An empty design is a blank canvas to draw on.
@@ -5086,7 +4992,9 @@ impl App {
         let d = self.design.as_ref().unwrap_or(&blank);
 
         let b = d.bbox;
+        let fit_box = if empty_canvas && self.show_hoop { self.hoop_rect(d).0 } else { b };
         if self.fit {
+            let b = fit_box;
             self.zoom = ((rect.width() - 100.0) / b.width() as f32)
                 .min((rect.height() - 100.0) / b.height() as f32)
                 .max(0.5);
@@ -5108,6 +5016,7 @@ impl App {
                 vc.y + ((s.y - rc.y) / zoom) as f64,
             )
         };
+        self.cursor_mm = resp.hover_pos().map(to_mm);
 
         // ---- interaction: select, move, pan, zoom
         let hit_layer = |pos: Pos2, layers: &[Layer], zoom: f32| -> Option<u64> {
@@ -5308,6 +5217,8 @@ impl App {
 
         let d = self.design.as_ref().unwrap_or(&blank);
         let painter = painter.with_clip_rect(rect);
+        let hoop_r = self.paint_artboard(&painter, rect, d, &to_screen, fabric);
+        let gp = painter.with_clip_rect(hoop_r.intersect(rect));
 
         // grid every 10 mm, and a slightly darker hoop-ish area around the design
         let grid = if dark_garment {
@@ -5326,7 +5237,7 @@ impl App {
             let h = rect.height();
             let mut x = rect.left() - h;
             while x < rect.right() {
-                painter.line_segment(
+                gp.line_segment(
                     [Pos2::new(x, rect.bottom()), Pos2::new(x + h, rect.top())],
                     Stroke::new((pitch * 0.35).max(1.0), ink),
                 );
@@ -5339,7 +5250,7 @@ impl App {
             let mut x = (tl.x / 10.0).floor() * 10.0;
             while x <= br.x {
                 let sx = to_screen(Pt::new(x, 0.0)).x;
-                painter.line_segment(
+                gp.line_segment(
                     [Pos2::new(sx, rect.top()), Pos2::new(sx, rect.bottom())],
                     Stroke::new(1.0_f32, grid),
                 );
@@ -5348,7 +5259,7 @@ impl App {
             let mut y = (tl.y / 10.0).floor() * 10.0;
             while y <= br.y {
                 let sy = to_screen(Pt::new(0.0, y)).y;
-                painter.line_segment(
+                gp.line_segment(
                     [Pos2::new(rect.left(), sy), Pos2::new(rect.right(), sy)],
                     Stroke::new(1.0_f32, grid),
                 );
@@ -5458,17 +5369,17 @@ impl App {
                         }
                         _ => {
                             if pts.len() >= 2 {
-                                painter.add(EShape::line(std::mem::take(&mut pts), Stroke::new(1.0, hi)));
+                                painter.add(EShape::line(std::mem::take(&mut pts), Stroke::new(1.0_f32, hi)));
                             }
                             pts.clear();
                         }
                     }
                 }
                 if pts.len() >= 2 {
-                    painter.add(EShape::line(pts, Stroke::new(1.0, hi)));
+                    painter.add(EShape::line(pts, Stroke::new(1.0_f32, hi)));
                 }
                 if bb.is_positive() {
-                    painter.rect_stroke(bb.expand(4.0), 3.0, Stroke::new(2.0, hi), egui::StrokeKind::Outside);
+                    painter.rect_stroke(bb.expand(4.0), 3.0, Stroke::new(2.0_f32, hi), egui::StrokeKind::Outside);
                 }
             }
         }
@@ -5709,6 +5620,17 @@ impl App {
             egui::FontId::proportional(13.0),
             Color32::from_rgb(110, 106, 98),
         );
+        }
+        let origin = if empty_canvas { Pt::new(0.0, 0.0) } else { b.center() };
+        self.paint_rulers(&painter, rect, &to_screen, &to_mm, origin);
+        let sel_screen = self.sel_idx().map(|li| {
+            let lb = self.layers[li].bbox();
+            Rect::from_min_max(to_screen(lb.min), to_screen(lb.max))
+        });
+        if let Some(sr) = sel_screen.filter(|r| r.is_positive() && rect.intersects(*r)) {
+            if self.sel_layers().len() == 1 {
+                self.task_bar(ui.ctx(), rect, sr, now);
+            }
         }
     }
 
@@ -7391,32 +7313,1223 @@ impl App {
     }
 
     /// The tool strip down the left edge.
+    // ---------- shell: menu bar, document bar, dock, hint and status bars ----------
+
+    fn tokens(&self) -> theme::Tokens {
+        theme::tokens(self.theme)
+    }
+
+    fn set_theme(&mut self, ctx: &egui::Context, k: ThemeKind) {
+        self.theme = k;
+        theme::apply(ctx, k);
+        self.save_prefs();
+    }
+
+    fn save_prefs(&self) {
+        theme::save_prefs(&theme::Prefs {
+            theme: self.theme,
+            workspace: self.workspace.key().into(),
+            keys: if self.ai_keys { "illustrator" } else { "classic" }.into(),
+            libs: self.libs.iter().filter(|l| l.on && !l.key.starts_with("design:")).map(|l| l.key.clone()).collect(),
+        });
+    }
+
+    /// Switch workspace: which panels lead, and Simple or full controls.
+    fn set_workspace(&mut self, w: Workspace) {
+        self.workspace = w;
+        self.dock_open = true;
+        let to_design = |s: &mut Self| {
+            if s.tab != Tab::Design {
+                s.set_tab(Tab::Design);
+            }
+        };
+        match w {
+            Workspace::Design => {
+                self.pro = true;
+                to_design(self);
+                self.dock = Dock::Properties;
+            }
+            Workspace::Lettering => {
+                self.pro = true;
+                to_design(self);
+                self.dock = Dock::Properties;
+                if self.machine.is_none() {
+                    self.set_tool(Tool::Text);
+                }
+                self.status = "Lettering: click where the words go, or Type > Add text".into();
+            }
+            Workspace::NameDrops => {
+                self.pro = true;
+                if self.machine.is_none() && !self.layers.is_empty() {
+                    if self.tab != Tab::Drops {
+                        self.set_tab(Tab::Drops);
+                    }
+                } else {
+                    self.status = "Name drops need a design first: open or draw the logo, then add a name layer".into();
+                }
+                self.dock = Dock::Properties;
+            }
+            Workspace::Production => {
+                self.pro = true;
+                to_design(self);
+                self.dock = Dock::Production;
+            }
+            Workspace::Simple => {
+                self.pro = false;
+                to_design(self);
+            }
+        }
+        self.save_prefs();
+    }
+
+    /// Dock tabs offered now (Simple hides the thread libraries).
+    fn dock_tabs(&self) -> Vec<Dock> {
+        vec![Dock::Properties, Dock::Layers, Dock::Threads, Dock::Production]
+    }
+
+    fn dock_label(&self, d: Dock) -> &'static str {
+        match d {
+            Dock::Properties if self.tab == Tab::Drops && self.machine.is_none() => "Names",
+            Dock::Properties => "Properties",
+            Dock::Layers if self.machine.is_some() => "Stitch file",
+            Dock::Layers if self.tab == Tab::Drops => "Drops",
+            Dock::Layers => "Layers",
+            Dock::Threads => "Threads",
+            Dock::Production => "Production",
+        }
+    }
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let t = self.tokens();
+        let art = self.machine.is_none();
+        let has = art && !self.layers.is_empty();
+        let n_sel = self.sel_layers().len();
+        let sel = self.sel_idx().filter(|_| art && self.tab == Tab::Design);
+        let item = |ui: &mut egui::Ui, on: bool, label: &str, keys: &str| -> bool {
+            let mut b = egui::Button::new(label);
+            if !keys.is_empty() {
+                b = b.shortcut_text(keys);
+            }
+            ui.add_enabled(on, b).clicked()
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            // brand mark
+            let (r, _) = ui.allocate_exact_size(Vec2::new(22.0, 22.0), Sense::hover());
+            ui.painter().rect_filled(r, 5.0, t.accent);
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "SF", egui::FontId::proportional(11.0), Color32::WHITE);
+            ui.add_space(8.0);
+            ui.menu_button("File", |ui| {
+                ui.set_min_width(240.0);
+                if item(ui, true, "New", &kb("N")) {
+                    ui.close();
+                    self.guard(Pending::New, &ctx);
+                }
+                if item(ui, true, "Open…", &kb("O")) {
+                    ui.close();
+                    self.guard(Pending::Open, &ctx);
+                }
+                ui.separator();
+                if item(ui, has, "Save", &kb("S")) {
+                    ui.close();
+                    self.save();
+                }
+                if item(ui, has, "Save As…", &kb("⇧S")) {
+                    ui.close();
+                    self.save_as();
+                }
+                ui.separator();
+                if item(ui, has, "Add art…", "") {
+                    ui.close();
+                    self.pick_svg(true);
+                }
+                if item(ui, art, "Trace a picture…", "") {
+                    ui.close();
+                    pick(
+                        if self.layers.is_empty() { Want::Open } else { Want::AddSvg },
+                        "Trace a picture",
+                        &[("Pictures, mockups, PDF", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "pdf", "ai"])],
+                        self.last_dir.as_ref(),
+                    );
+                }
+                ui.separator();
+                if item(ui, self.design.is_some(), "Export machine files…", &kb("E")) {
+                    ui.close();
+                    self.show_export = true;
+                }
+                if item(ui, has, "Export artwork as SVG…", "") {
+                    ui.close();
+                    self.export_art_svg();
+                }
+                ui.separator();
+                if item(ui, true, "Sample logo", "") {
+                    ui.close();
+                    self.guard(Pending::Sample, &ctx);
+                }
+                if item(ui, true, "Calibration sampler", "") {
+                    ui.close();
+                    self.guard(Pending::Sampler, &ctx);
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                ui.set_min_width(220.0);
+                if item(ui, !self.undo.is_empty(), "Undo", &kb("Z")) {
+                    ui.close();
+                    self.do_undo();
+                }
+                if item(ui, !self.redo.is_empty(), "Redo", &kb("⇧Z")) {
+                    ui.close();
+                    self.do_redo();
+                }
+                ui.separator();
+                if item(ui, sel.is_some(), "Duplicate", &kb("D")) {
+                    ui.close();
+                    if let Some(li) = sel {
+                        self.layer_action("dup", li);
+                    }
+                }
+                if item(ui, sel.is_some(), "Delete", "Del") {
+                    ui.close();
+                    if let Some(li) = sel {
+                        self.layer_action("del", li);
+                    }
+                }
+            });
+            ui.menu_button("Object", |ui| {
+                ui.set_min_width(220.0);
+                ui.add_enabled_ui(has, |ui| self.path_tools(ui, true));
+                ui.separator();
+                if item(ui, sel.map(|li| li > 0).unwrap_or(false), "Sew earlier", "") {
+                    ui.close();
+                    if let Some(li) = sel {
+                        self.layer_action("up", li);
+                    }
+                }
+                if item(ui, sel.map(|li| li + 1 < self.layers.len()).unwrap_or(false), "Sew later", "") {
+                    ui.close();
+                    if let Some(li) = sel {
+                        self.layer_action("down", li);
+                    }
+                }
+                if item(ui, has, "Auto-sequence layers", "") {
+                    ui.close();
+                    self.auto_sequence();
+                }
+            });
+            ui.menu_button("Type", |ui| {
+                ui.set_min_width(220.0);
+                if item(ui, art, "Add text…", "") {
+                    ui.close();
+                    self.show_text = true;
+                }
+                if item(ui, art, "Text tool", Tool::Text.key_label(self.ai_keys)) {
+                    ui.close();
+                    self.set_tool(Tool::Text);
+                }
+                ui.separator();
+                if item(ui, has, "Name drops…", "") {
+                    ui.close();
+                    self.set_workspace(Workspace::NameDrops);
+                }
+            });
+            ui.menu_button("Stitch", |ui| {
+                ui.set_min_width(240.0);
+                if item(ui, sel.is_some(), "Edit shape points", Tool::Nodes.key_label(self.ai_keys)) {
+                    ui.close();
+                    if let Some(li) = sel {
+                        self.layer_action("edit-shape", li);
+                    }
+                }
+                if item(ui, sel.is_some(), "Edit stitch points", Tool::Stitches.key_label(self.ai_keys)) {
+                    ui.close();
+                    if let Some(li) = sel {
+                        self.layer_action("edit-stitches", li);
+                    }
+                }
+                if item(ui, sel.is_some(), "Direction lines", Tool::Guides.key_label(self.ai_keys)) {
+                    ui.close();
+                    if let Some(li) = sel {
+                        self.layer_action("guides", li);
+                    }
+                }
+                ui.separator();
+                ui.checkbox(&mut self.show_underlay, "Show underlay");
+                ui.checkbox(&mut self.show_jumps, "Show jumps");
+                ui.separator();
+                if item(ui, true, "Thread weight guide…", "") {
+                    ui.close();
+                    self.show_weights = true;
+                }
+                if self.machine.is_some() && item(ui, true, "Turn stitches into objects", "") {
+                    ui.close();
+                    self.convert_machine();
+                }
+            });
+            ui.menu_button("Select", |ui| {
+                ui.set_min_width(200.0);
+                if item(ui, has && self.tab == Tab::Design, "All", &kb("A")) {
+                    ui.close();
+                    self.select_all();
+                }
+                if item(ui, n_sel > 0, "None", "Esc") {
+                    ui.close();
+                    self.selected = None;
+                    self.focus_part = None;
+                }
+            });
+            ui.menu_button("View", |ui| {
+                ui.set_min_width(220.0);
+                for (k, v) in View::ALL.iter().enumerate() {
+                    if ui.add(egui::Button::selectable(self.view == *v, v.label()).shortcut_text(format!("{}", k + 1))).clicked() {
+                        ui.close();
+                        self.view = *v;
+                    }
+                }
+                ui.separator();
+                if item(ui, true, "Fit in window", "F") {
+                    ui.close();
+                    self.fit = true;
+                }
+                if item(ui, true, "Zoom in", &kb("=")) {
+                    ui.close();
+                    self.zoom = (self.zoom * 1.25).min(200.0);
+                }
+                if item(ui, true, "Zoom out", &kb("-")) {
+                    ui.close();
+                    self.zoom = (self.zoom / 1.25).max(0.3);
+                }
+                if item(ui, true, "Actual size (100%)", &kb("1")) {
+                    ui.close();
+                    self.zoom = MM_PX;
+                }
+                ui.separator();
+                ui.checkbox(&mut self.show_rulers, "Rulers");
+                ui.checkbox(&mut self.show_hoop, "Hoop");
+                ui.checkbox(&mut self.show_underlay, "Underlay");
+                ui.checkbox(&mut self.show_jumps, "Jumps");
+                ui.separator();
+                ui.menu_button("Garment colour", |ui| self.garment_picker(ui));
+            });
+            ui.menu_button("Window", |ui| {
+                ui.set_min_width(220.0);
+                ui.menu_button("Workspace", |ui| {
+                    for w in Workspace::ALL {
+                        if ui.add(egui::Button::selectable(self.workspace == w, w.label())).on_hover_text(w.hint()).clicked() {
+                            ui.close();
+                            self.set_workspace(w);
+                        }
+                    }
+                });
+                ui.menu_button("Theme", |ui| {
+                    for k in ThemeKind::ALL {
+                        if ui.add(egui::Button::selectable(self.theme == k, k.label())).clicked() {
+                            ui.close();
+                            self.set_theme(&ctx, k);
+                        }
+                    }
+                });
+                ui.menu_button("Keyboard shortcuts", |ui| {
+                    if ui.add(egui::Button::selectable(!self.ai_keys, "StitchForge")).clicked() {
+                        ui.close();
+                        self.ai_keys = false;
+                        self.save_prefs();
+                    }
+                    if ui.add(egui::Button::selectable(self.ai_keys, "Vector-editor style")).on_hover_text("Tool keys like most vector drawing apps: A edits points, M rectangle, L ellipse").clicked() {
+                        ui.close();
+                        self.ai_keys = true;
+                        self.save_prefs();
+                    }
+                });
+                ui.separator();
+                for d in self.dock_tabs() {
+                    if ui.add(egui::Button::selectable(self.dock_open && self.dock == d, self.dock_label(d))).clicked() {
+                        ui.close();
+                        self.dock = d;
+                        self.dock_open = true;
+                    }
+                }
+                ui.separator();
+                let lbl = if self.dock_open { "Hide panels" } else { "Show panels" };
+                if item(ui, true, lbl, "") {
+                    ui.close();
+                    self.dock_open = !self.dock_open;
+                }
+            });
+            ui.menu_button("Help", |ui| {
+                ui.set_min_width(200.0);
+                if item(ui, true, "Keyboard shortcuts", "?") {
+                    ui.close();
+                    self.show_keys = true;
+                }
+                if item(ui, true, "About StitchForge", "") {
+                    ui.close();
+                    self.show_about = true;
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let export = egui::Button::new(RichText::new("Export").color(Color32::WHITE).strong()).fill(t.accent);
+                if ui
+                    .add_enabled(self.design.is_some(), export)
+                    .on_hover_text(format!("Machine files and operator sheet ({})", kb("E")))
+                    .clicked()
+                {
+                    self.show_export = true;
+                }
+                let before = self.workspace;
+                let mut w = self.workspace;
+                egui::ComboBox::from_id_salt("workspace")
+                    .width(130.0)
+                    .selected_text(w.label())
+                    .show_ui(ui, |ui| {
+                        for x in Workspace::ALL {
+                            ui.selectable_value(&mut w, x, x.label()).on_hover_text(x.hint());
+                        }
+                    })
+                    .response
+                    .on_hover_text("Workspace: which panels lead. Simple keeps only the essentials");
+                if w != before {
+                    self.set_workspace(w);
+                }
+                // theme: one click cycles Dark, Neutral grey, Light
+                let (r, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+                let c = r.center();
+                ui.painter().circle_stroke(c, 7.0, Stroke::new(1.5_f32, t.text_weak));
+                ui.painter().add(EShape::convex_polygon(
+                    (0..=12).map(|i| {
+                        let a = std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / 12.0;
+                        c + Vec2::new(a.cos(), -a.sin()) * 7.0
+                    }).collect(),
+                    t.text_weak,
+                    Stroke::NONE,
+                ));
+                if resp.on_hover_text(format!("Theme: {} (click to change)", self.theme.label())).clicked() {
+                    let i = ThemeKind::ALL.iter().position(|k| *k == self.theme).unwrap_or(0);
+                    self.set_theme(&ctx, ThemeKind::ALL[(i + 1) % ThemeKind::ALL.len()]);
+                }
+            });
+        });
+    }
+
+    fn select_all(&mut self) {
+        self.multi = self.layers.iter().filter(|l| l.visible).map(|l| l.id).collect();
+        self.selected = self.multi.iter().next().copied();
+    }
+
+    fn garment_picker(&mut self, ui: &mut egui::Ui) {
+        let cur = self.job.garment_rgb.unwrap_or(CANVAS);
+        let before = self.job.garment_rgb;
+        for (n, rgb) in GARMENTS {
+            ui.horizontal(|ui| {
+                swatch(ui, *rgb);
+                if ui.selectable_label(cur == *rgb, *n).clicked() {
+                    self.job.garment_rgb = if *rgb == CANVAS { None } else { Some(*rgb) };
+                }
+            });
+        }
+        let mut c = cur;
+        ui.horizontal(|ui| {
+            ui.label("Any colour");
+            if ui.color_edit_button_srgb(&mut c).changed() {
+                self.job.garment_rgb = Some(c);
+            }
+        });
+        if self.job.garment_rgb != before {
+            self.modified = true;
+        }
+    }
+
+    /// The document tab, and the view switch.
+    fn doc_bar(&mut self, ui: &mut egui::Ui) {
+        let t = self.tokens();
+        ui.horizontal(|ui| {
+            let pct = self.zoom / MM_PX * 100.0;
+            let name = format!(
+                "{}{}  @ {:.0}%  ({})",
+                self.display_name(),
+                if self.modified { " •" } else { "" },
+                pct,
+                self.view.label()
+            );
+            egui::Frame::new()
+                .fill(t.panel)
+                .corner_radius(CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
+                .inner_margin(egui::Margin::symmetric(14, 6))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(name).strong().color(t.text))
+                        .on_hover_text(if self.modified { "Unsaved changes" } else { "All changes saved" });
+                });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                ui.toggle_value(&mut self.show_underlay, "Underlay")
+                    .on_hover_text("Show the underlay in orange with the top stitches faded");
+                ui.toggle_value(&mut self.show_jumps, "Jumps");
+                ui.separator();
+                // garment colour the design is shown on (also on the sheet)
+                let g = self.job.garment_rgb.unwrap_or(CANVAS);
+                let gname = GARMENTS.iter().find(|x| x.1 == g).map(|x| x.0).unwrap_or("Custom");
+                ui.menu_button(format!("Garment: {gname}"), |ui| self.garment_picker(ui))
+                    .response
+                    .on_hover_text("The garment colour the design is shown on, also printed on the operator sheet");
+                let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
+                ui.painter().circle_filled(r.center(), 7.0, Color32::from_rgb(g[0], g[1], g[2]));
+                ui.painter().circle_stroke(r.center(), 7.0, Stroke::new(1.0_f32, t.border));
+                ui.separator();
+                egui::Frame::new()
+                    .fill(t.field)
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(egui::Margin::same(2))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            // right-to-left row: last first
+                            for (k, v) in View::ALL.iter().enumerate().rev() {
+                                if self.machine.is_some() && *v == View::Vector {
+                                    continue;
+                                }
+                                let on = self.view == *v;
+                                let txt = RichText::new(v.label()).color(if on { Color32::WHITE } else { t.text_weak });
+                                let b = egui::Button::new(txt).fill(if on { t.accent } else { Color32::TRANSPARENT });
+                                if ui.add(b).on_hover_text(format!("Press {}", k + 1)).clicked() {
+                                    self.view = *v;
+                                }
+                            }
+                        });
+                    });
+            });
+        });
+    }
+
+    /// One-line help for what the pointer does now, plus the sew-out player.
+    fn hint_bar(&mut self, ui: &mut egui::Ui) {
+        let t = self.tokens();
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+            ui.painter().circle_stroke(r.center(), 7.5, Stroke::new(1.2_f32, t.text_weak));
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "?", egui::FontId::proportional(11.0), t.text_weak);
+            ui.add_space(4.0);
+            let parts = self.hint_parts();
+            for (i, (b, rest)) in parts.iter().enumerate() {
+                if i > 0 {
+                    ui.label(RichText::new("|").color(t.border));
+                }
+                ui.label(RichText::new(*b).strong().color(t.text));
+                ui.label(RichText::new(*rest).color(t.text_weak));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.player(ui));
+        });
+    }
+
+    fn hint_parts(&self) -> Vec<(&'static str, &'static str)> {
+        if self.machine.is_some() {
+            return vec![("Drag", "to pan"), ("Scroll", "to zoom"), ("Stitch > Turn stitches into objects", "to edit")];
+        }
+        if self.tab == Tab::Drops {
+            return vec![("Drops", "panel: pick a drop to see it"), ("Names", "panel: the sheet, layers and machine")];
+        }
+        match self.edit {
+            Edit::Shape(_) => return vec![("Drag", "an anchor or handle"), ("Double-click", "the outline to add a point"), ("Esc", "to finish")],
+            Edit::Stitches(_) => return vec![("Click", "a needle point"), ("Drag", "to move it"), ("Delete", "removes it"), ("Esc", "to finish")],
+            Edit::None => {}
+        }
+        match self.tool {
+            Tool::Select if self.selected.is_some() => vec![
+                ("Drag", "to move"),
+                ("Drag an angle end", "to turn the stitches"),
+                ("Shift+Click", "to add to the selection"),
+                ("Arrows", "nudge"),
+            ],
+            Tool::Select => vec![("Click", "an object to select it"), ("Shift+Click", "to select several"), ("Drag", "empty space to pan"), ("Double-click", "to fit")],
+            Tool::Nodes => vec![("Click", "an object"), ("Drag", "its anchors and handles")],
+            Tool::Stitches => vec![("Click", "an object"), ("Drag", "its needle points")],
+            Tool::Pen => vec![("Click", "for a corner"), ("Drag", "for a curve"), ("Click the first point", "to close"), ("Enter", "to finish")],
+            Tool::Rect => vec![("Drag", "to draw"), ("Shift", "for a square")],
+            Tool::Ellipse => vec![("Drag", "to draw"), ("Shift", "for a circle")],
+            Tool::Polygon => vec![("Drag", "from the centre"), ("Shift", "snaps the angle")],
+            Tool::Line => vec![("Drag", "to draw"), ("Shift", "snaps to 15°")],
+            Tool::Text => vec![("Click", "where the words go")],
+            Tool::Measure => vec![("Drag", "across a column or gap"), ("Shift", "snaps to 15°")],
+            Tool::Knife => vec![("Drag", "a line across a shape to cut it"), ("Shift", "snaps to 15°")],
+            Tool::Eraser => vec![("Draw", "around the part to remove")],
+            Tool::Guides => vec![("Drag", "across a fill to set the stitch direction"), ("Delete", "removes the picked line")],
+        }
+    }
+
+    /// Sew-out player: play, rewind, scrub, speed.
+    fn player(&mut self, ui: &mut egui::Ui) {
+        let total = self.design.as_ref().map(|d| d.cmds.len()).unwrap_or(0);
+        let on = total > 0;
+        ui.add_enabled(
+            on,
+            egui::Slider::new(&mut self.speed, 50.0..=8000.0).logarithmic(true).show_value(false),
+        )
+        .on_hover_text("Sew-out speed");
+        if let Some(d) = &self.design {
+            let n = d.cmds[..self.progress.min(d.cmds.len())]
+                .iter()
+                .filter(|c| matches!(c, Cmd::Stitch(_)))
+                .count();
+            ui.label(RichText::new(format!("{} / {}", group(n), group(d.stats.stitches))).monospace());
+        }
+        ui.add_enabled(on, egui::Slider::new(&mut self.progress, 0..=total.max(1)).show_value(false));
+        if ui.add_enabled(on, egui::Button::new("⏭")).on_hover_text("Show everything").clicked() {
+            self.progress = total;
+            self.playing = false;
+        }
+        if ui.add_enabled(on, egui::Button::new("⏮")).on_hover_text("Back to start").clicked() {
+            self.progress = 0;
+            self.playing = false;
+        }
+        let label = if self.playing { "⏸ Pause" } else { "▶ Sew-out" };
+        if ui.add_enabled(on, egui::Button::new(label)).on_hover_text("Play the sew-out (Space)").clicked() {
+            if !self.playing && self.progress >= total {
+                self.progress = 0;
+            }
+            self.playing = !self.playing;
+        }
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let t = self.tokens();
+        ui.horizontal(|ui| {
+            let pct = self.zoom / MM_PX * 100.0;
+            egui::ComboBox::from_id_salt("zoom-pct")
+                .width(64.0)
+                .selected_text(format!("{pct:.0}%"))
+                .show_ui(ui, |ui| {
+                    for z in [25.0, 50.0, 100.0, 200.0, 400.0, 800.0, 1600.0] {
+                        if ui.selectable_label(false, format!("{z:.0}%")).clicked() {
+                            self.zoom = z / 100.0 * MM_PX;
+                        }
+                    }
+                    if ui.selectable_label(false, "Fit (F)").clicked() {
+                        self.fit = true;
+                    }
+                });
+            ui.separator();
+            let origin = self.design.as_ref().map(|d| d.bbox.center()).unwrap_or(Pt::new(0.0, 0.0));
+            let pos = match self.cursor_mm {
+                Some(p) => format!("X {:>6.1}   Y {:>6.1} mm", p.x - origin.x, p.y - origin.y),
+                None => "X      –   Y      – mm".into(),
+            };
+            ui.label(RichText::new(pos).monospace().color(t.text_weak))
+                .on_hover_text("Pointer position from the design centre");
+            ui.separator();
+            ui.label(RichText::new(self.tool.name()).color(t.text_weak));
+            if let Some(d) = &self.design {
+                ui.separator();
+                let s = &d.stats;
+                ui.label(
+                    RichText::new(format!(
+                        "{} stitches · {} stops · {} trims · {:.1} min",
+                        group(s.stitches),
+                        d.stops.len(),
+                        s.trims,
+                        s.run_minutes
+                    ))
+                    .color(t.text_weak),
+                );
+                if !d.warnings.is_empty() {
+                    let w = ui.label(RichText::new(format!("⚠ {} to check", d.warnings.len())).color(t.warn));
+                    if w.on_hover_text("Open the Production panel").interact(Sense::click()).clicked() {
+                        self.dock = Dock::Production;
+                        self.dock_open = true;
+                    }
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut s = self.status.clone();
+                if s.chars().count() > 90 {
+                    s = s.chars().take(88).collect::<String>() + "…";
+                }
+                ui.label(RichText::new(s).color(t.text_weak)).on_hover_text(self.status.clone());
+            });
+        });
+    }
+
+    /// The icon strip beside the dock: one icon per panel.
+    fn dock_icons(&mut self, ui: &mut egui::Ui) {
+        let t = self.tokens();
+        ui.add_space(6.0);
+        ui.vertical_centered(|ui| {
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(28.0, 20.0), Sense::click());
+            let ink = if resp.hovered() { t.text } else { t.text_weak };
+            let s = if self.dock_open { "»" } else { "«" };
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, s, egui::FontId::proportional(14.0), ink);
+            if resp.on_hover_text(if self.dock_open { "Hide panels" } else { "Show panels" }).clicked() {
+                self.dock_open = !self.dock_open;
+            }
+            ui.add_space(6.0);
+            for d in self.dock_tabs() {
+                let (r, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+                let on = self.dock_open && self.dock == d;
+                let bg = if on {
+                    t.accent_soft
+                } else if resp.hovered() {
+                    t.hover
+                } else {
+                    Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(r, 6.0, bg);
+                let ink = if on { if t.dark { Color32::WHITE } else { t.accent } } else { t.text_weak };
+                dock_icon(ui.painter(), r.shrink(8.0), d, ink);
+                if resp.on_hover_text(self.dock_label(d)).clicked() {
+                    if on {
+                        self.dock_open = false;
+                    } else {
+                        self.dock = d;
+                        self.dock_open = true;
+                    }
+                }
+                ui.add_space(2.0);
+            }
+        });
+    }
+
+    /// The docked panels: a tab strip and the open panel.
+    fn dock(&mut self, ui: &mut egui::Ui, now: f64) {
+        let t = self.tokens();
+        if !self.dock_tabs().contains(&self.dock) {
+            self.dock = Dock::Properties;
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for d in self.dock_tabs() {
+                let on = self.dock == d;
+                let txt = RichText::new(self.dock_label(d)).strong().color(if on { t.text } else { t.text_weak });
+                let b = egui::Button::new(txt).fill(if on { t.panel_alt } else { Color32::TRANSPARENT });
+                if ui.add(b).clicked() {
+                    self.dock = d;
+                }
+            }
+        });
+        ui.add_space(2.0);
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt(("dock", self.dock as u8))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                match self.dock {
+                    Dock::Properties => self.props_panel(ui, now),
+                    Dock::Layers => {
+                        if self.machine.is_some() {
+                            self.machine_panel(ui)
+                        } else if self.tab == Tab::Drops {
+                            self.drops_panel(ui)
+                        } else {
+                            self.layers_panel(ui)
+                        }
+                    }
+                    Dock::Threads => self.threads_panel(ui),
+                    Dock::Production => self.production_panel(ui),
+                }
+                ui.add_space(12.0);
+            });
+    }
+
+    /// Properties: what is selected, or the design itself when nothing is.
+    fn props_panel(&mut self, ui: &mut egui::Ui, now: f64) {
+        let t = self.tokens();
+        if self.tab == Tab::Drops && self.machine.is_none() {
+            self.drops_setup(ui);
+            return;
+        }
+        let kind = if self.machine.is_some() {
+            "Stitch file".to_string()
+        } else {
+            match (self.sel_layers().len(), self.sel_idx()) {
+                (0, _) => "Design".to_string(),
+                (1, Some(li)) => {
+                    let l = &self.layers[li];
+                    format!("{} · {}", if l.text.is_some() { "Text" } else { "Shape" }, l.name)
+                }
+                (n, _) => format!("{n} objects"),
+            }
+        };
+        ui.label(RichText::new(kind).color(t.text_weak));
+        if self.selected.is_some() || self.tool.draws() || self.edit != Edit::None {
+            self.props_selection(ui, now);
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(RichText::new("Design").strong())
+                .id_salt("doc-props")
+                .default_open(false)
+                .show(ui, |ui| self.props_document(ui));
+        } else {
+            self.props_document(ui);
+        }
+    }
+
+    // ---------- canvas furniture: hoop artboard, rulers, task bar ----------
+
+    /// The hoop (or cap frame) the design sews in, in mm, centred on the design.
+    fn hoop_rect(&self, d: &Design) -> (BBox, String) {
+        let c = if self.design.is_some() { d.bbox.center() } else { Pt::new(0.0, 0.0) };
+        let (w, h, name) = if self.profile == Profile::Cap {
+            let (w, h) = self.recipe.cap_size.limit();
+            (w + 16.0, h + 16.0, format!("Cap frame · {}", self.recipe.cap_size.label()))
+        } else {
+            let need = (d.bbox.width() + 10.0, d.bbox.height() + 10.0);
+            let i = self.hoop.unwrap_or_else(|| {
+                HOOPS
+                    .iter()
+                    .position(|h| (h.1 >= need.0 && h.2 >= need.1) || (h.2 >= need.0 && h.1 >= need.1))
+                    .unwrap_or(HOOPS.len() - 1)
+            });
+            let (n, a, b) = HOOPS[i];
+            // turn the hoop to suit the design
+            let (w, h) = if (need.0 > need.1) == (a > b) { (a, b) } else { (b, a) };
+            let auto = if self.hoop.is_none() { " (auto)" } else { "" };
+            (w, h, format!("Hoop {n}{auto}"))
+        };
+        let half = Pt::new(w / 2.0, h / 2.0);
+        (BBox { min: Pt::new(c.x - half.x, c.y - half.y), max: Pt::new(c.x + half.x, c.y + half.y) }, name)
+    }
+
+    /// Pasteboard, then the hoop area in the garment colour.
+    fn paint_artboard(&self, painter: &egui::Painter, rect: Rect, d: &Design, to_screen: &dyn Fn(Pt) -> Pos2, fabric: Color32) -> Rect {
+        let t = self.tokens();
+        painter.rect_filled(rect, 0.0, t.pasteboard);
+        if !self.show_hoop {
+            painter.rect_filled(rect, 0.0, fabric);
+            return rect;
+        }
+        let (hb, name) = self.hoop_rect(d);
+        let r = Rect::from_min_max(to_screen(hb.min), to_screen(hb.max));
+        let round = (6.0 * self.zoom).min(r.width() / 4.0) as u8;
+        painter.add(egui::epaint::RectShape::filled(r.translate(Vec2::new(0.0, 3.0)), round, Color32::from_black_alpha(60)));
+        painter.rect_filled(r, round, fabric);
+        painter.rect_stroke(r, round, Stroke::new(1.0_f32, Color32::from_black_alpha(50)), egui::StrokeKind::Outside);
+        painter.text(
+            r.left_top() - Vec2::new(0.0, 6.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{name}  ·  {}", self.profile.label()),
+            egui::FontId::proportional(11.5),
+            t.text_weak,
+        );
+        r
+    }
+
+    /// Rulers along the top and left of the canvas, in mm from the design centre.
+    fn paint_rulers(&self, painter: &egui::Painter, rect: Rect, to_screen: &dyn Fn(Pt) -> Pos2, to_mm: &dyn Fn(Pos2) -> Pt, origin: Pt) {
+        if !self.show_rulers {
+            return;
+        }
+        let t = self.tokens();
+        let s = RULER;
+        let top = Rect::from_min_max(rect.left_top(), Pos2::new(rect.right(), rect.top() + s));
+        let left = Rect::from_min_max(rect.left_top(), Pos2::new(rect.left() + s, rect.bottom()));
+        painter.rect_filled(top, 0.0, t.chrome);
+        painter.rect_filled(left, 0.0, t.chrome);
+        painter.line_segment([top.left_bottom(), top.right_bottom()], Stroke::new(1.0_f32, t.border));
+        painter.line_segment([left.right_top(), left.right_bottom()], Stroke::new(1.0_f32, t.border));
+        // label step: about every 60 px, at 1/2/5 × 10^n mm
+        let zoom = self.zoom as f64;
+        let mut step = 1.0;
+        for cand in [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0] {
+            step = cand;
+            if cand * zoom >= 60.0 {
+                break;
+            }
+        }
+        let minor = step / if step == 2.0 || step == 20.0 || step == 200.0 { 4.0 } else { 5.0 };
+        let font = egui::FontId::proportional(9.5);
+        let ink = t.text_weak;
+        let tick = Stroke::new(1.0_f32, t.text_weak.gamma_multiply(0.7));
+        let a = to_mm(Pos2::new(top.left() + s, 0.0)).x - origin.x;
+        let b = to_mm(Pos2::new(top.right(), 0.0)).x - origin.x;
+        let mut v = (a / minor).floor() * minor;
+        while v <= b {
+            let x = to_screen(Pt::new(v + origin.x, 0.0)).x;
+            if x > top.left() + s {
+                let major = ((v / step).round() * step - v).abs() < 1e-6;
+                let len = if major { s * 0.6 } else { s * 0.25 };
+                painter.line_segment([Pos2::new(x, top.bottom() - len), Pos2::new(x, top.bottom())], tick);
+                if major {
+                    painter.text(Pos2::new(x + 3.0, top.top() + 2.0), egui::Align2::LEFT_TOP, format!("{}", v.round() as i64), font.clone(), ink);
+                }
+            }
+            v += minor;
+        }
+        let a = to_mm(Pos2::new(0.0, left.top() + s)).y - origin.y;
+        let b = to_mm(Pos2::new(0.0, left.bottom())).y - origin.y;
+        let mut v = (a / minor).floor() * minor;
+        while v <= b {
+            let y = to_screen(Pt::new(0.0, v + origin.y)).y;
+            if y > left.top() + s {
+                let major = ((v / step).round() * step - v).abs() < 1e-6;
+                let len = if major { s * 0.6 } else { s * 0.25 };
+                painter.line_segment([Pos2::new(left.right() - len, y), Pos2::new(left.right(), y)], tick);
+                if major {
+                    let g = painter.layout_no_wrap(format!("{}", v.round() as i64), font.clone(), ink);
+                    let pos = Pos2::new(left.left() + 2.0, y + 3.0);
+                    painter.add(egui::epaint::TextShape::new(pos + Vec2::new(0.0, g.size().x), g, ink).with_angle(-std::f32::consts::FRAC_PI_2));
+                }
+            }
+            v += minor;
+        }
+        // pointer position marks
+        if let Some(p) = self.cursor_mm {
+            let sp = to_screen(p);
+            let mark = Stroke::new(1.0_f32, t.accent);
+            if sp.x > top.left() + s {
+                painter.line_segment([Pos2::new(sp.x, top.top()), Pos2::new(sp.x, top.bottom())], mark);
+            }
+            if sp.y > left.top() + s {
+                painter.line_segment([Pos2::new(left.left(), sp.y), Pos2::new(left.right(), sp.y)], mark);
+            }
+        }
+        let corner = Rect::from_min_size(rect.left_top(), Vec2::splat(s));
+        painter.rect_filled(corner, 0.0, t.chrome);
+        painter.text(corner.center(), egui::Align2::CENTER_CENTER, "mm", egui::FontId::proportional(8.5), ink);
+    }
+
+    /// Floating bar under the selection: the common next steps for it.
+    fn task_bar(&mut self, ctx: &egui::Context, canvas: Rect, sel_screen: Rect, now: f64) {
+        let Some(li) = self.sel_idx() else { return };
+        if self.edit != Edit::None || self.machine.is_some() || self.tab != Tab::Design || self.moving.is_some() {
+            return;
+        }
+        if self.show_export || self.trace_dlg.is_some() || self.show_text {
+            return;
+        }
+        let t = self.tokens();
+        let w_guess = 470.0;
+        let mut pos = Pos2::new(sel_screen.center().x - w_guess / 2.0, sel_screen.bottom() + 34.0);
+        let bottom_room = canvas.bottom() - 54.0;
+        if pos.y > bottom_room {
+            pos.y = (sel_screen.top() - 50.0).max(canvas.top() + RULER + 6.0);
+        }
+        pos.x = pos.x.clamp(canvas.left() + RULER + 6.0, (canvas.right() - w_guess - 6.0).max(canvas.left() + RULER + 6.0));
+        let mut action: Option<&'static str> = None;
+        let mut set_stitch: Option<StitchChoice> = None;
+        let cur = self.layers[li].opts.stitch;
+        let rgb = self.layers[li].custom.as_ref().map(|c| c.rgb).or(self.layers[li].shapes.first().map(|s| s.rgb)).unwrap_or([128, 128, 128]);
+        egui::Area::new(egui::Id::new("task-bar"))
+            .fixed_pos(pos)
+            .order(egui::Order::Middle)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(t.chrome)
+                    .stroke(Stroke::new(1.0_f32, t.border))
+                    .corner_radius(CornerRadius::same(8))
+                    .shadow(egui::epaint::Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(70) })
+                    .inner_margin(egui::Margin::symmetric(6, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            swatch(ui, rgb);
+                            egui::ComboBox::from_id_salt("tb-stitch")
+                                .width(132.0)
+                                .selected_text(cur.label())
+                                .show_ui(ui, |ui| {
+                                    for c in StitchChoice::ALL {
+                                        if ui.selectable_label(cur == c, c.label()).clicked() {
+                                            set_stitch = Some(c);
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Stitch type for this layer");
+                            ui.separator();
+                            let b = |ui: &mut egui::Ui, label: &str, tip: &str| ui.add(egui::Button::new(label).frame(false)).on_hover_text(tip).clicked();
+                            if b(ui, "Shape", "Edit shape points") {
+                                action = Some("edit-shape");
+                            }
+                            if b(ui, "Stitches", "Edit stitch points") {
+                                action = Some("edit-stitches");
+                            }
+                            if b(ui, "Direction", "Direction lines: draw which way the stitches run") {
+                                action = Some("guides");
+                            }
+                            ui.separator();
+                            if b(ui, "Duplicate", &format!("Duplicate ({})", kb("D"))) {
+                                action = Some("dup");
+                            }
+                            if b(ui, "🗑", "Delete") {
+                                action = Some("del");
+                            }
+                            ui.menu_button("…", |ui| {
+                                ui.set_min_width(200.0);
+                                self.path_tools(ui, true);
+                            })
+                            .response
+                            .on_hover_text("More shape tools");
+                        });
+                    });
+            });
+        if let Some(c) = set_stitch {
+            if c != cur {
+                self.checkpoint(now);
+                self.layers[li].opts.stitch = c;
+                self.sync_links(li);
+                self.dirty = true;
+            }
+        }
+        if let Some(a) = action {
+            self.layer_action(a, li);
+        }
+    }
+
+    fn keys_window(&mut self, ctx: &egui::Context) {
+        if !self.show_keys {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Keyboard shortcuts").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(RichText::new(if self.ai_keys { "Vector-editor style tool keys" } else { "StitchForge tool keys" }).weak());
+            egui::Grid::new("keys").num_columns(2).spacing([24.0, 3.0]).show(ui, |ui| {
+                for t in Tool::ALL {
+                    ui.label(t.name());
+                    ui.label(RichText::new(t.key_label(self.ai_keys)).monospace().strong());
+                    ui.end_row();
+                }
+                for (a, b) in [
+                    ("Vector / Stitches 3D / Flat", "1  2  3".to_string()),
+                    ("Fit in window", "F".into()),
+                    ("Play the sew-out", "Space".into()),
+                    ("Nudge (Shift = 5 mm)", "Arrows".into()),
+                    ("Undo / Redo", format!("{}  /  {}", kb("Z"), kb("⇧Z"))),
+                    ("Save / Open / Export", format!("{}  {}  {}", kb("S"), kb("O"), kb("E"))),
+                    ("Duplicate", kb("D")),
+                ] {
+                    ui.label(a);
+                    ui.label(RichText::new(b).monospace().strong());
+                    ui.end_row();
+                }
+            });
+        });
+        if !open {
+            self.show_keys = false;
+        }
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("About StitchForge").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(RichText::new("StitchForge 0.20").strong().size(16.0));
+            ui.label("Embroidery design, lettering, name drops and machine files.");
+            ui.label(RichText::new("Written from scratch. Reads and writes DST, EXP and PES; SVG, PDF and pictures for art.").weak());
+        });
+        if !open {
+            self.show_about = false;
+        }
+    }
+
+    // ---------- thread libraries (several at once) ----------
+
+    /// Generic palette plus every library in the library folder; the ones
+    /// saved in the preferences are ticked.
+    fn with_libraries(mut self, on: &[String]) -> Self {
+        self.libs.push(LoadedLib {
+            key: "generic".into(),
+            name: "Generic 40wt".into(),
+            note: "Built-in generic 40 wt palette, made for StitchForge.".into(),
+            threads: self.chart.clone(),
+            on: on.is_empty() || on.iter().any(|k| k == "generic"),
+        });
+        for p in thread::scan_libraries(&thread::library_dir()) {
+            if let Ok(lib) = thread::load_library(&p.to_string_lossy()) {
+                let key = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let on = on.iter().any(|k| *k == key);
+                self.libs.push(LoadedLib::from_library(key, lib, on));
+            }
+        }
+        if !self.libs.iter().any(|l| l.on) {
+            self.libs[0].on = true;
+        }
+        self.rebuild_chart(false);
+        self
+    }
+
+    /// The working chart is every ticked library in list order. Layers that
+    /// picked a thread keep it (found again by library and code).
+    fn rebuild_chart(&mut self, save: bool) {
+        if !self.libs.iter().any(|l| l.on) {
+            if let Some(g) = self.libs.iter_mut().find(|l| l.key == "generic") {
+                g.on = true;
+            }
+        }
+        let keep: Vec<Option<(String, String)>> = self
+            .layers
+            .iter()
+            .map(|l| l.opts.thread.and_then(|i| self.chart.get(i)).map(|t| (t.brand.clone(), t.code.clone())))
+            .collect();
+        let mut chart = Vec::new();
+        for l in self.libs.iter().filter(|l| l.on) {
+            for t in &l.threads {
+                let mut t = t.clone();
+                t.brand = l.name.clone();
+                chart.push(t);
+            }
+        }
+        self.chart = chart;
+        for (l, k) in self.layers.iter_mut().zip(keep) {
+            l.opts.thread = k.and_then(|(b, c)| self.chart.iter().position(|t| t.brand == b && t.code == c));
+        }
+        let on: Vec<&LoadedLib> = self.libs.iter().filter(|l| l.on).collect();
+        self.chart_name = on.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(" + ");
+        self.chart_note = if on.len() == 1 {
+            on[0].note.clone()
+        } else {
+            format!("{} threads from {} libraries. Colours are matched from all of them.", self.chart.len(), on.len())
+        };
+        self.dirty = true;
+        if save {
+            self.save_prefs();
+        }
+    }
+
+    /// Add a library file: copied into the library folder (so it is there
+    /// next time) and ticked. Already known: just ticked.
+    fn add_library_file(&mut self, p: &std::path::Path) {
+        let lib = match thread::load_library(&p.to_string_lossy()) {
+            Ok(l) => l,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        let file = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "library.csv".into());
+        #[cfg(not(target_arch = "wasm32"))]
+        let key = {
+            let dir = thread::library_dir();
+            let dest = dir.join(&file);
+            let same = p.canonicalize().ok() == dest.canonicalize().ok();
+            if same || (std::fs::create_dir_all(&dir).is_ok() && std::fs::copy(p, &dest).is_ok()) {
+                self.libraries = thread::scan_libraries(&dir);
+                file.clone()
+            } else {
+                p.to_string_lossy().to_string()
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let key = file.clone();
+        let name = lib.name.clone();
+        let n = lib.threads.len();
+        match self.libs.iter_mut().find(|l| l.key == key) {
+            Some(l) => {
+                *l = LoadedLib::from_library(key, lib, true);
+            }
+            None => self.libs.push(LoadedLib::from_library(key, lib, true)),
+        }
+        self.rebuild_chart(true);
+        self.status = format!("Added {name} ({n} threads). It stays in your Thread libraries folder.");
+    }
+
+    fn libraries_ui(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Thread libraries");
+        ui.label(RichText::new("Tick every library you stock. Threads are matched from all ticked libraries.").small().weak());
+        ui.add_space(2.0);
+        let mut changed = false;
+        for l in self.libs.iter_mut() {
+            ui.horizontal(|ui| {
+                let r = ui.checkbox(&mut l.on, RichText::new(&l.name));
+                if r.changed() {
+                    changed = true;
+                }
+                r.on_hover_text(&l.note);
+                ui.label(RichText::new(format!("{}", l.threads.len())).small().weak());
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(64.0, 10.0), Sense::hover());
+                // a strip of the library's colours
+                let k = l.threads.len().max(1);
+                let step = (k / 16).max(1);
+                let cols: Vec<[u8; 3]> = l.threads.iter().step_by(step).take(16).map(|t| t.rgb).collect();
+                let w = rect.width() / cols.len().max(1) as f32;
+                for (i, c) in cols.iter().enumerate() {
+                    let r = Rect::from_min_size(rect.min + Vec2::new(i as f32 * w, 0.0), Vec2::new(w, rect.height()));
+                    ui.painter().rect_filled(r, 0.0, Color32::from_rgb(c[0], c[1], c[2]));
+                }
+            });
+        }
+        if changed {
+            self.rebuild_chart(true);
+        }
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Add library…").on_hover_text("A CSV with code,name,r,g,b. It's copied into your Thread libraries folder").clicked() {
+                pick(Want::Chart, "Add a thread library", &[("Thread library", &["csv"])], self.last_dir.as_ref());
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if ui.button("Open folder").on_hover_text(thread::library_dir().display().to_string()).clicked() {
+                let d = thread::library_dir();
+                let _ = std::fs::create_dir_all(&d);
+                open_path(&d);
+            }
+            if ui.button("Make my own").on_hover_text("Creates a template CSV in your Thread libraries folder").clicked() {
+                match thread::write_template(&thread::library_dir()) {
+                    Ok(p) => self.error = Some(format!("Template saved to {}. Fill it in, rename it without the _ at the front, then Add library.", p.display())),
+                    Err(e) => self.error = Some(format!("Could not create the template: {e}")),
+                }
+            }
+        });
+        ui.label(RichText::new(&self.chart_note).small().weak());
+    }
+
     fn tool_strip(&mut self, ui: &mut egui::Ui) {
+        let t = self.tokens();
+        let art = self.machine.is_none() && self.tab == Tab::Design;
         ui.add_space(4.0);
         let mut pick: Option<Tool> = None;
-        for t in Tool::ALL {
-            if matches!(t, Tool::Pen) {
-                ui.add_space(6.0);
+        for tool in Tool::ALL {
+            if matches!(tool, Tool::Pen | Tool::Measure) {
+                ui.add_space(3.0);
+                let (r, _) = ui.allocate_exact_size(Vec2::new(36.0, 5.0), Sense::hover());
+                ui.painter().line_segment([r.left_center() + Vec2::new(6.0, 0.0), r.right_center() - Vec2::new(6.0, 0.0)], Stroke::new(1.0_f32, t.border));
+                ui.add_space(1.0);
             }
-            let on = self.tool == t;
-            let (r, resp) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
-            let v = ui.visuals();
+            let on = self.tool == tool && art;
+            let (r, resp) = ui.allocate_exact_size(Vec2::splat(36.0), if art { Sense::click() } else { Sense::hover() });
             let bg = if on {
-                v.selection.bg_fill
-            } else if resp.hovered() {
-                v.widgets.hovered.bg_fill
+                t.accent
+            } else if resp.hovered() && art {
+                t.hover
             } else {
                 Color32::TRANSPARENT
             };
-            ui.painter().rect_filled(r, 6.0, bg);
-            let ink = if on { Color32::WHITE } else { v.text_color() };
-            tool_icon(ui.painter(), r.shrink(9.0), t, ink);
-            if resp.on_hover_text(t.hint()).clicked() {
-                pick = Some(t);
+            ui.painter().rect_filled(r, 5.0, bg);
+            let ink = if on {
+                Color32::WHITE
+            } else if art {
+                t.text
+            } else {
+                t.text_weak.gamma_multiply(0.45)
+            };
+            tool_icon(ui.painter(), r.shrink(9.0), tool, ink);
+            if art && resp.on_hover_text(tool.tip(self.ai_keys)).clicked() {
+                pick = Some(tool);
             }
         }
-        if let Some(t) = pick {
-            self.set_tool(t);
+        if let Some(tool) = pick {
+            self.set_tool(tool);
+        }
+        // the colour the next shape is drawn in (fill over outline)
+        ui.add_space(10.0);
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(36.0, 36.0), Sense::click());
+        let p = ui.painter();
+        let back = Rect::from_min_size(r.min + Vec2::new(13.0, 13.0), Vec2::splat(18.0));
+        let front = Rect::from_min_size(r.min + Vec2::new(4.0, 4.0), Vec2::splat(18.0));
+        let c = |rgb: [u8; 3]| Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+        if self.style.stroke_on {
+            p.rect_stroke(back.shrink(2.0), 2.0, Stroke::new(4.0_f32, c(self.style.stroke)), egui::StrokeKind::Middle);
+        } else {
+            p.rect_stroke(back, 2.0, Stroke::new(1.0_f32, t.border), egui::StrokeKind::Inside);
+        }
+        if self.style.fill_on {
+            p.rect_filled(front, 2.0, c(self.style.fill));
+        } else {
+            p.rect_filled(front, 2.0, t.panel);
+            p.line_segment([front.left_bottom(), front.right_top()], Stroke::new(1.5_f32, Color32::from_rgb(220, 60, 50)));
+        }
+        p.rect_stroke(front, 2.0, Stroke::new(1.0_f32, t.border), egui::StrokeKind::Outside);
+        if art && resp.on_hover_text("Fill and outline of the next shape you draw: pick a drawing tool to change them").clicked() {
+            self.set_tool(Tool::Rect);
+            self.dock = Dock::Properties;
+            self.dock_open = true;
         }
     }
 
@@ -7553,8 +8666,21 @@ impl eframe::App for App {
                 self.guard(Pending::OpenPath(p), ctx);
             }
         }
+        // shell state follows the workspace and theme
+        if ctx.data(|d| d.get_temp::<ThemeKind>(egui::Id::new("sf-theme"))) != Some(self.theme) {
+            theme::apply(ctx, self.theme);
+        }
+        self.pro = self.workspace != Workspace::Simple;
+        if self.tab == Tab::Drops && self.workspace != Workspace::NameDrops {
+            self.workspace = Workspace::NameDrops;
+        } else if self.tab == Tab::Design && self.workspace == Workspace::NameDrops {
+            self.workspace = Workspace::Design;
+        }
         // shortcuts (ignored while typing in a field)
         let typing = ctx.wants_keyboard_input();
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Questionmark) || (i.modifiers.shift && i.key_pressed(egui::Key::Slash))) {
+            self.show_keys = !self.show_keys;
+        }
         let edit_used = !typing && self.edit != Edit::None && self.edit_keys(ctx);
         let mut pen_used = false;
         if !typing && !self.pen.is_empty() {
@@ -7574,7 +8700,7 @@ impl eframe::App for App {
             let plain = ctx.input(|i| !i.modifiers.command && !i.modifiers.alt);
             if plain {
                 for t in Tool::ALL {
-                    if ctx.input(|i| i.key_pressed(t.key())) && !(t == Tool::Text && self.show_text) {
+                    if ctx.input(|i| i.key_pressed(t.key_for(self.ai_keys)) && !i.modifiers.shift) && !(t == Tool::Text && self.show_text) {
                         self.set_tool(t);
                     }
                 }
@@ -7618,6 +8744,18 @@ impl eframe::App for App {
             }
             if pressed(egui::Key::F) && !cmd {
                 self.fit = true;
+            }
+            if cmd && (pressed(egui::Key::Equals) || pressed(egui::Key::Plus)) {
+                self.zoom = (self.zoom * 1.25).min(200.0);
+            }
+            if cmd && pressed(egui::Key::Minus) {
+                self.zoom = (self.zoom / 1.25).max(0.3);
+            }
+            if cmd && pressed(egui::Key::Num1) {
+                self.zoom = MM_PX;
+            }
+            if cmd && pressed(egui::Key::A) && self.tab == Tab::Design && self.machine.is_none() && self.edit == Edit::None {
+                self.select_all();
             }
             if pressed(egui::Key::Space) && self.design.is_some() {
                 self.playing = !self.playing;
@@ -7717,18 +8855,23 @@ impl eframe::App for App {
             }
         }
 
-        egui::TopBottomPanel::top("top")
-            .frame(
-                egui::Frame::side_top_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(10, 8)),
-            )
-            .show(ctx, |ui| self.top_bar(ui));
-        egui::TopBottomPanel::bottom("bottom")
-            .frame(
-                egui::Frame::side_top_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(10, 6)),
-            )
-            .show(ctx, |ui| self.bottom_bar(ui));
+        let t = self.tokens();
+        let chrome = egui::Frame::new().fill(t.chrome);
+        egui::TopBottomPanel::top("menu")
+            .frame(chrome.inner_margin(egui::Margin::symmetric(8, 4)))
+            .show_separator_line(false)
+            .show(ctx, |ui| self.menu_bar(ui));
+        egui::TopBottomPanel::top("docbar")
+            .frame(chrome.inner_margin(egui::Margin { left: 56, right: 8, top: 4, bottom: 0 }))
+            .show_separator_line(false)
+            .show(ctx, |ui| self.doc_bar(ui));
+        egui::TopBottomPanel::bottom("status")
+            .frame(chrome.inner_margin(egui::Margin::symmetric(10, 3)))
+            .show_separator_line(false)
+            .show(ctx, |ui| self.status_bar(ui));
+        egui::TopBottomPanel::bottom("hint")
+            .frame(egui::Frame::new().fill(t.panel).inner_margin(egui::Margin::symmetric(10, 4)))
+            .show(ctx, |ui| self.hint_bar(ui));
         let title = format!(
             "StitchForge — {}{}",
             self.display_name(),
@@ -7738,28 +8881,26 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
-        if self.machine.is_none() && self.tab == Tab::Design {
-            egui::SidePanel::left("tools")
-                .resizable(false)
-                .exact_width(48.0)
-                .show(ctx, |ui| self.tool_strip(ui));
+        egui::SidePanel::left("tools")
+            .resizable(false)
+            .exact_width(48.0)
+            .frame(chrome.inner_margin(egui::Margin::symmetric(6, 4)))
+            .show_separator_line(false)
+            .show(ctx, |ui| self.tool_strip(ui));
+        egui::SidePanel::right("dock-icons")
+            .resizable(false)
+            .exact_width(44.0)
+            .frame(chrome)
+            .show_separator_line(false)
+            .show(ctx, |ui| self.dock_icons(ui));
+        if self.dock_open {
+            egui::SidePanel::right("dock")
+                .resizable(true)
+                .default_width(360.0)
+                .width_range(280.0..=620.0)
+                .frame(egui::Frame::new().fill(t.panel).inner_margin(egui::Margin::symmetric(10, 0)))
+                .show(ctx, |ui| self.dock(ui, now));
         }
-        egui::SidePanel::left("layers")
-            .resizable(true)
-            .default_width(320.0)
-            .show(ctx, |ui| {
-                if self.machine.is_some() {
-                    self.machine_panel(ui)
-                } else if self.tab == Tab::Drops {
-                    self.drops_panel(ui)
-                } else {
-                    self.layers_panel(ui)
-                }
-            });
-        egui::SidePanel::right("props")
-            .resizable(true)
-            .default_width(350.0)
-            .show(ctx, |ui| self.right_panel(ui, now));
         if let Some(e) = self.error.clone() {
             if self.design.is_some() && !self.show_text {
                 egui::TopBottomPanel::top("err").show(ctx, |ui| {
@@ -7783,6 +8924,8 @@ impl eframe::App for App {
         self.trace_window(ctx);
         self.export_window(ctx);
         self.confirm_window(ctx);
+        self.keys_window(ctx);
+        self.about_window(ctx);
     }
 }
 

@@ -1459,12 +1459,33 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
         let thick: Vec<f64> = (0..centers.len()).map(|j| 2.0 * cnt[j] as f64 / per[j].max(1) as f64 * mm_per_px).collect();
         let (comp, sizes) = components(w, h, |i, j| labels[i] == labels[j]);
         let mut votes: std::collections::BTreeMap<u32, std::collections::BTreeMap<u16, usize>> = Default::default();
+        // per piece: pixels, edge length, and whether it borders the real
+        // surroundings (the background reached from the picture's edge)
+        let mut area: std::collections::HashMap<u32, (usize, usize, bool)> = Default::default();
         for i in 0..n {
             let l = labels[i];
             if l == NONE || !like_bg[l as usize] || o.keep.contains(&(l as usize)) {
                 continue;
             }
             let (x, y) = (i % w, i / w);
+            let e = area.entry(comp[i]).or_insert((0, 0, false));
+            e.0 += 1;
+            for j in [
+                (x > 0).then(|| i - 1),
+                (x + 1 < w).then(|| i + 1),
+                (y > 0).then(|| i - w),
+                (y + 1 < h).then(|| i + w),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if comp[j] != comp[i] {
+                    e.1 += 1;
+                    if bg.mask[j] {
+                        e.2 = true;
+                    }
+                }
+            }
             for j in [
                 (x > 0).then(|| i - 1),
                 (x + 1 < w).then(|| i + 1),
@@ -1480,11 +1501,29 @@ pub fn trace(src: &Raster, o: &TraceOptions) -> Result<Trace, String> {
             }
         }
         let mut out: std::collections::HashSet<u32> = Default::default();
+        let px_mm2 = mm_per_px * mm_per_px;
         for (c, v) in votes {
-            let touches_bg = v.get(&NONE).copied().unwrap_or(0) > 0;
-            let (top, _) = v.iter().max_by_key(|(_, n)| **n).map(|(l, n)| (*l, *n)).unwrap();
-            let in_thin = top != NONE && thick[top as usize] < 3.5;
-            if touches_bg || in_thin {
+            let (px, edge, outside) = area.get(&c).copied().unwrap_or((0, 0, false));
+            let own_thick = 2.0 * px as f64 / edge.max(1) as f64 * mm_per_px;
+            let area_mm2 = px as f64 * px_mm2;
+            // Light areas inside the subject are part of it (a skull's
+            // highlights, a white shirt on a figure): the background flood
+            // stopped at an edge before them. Only drop what really is the
+            // surroundings showing: thin fringes against the outside, and
+            // small counters held inside thin strokes (letters).
+            let fringe = outside && (own_thick < 1.0 || area_mm2 < 2.0);
+            let (top, top_n) = v.iter().max_by_key(|(_, n)| **n).map(|(l, n)| (*l, *n)).unwrap();
+            let border_n: usize = v.values().sum();
+            // a letter's counter is held by one stroke colour all round;
+            // a light patch between several colours is part of the artwork
+            let one_holder = top_n as f64 >= 0.85 * border_n.max(1) as f64;
+            let counter = !outside && top != NONE && one_holder && thick[top as usize] < 3.5 && area_mm2 < 80.0;
+            let mockup_show = bg.mockup && outside;
+            if std::env::var("SF_DEBUG_TRACE").is_ok() && (fringe || counter || mockup_show) {
+                let tot: usize = v.values().sum();
+                eprintln!("bg-like piece {area_mm2:.1} mm² thick {own_thick:.2} outside {outside} top share {:.2} fringe {fringe} counter {counter}", v.get(&top).copied().unwrap_or(0) as f64 / tot.max(1) as f64);
+            }
+            if fringe || counter || mockup_show {
                 out.insert(c);
             }
         }
